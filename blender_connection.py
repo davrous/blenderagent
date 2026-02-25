@@ -186,11 +186,14 @@ def get_blender_connection() -> BlenderConnection:
     """Get or create a persistent Blender connection (singleton)."""
     global _blender_connection
 
-    # Validate existing connection
+    # Validate existing connection with a lightweight socket check (no TCP round-trip)
     if _blender_connection is not None:
         try:
-            _blender_connection.send_command("get_polyhaven_status")
-            return _blender_connection
+            if _blender_connection.sock is not None:
+                _blender_connection.sock.getpeername()
+                return _blender_connection
+            else:
+                raise Exception("Socket is None")
         except Exception as e:
             logger.warning(
                 f"Existing connection is no longer valid: {str(e)}"

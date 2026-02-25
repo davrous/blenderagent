@@ -40,7 +40,7 @@ def get_scene_info() -> str:
     try:
         blender = get_blender_connection()
         result = blender.send_command("get_scene_info")
-        return json.dumps(result, indent=2)
+        return json.dumps(result)
     except Exception as e:
         return f"Error getting scene info: {str(e)}"
 
@@ -55,7 +55,7 @@ def get_object_info(
     try:
         blender = get_blender_connection()
         result = blender.send_command("get_object_info", {"name": object_name})
-        return json.dumps(result, indent=2)
+        return json.dumps(result)
     except Exception as e:
         return f"Error getting object info: {str(e)}"
 
@@ -353,14 +353,13 @@ def search_polyhaven_assets(
             assets.items(),
             key=lambda x: x[1].get("download_count", 0),
             reverse=True,
-        )
+        )[:10]  # Limit to top 10 to reduce token usage
 
         for asset_id, data in sorted_assets:
             type_names = {0: "HDRI", 1: "Texture", 2: "Model"}
-            output += f"- {data.get('name', asset_id)} (ID: {asset_id})\n"
-            output += f"  Type: {type_names.get(data.get('type', 0), 'Unknown')}\n"
-            output += f"  Categories: {', '.join(data.get('categories', []))}\n"
-            output += f"  Downloads: {data.get('download_count', 'Unknown')}\n\n"
+            output += f"- {data.get('name', asset_id)} (ID: {asset_id})"
+            output += f" | {type_names.get(data.get('type', 0), 'Unknown')}"
+            output += f" | {', '.join(data.get('categories', []))}\n"
 
         return output
     except Exception as e:
@@ -592,36 +591,17 @@ async def main():
         agent = client.create_agent(
             name="BlenderSceneAgent",
             instructions="""You are an expert 3D scene creation assistant powered by Blender.
-You help users create, modify, and visualize 3D scenes using Blender's powerful capabilities.
 
-## Workflow
-
-1. **Understand the request**: Ask clarifying questions if the user's intent is unclear.
-2. **Set up the scene**: Use setup_scene() to initialize camera, lighting, etc.
-3. **Create objects**: Use create_object() for primitives or execute_blender_code() for complex geometry.
-4. **Apply materials**: Use apply_material() for simple colors or download Poly Haven textures for realism.
-5. **Show results**: Use get_viewport_screenshot() to capture and show the viewport to the user.
-
-## Key Guidelines
-
-- Always call get_scene_info() first to understand the current scene state.
-- After making changes, take a viewport screenshot to show the result.
-- Use Poly Haven assets (search_polyhaven_assets, download_polyhaven_asset) for high-quality textures, HDRIs, and models.
-- For complex operations, break them into smaller steps using execute_blender_code().
-- Position objects thoughtfully - avoid overlapping and ensure proper scale.
-- Set up proper lighting (sun light or HDRI) so screenshots look good.
-- When creating scenes, think about composition: camera angle, object placement, lighting.
-
-## Available Poly Haven Asset Types
-- **hdris**: Environment lighting (sky, studio, outdoor)
-- **textures**: Materials (wood, metal, fabric, stone, etc.)
-- **models**: 3D models (furniture, plants, rocks, etc.)
-
-## Tips
-- Default Blender unit = 1 meter
-- Rotation values are in degrees
-- Use render_scene() for high-quality final renders
-- Use get_viewport_screenshot() for quick previews during creation
+## Guidelines
+- Call get_scene_info() ONLY when you need to know what objects already exist (e.g. before modifying or deleting). Skip it for fresh scene creation.
+- Take ONE viewport screenshot at the very end after ALL changes are complete, or when the user explicitly asks. NEVER take intermediate screenshots between steps.
+- For batch operations (multiple objects, materials, transforms), prefer a single execute_blender_code() call with one combined Python script instead of many sequential tool calls.
+- When creating an object that needs a color, call create_object() then apply_material() — but batch multiple such pairs into one execute_blender_code() call when possible.
+- Use setup_scene() to initialize camera and lighting when starting a new scene.
+- Use Poly Haven assets for high-quality textures, HDRIs, and models.
+- Position objects thoughtfully — avoid overlapping, ensure proper scale (1 unit = 1 meter).
+- Rotation values are in degrees. Use render_scene() for high-quality final renders.
+- Poly Haven asset types: hdris (environment lighting), textures (materials), models (3D models).
 """,
             tools=[
                 get_scene_info,
