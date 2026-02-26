@@ -57,6 +57,8 @@ An AI agent that creates and manipulates 3D scenes in a headless Blender instanc
 
 ```bash
 docker build -t blender-scene-agent .
+
+docker build --platform linux/amd64 --no-cache -t blender-scene-agent .    
 ```
 
 ### Run the container

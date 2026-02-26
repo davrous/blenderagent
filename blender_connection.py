@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("BlenderConnection")
@@ -37,7 +37,7 @@ class BlenderConnection:
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((self.host, self.port))
-            logger.info(f"Connected to Blender at {self.host}:{self.port}")
+            logger.debug(f"Connected to Blender at {self.host}:{self.port}")
             return True
         except Exception as e:
             logger.error(f"Failed to connect to Blender: {str(e)}")
@@ -78,7 +78,7 @@ class BlenderConnection:
                     try:
                         data = b"".join(chunks)
                         json.loads(data.decode("utf-8"))
-                        logger.info(
+                        logger.debug(
                             f"Received complete response ({len(data)} bytes)"
                         )
                         return data
@@ -105,7 +105,7 @@ class BlenderConnection:
 
         if chunks:
             data = b"".join(chunks)
-            logger.info(
+            logger.debug(
                 f"Returning data after receive completion ({len(data)} bytes)"
             )
             try:
@@ -126,18 +126,18 @@ class BlenderConnection:
         command = {"type": command_type, "params": params or {}}
 
         try:
-            logger.info(
-                f"Sending command: {command_type} with params: {params}"
+            logger.debug(
+                f"Sending command: {command_type}"
             )
             self.sock.sendall(json.dumps(command).encode("utf-8"))
-            logger.info("Command sent, waiting for response...")
+            logger.debug("Command sent, waiting for response...")
 
             self.sock.settimeout(180.0)
             response_data = self._receive_full_response(self.sock)
-            logger.info(f"Received {len(response_data)} bytes of data")
+            logger.debug(f"Received {len(response_data)} bytes of data")
 
             response = json.loads(response_data.decode("utf-8"))
-            logger.info(
+            logger.debug(
                 f"Response parsed, status: {response.get('status', 'unknown')}"
             )
 
@@ -215,7 +215,7 @@ def get_blender_connection() -> BlenderConnection:
             raise Exception(
                 "Could not connect to Blender. Make sure Blender is running with the addon."
             )
-        logger.info("Created new persistent connection to Blender")
+        logger.debug("Created new persistent connection to Blender")
 
     return _blender_connection
 
@@ -226,4 +226,4 @@ def close_blender_connection():
     if _blender_connection:
         _blender_connection.disconnect()
         _blender_connection = None
-        logger.info("Blender connection closed")
+        logger.debug("Blender connection closed")

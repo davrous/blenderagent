@@ -27,3 +27,5 @@ environment_variables:
     value: "localhost"
   - name: BLENDER_PORT
     value: "9876"
+  - name: AZURE_STORAGE_ACCOUNT_NAME
+    value: "{{AZURE_STORAGE_ACCOUNT_NAME}}"

@@ -4,6 +4,7 @@ azure-ai-projects==2.0.0b3
 opentelemetry-semantic-conventions-ai==0.4.13
 python-dotenv
 azure-identity
+azure-storage-blob
 debugpy
 # Agent development CLI tool (preview)
 agent-dev-cli

@@ -21,6 +21,14 @@ import zipfile
 import io
 from datetime import datetime
 from contextlib import redirect_stdout, suppress
+import logging
+
+# Configure logger for BlenderMCP server
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+_logger = logging.getLogger("BlenderMCP")
 
 # Add User-Agent as required by Poly Haven API
 REQ_HEADERS = requests.utils.default_headers()
@@ -54,7 +62,7 @@ class BlenderMCPServer:
 
             print(f"BlenderMCP server started on {self.host}:{self.port}")
         except Exception as e:
-            print(f"Failed to start server: {str(e)}")
+            _logger.error(f"Failed to start server: {str(e)}")
             self.stop()
 
     def stop(self):
@@ -78,14 +86,14 @@ class BlenderMCPServer:
 
     def _server_loop(self):
         """Main server loop in a separate thread"""
-        print("Server thread started")
+        _logger.debug("Server thread started")
         self.socket.settimeout(1.0)
 
         while self.running:
             try:
                 try:
                     client, address = self.socket.accept()
-                    print(f"Connected to client: {address}")
+                    _logger.debug(f"Connected to client: {address}")
                     client_thread = threading.Thread(
                         target=self._handle_client,
                         args=(client,),
@@ -95,19 +103,19 @@ class BlenderMCPServer:
                 except socket.timeout:
                     continue
                 except Exception as e:
-                    print(f"Error accepting connection: {str(e)}")
+                    _logger.error(f"Error accepting connection: {str(e)}")
                     time.sleep(0.5)
             except Exception as e:
-                print(f"Error in server loop: {str(e)}")
+                _logger.error(f"Error in server loop: {str(e)}")
                 if not self.running:
                     break
                 time.sleep(0.5)
 
-        print("Server thread stopped")
+        _logger.debug("Server thread stopped")
 
     def _handle_client(self, client):
         """Handle connected client"""
-        print("Client handler started")
+        _logger.debug("Client handler started")
         client.settimeout(None)
         buffer = b""
 
@@ -116,7 +124,7 @@ class BlenderMCPServer:
                 try:
                     data = client.recv(8192)
                     if not data:
-                        print("Client disconnected")
+                        _logger.debug("Client disconnected")
                         break
 
                     buffer += data
@@ -133,11 +141,11 @@ class BlenderMCPServer:
                                         response_json.encode("utf-8")
                                     )
                                 except:
-                                    print(
+                                    _logger.warning(
                                         "Failed to send response - client disconnected"
                                     )
                             except Exception as e:
-                                print(f"Error executing command: {str(e)}")
+                                _logger.error(f"Error executing command: {str(e)}")
                                 traceback.print_exc()
                                 try:
                                     error_response = {
@@ -161,10 +169,10 @@ class BlenderMCPServer:
                         # Incomplete data, wait for more
                         pass
                 except Exception as e:
-                    print(f"Error receiving data: {str(e)}")
+                    _logger.error(f"Error receiving data: {str(e)}")
                     break
         except Exception as e:
-            print(f"Error in client handler: {str(e)}")
+            _logger.error(f"Error in client handler: {str(e)}")
         finally:
             try:
                 client.close()
@@ -177,7 +185,7 @@ class BlenderMCPServer:
         try:
             return self._execute_command_internal(command)
         except Exception as e:
-            print(f"Error executing command: {str(e)}")
+            _logger.error(f"Error executing command: {str(e)}")
             traceback.print_exc()
             return {"status": "error", "message": str(e)}
 
@@ -213,12 +221,12 @@ class BlenderMCPServer:
         handler = handlers.get(cmd_type)
         if handler:
             try:
-                print(f"Executing handler for {cmd_type}")
+                _logger.debug(f"Executing handler for {cmd_type}")
                 result = handler(**params)
-                print("Handler execution complete")
+                _logger.debug("Handler execution complete")
                 return {"status": "success", "result": result}
             except Exception as e:
-                print(f"Error in handler: {str(e)}")
+                _logger.error(f"Error in handler: {str(e)}")
                 traceback.print_exc()
                 return {"status": "error", "message": str(e)}
         else:
@@ -234,7 +242,7 @@ class BlenderMCPServer:
     def get_scene_info(self):
         """Get information about the current Blender scene"""
         try:
-            print("Getting scene info...")
+            _logger.debug("Getting scene info...")
             scene_info = {
                 "name": bpy.context.scene.name,
                 "object_count": len(bpy.context.scene.objects),
@@ -256,12 +264,12 @@ class BlenderMCPServer:
                 }
                 scene_info["objects"].append(obj_info)
 
-            print(
+            _logger.debug(
                 f"Scene info collected: {len(scene_info['objects'])} objects"
             )
             return scene_info
         except Exception as e:
-            print(f"Error in get_scene_info: {str(e)}")
+            _logger.error(f"Error in get_scene_info: {str(e)}")
             traceback.print_exc()
             return {"error": str(e)}
 
@@ -386,6 +394,15 @@ class BlenderMCPServer:
                 exec(code, namespace)
             captured_output = capture_buffer.getvalue()
             return {"executed": True, "result": captured_output}
+        except AttributeError as e:
+            error_msg = str(e)
+            if "read-only" in error_msg:
+                return {
+                    "executed": False,
+                    "error": f"Read-only attribute error: {error_msg}. "
+                    "Hint: Collection.name is read-only. Use bpy.data.collections.new('Name') instead of renaming.",
+                }
+            raise Exception(f"Code execution error: {error_msg}")
         except Exception as e:
             raise Exception(f"Code execution error: {str(e)}")
 
@@ -932,7 +949,7 @@ class BlenderMCPServer:
                 "maps": list(texture_images.keys()),
             }
         except Exception as e:
-            print(f"Error in set_texture: {str(e)}")
+            _logger.error(f"Error in set_texture: {str(e)}")
             traceback.print_exc()
             return {"error": f"Failed to apply texture: {str(e)}"}
 
@@ -982,9 +999,7 @@ def start_server_headless():
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("=" * 60)
     print("BlenderMCP Headless Startup")
-    print("=" * 60)
 
     register_properties()
 
@@ -995,5 +1010,4 @@ if __name__ == "__main__":
 
     bpy.app.timers.register(_deferred_start, first_interval=1.0)
 
-    print("Server will start in 1 second...")
     print("Blender is ready for headless operation.")

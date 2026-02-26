@@ -9,6 +9,8 @@ import base64
 import json
 import os
 import tempfile
+import uuid
+from datetime import datetime, timezone
 from typing import Annotated
 
 from dotenv import load_dotenv
@@ -19,10 +21,39 @@ from agent_framework.azure import AzureAIAgentClient
 from azure.ai.agentserver.agentframework import from_agent_framework
 from azure.identity.aio import DefaultAzureCredential
 
+from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
+from azure.storage.blob import BlobServiceClient, ContentSettings
+
 from blender_connection import get_blender_connection, close_blender_connection
 
 # Azure AI Foundry configuration
 PROJECT_ENDPOINT = os.getenv("PROJECT_ENDPOINT")
+
+# Azure Blob Storage configuration
+AZURE_STORAGE_ACCOUNT_NAME = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "david")
+BLOB_CONTAINER_NAME = "screenshots"
+
+
+def upload_image_to_blob(image_bytes: bytes, blob_name: str) -> str:
+    """Upload image bytes to Azure Blob Storage and return the public URL."""
+    account_url = f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
+    credential = SyncDefaultAzureCredential()
+    blob_service_client = BlobServiceClient(account_url, credential=credential)
+    container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
+
+    # Ensure container exists
+    try:
+        container_client.get_container_properties()
+    except Exception:
+        container_client.create_container(public_access="blob")
+
+    blob_client = container_client.get_blob_client(blob_name)
+    blob_client.upload_blob(
+        image_bytes,
+        overwrite=True,
+        content_settings=ContentSettings(content_type="image/png"),
+    )
+    return f"{account_url}/{BLOB_CONTAINER_NAME}/{blob_name}"
 MODEL_DEPLOYMENT_NAME = os.getenv("MODEL_DEPLOYMENT_NAME", "gpt-4.1")
 
 
@@ -40,7 +71,14 @@ def get_scene_info() -> str:
     try:
         blender = get_blender_connection()
         result = blender.send_command("get_scene_info")
-        return json.dumps(result)
+        # Return a concise summary instead of raw JSON to save LLM tokens
+        obj_count = result.get("object_count", 0)
+        mat_count = result.get("materials_count", 0)
+        lines = [f"Scene '{result.get('name', '?')}': {obj_count} objects, {mat_count} materials."]
+        for obj in result.get("objects", []):
+            loc = obj.get("location", [0, 0, 0])
+            lines.append(f"  - {obj.get('name', '?')} ({obj.get('type', '?')}) at ({loc[0]}, {loc[1]}, {loc[2]})")
+        return "\n".join(lines)
     except Exception as e:
         return f"Error getting scene info: {str(e)}"
 
@@ -55,7 +93,25 @@ def get_object_info(
     try:
         blender = get_blender_connection()
         result = blender.send_command("get_object_info", {"name": object_name})
-        return json.dumps(result)
+        # Return a concise summary instead of raw JSON to save LLM tokens
+        lines = [f"Object '{result.get('name', object_name)}' ({result.get('type', '?')})"]
+        loc = result.get("location", {})
+        if loc:
+            lines.append(f"  Location: ({loc.get('x', 0)}, {loc.get('y', 0)}, {loc.get('z', 0)})")
+        rot = result.get("rotation", {})
+        if rot:
+            lines.append(f"  Rotation: ({rot.get('x', 0)}, {rot.get('y', 0)}, {rot.get('z', 0)})")
+        sc = result.get("scale", {})
+        if sc:
+            lines.append(f"  Scale: ({sc.get('x', 1)}, {sc.get('y', 1)}, {sc.get('z', 1)})")
+        mats = result.get("materials", [])
+        if mats:
+            mat_names = [m.get("name", "?") if isinstance(m, dict) else str(m) for m in mats]
+            lines.append(f"  Materials: {', '.join(mat_names)}")
+        if result.get("mesh"):
+            mesh = result["mesh"]
+            lines.append(f"  Mesh: {mesh.get('vertices', '?')} verts, {mesh.get('faces', '?')} faces")
+        return "\n".join(lines)
     except Exception as e:
         return f"Error getting object info: {str(e)}"
 
@@ -106,7 +162,7 @@ print(f"Created {{obj.name}} at ({{obj.location.x}}, {{obj.location.y}}, {{obj.l
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
-        return f"Created {object_type} named '{name}' at ({location_x}, {location_y}, {location_z}). {result.get('result', '')}"
+        return f"Created {object_type} named '{name}' at ({location_x}, {location_y}, {location_z})."
     except Exception as e:
         return f"Error creating object: {str(e)}"
 
@@ -161,7 +217,7 @@ def modify_object(
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
-        return f"Modified '{object_name}'. {result.get('result', '')}"
+        return f"Modified '{object_name}'."
     except Exception as e:
         return f"Error modifying object: {str(e)}"
 
@@ -181,7 +237,7 @@ print("Deleted {object_name}")
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
-        return f"Deleted '{object_name}'. {result.get('result', '')}"
+        return f"Deleted '{object_name}'."
     except Exception as e:
         return f"Error deleting object: {str(e)}"
 
@@ -236,7 +292,7 @@ print(f"Applied material '{{mat.name}}' with color ({color_hex}) to {{obj.name}}
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
-        return f"Applied {color_hex} material to '{object_name}'. {result.get('result', '')}"
+        return f"Applied {color_hex} material to '{object_name}'."
     except Exception as e:
         return f"Error applying material: {str(e)}"
 
@@ -261,7 +317,11 @@ def execute_blender_code(
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
-        return f"Code executed successfully: {result.get('result', '')}"
+        raw = result.get('result', '')
+        # Truncate verbose Blender stdout to save LLM tokens
+        if len(raw) > 500:
+            raw = raw[:500] + "... [truncated]"
+        return f"Code executed successfully. {raw}".strip()
     except Exception as e:
         return f"Error executing code: {str(e)}"
 
@@ -305,8 +365,13 @@ def get_viewport_screenshot(
 
         os.remove(temp_path)
 
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        return f"Screenshot captured ({result.get('width', '?')}x{result.get('height', '?')} pixels). Base64 PNG data:\n\ndata:image/png;base64,{image_b64}"
+        # Upload to Azure Blob Storage and return URL
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        blob_name = f"screenshot_{timestamp}_{uuid.uuid4().hex[:8]}.png"
+        blob_url = upload_image_to_blob(image_bytes, blob_name)
+        width = result.get('width', '?')
+        height = result.get('height', '?')
+        return f"Screenshot captured ({width}x{height} pixels).\nInclude the following image link in your response exactly as-is:\n\n![screenshot]({blob_url})"
     except Exception as e:
         return f"Error capturing screenshot: {str(e)}"
 
@@ -523,7 +588,7 @@ print("Added ground plane")
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
-        return f"Scene setup complete. {result.get('result', '')}"
+        return "Scene setup complete."
     except Exception as e:
         return f"Error setting up scene: {str(e)}"
 
@@ -565,8 +630,11 @@ print("Render complete: {output_path}")
         if os.path.exists(output_path):
             with open(output_path, "rb") as f:
                 image_bytes = f.read()
-            image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-            return f"Render complete ({resolution_x}x{resolution_y}). Base64 PNG:\n\ndata:image/png;base64,{image_b64}"
+            # Upload to Azure Blob Storage and return URL
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            blob_name = f"render_{timestamp}_{uuid.uuid4().hex[:8]}.png"
+            blob_url = upload_image_to_blob(image_bytes, blob_name)
+            return f"Render complete ({resolution_x}x{resolution_y}).\nInclude the following image link in your response exactly as-is:\n\n![render]({blob_url})"
         else:
             return f"Render command executed but output file not found. {result.get('result', '')}"
     except Exception as e:
@@ -602,6 +670,8 @@ async def main():
 - Position objects thoughtfully — avoid overlapping, ensure proper scale (1 unit = 1 meter).
 - Rotation values are in degrees. Use render_scene() for high-quality final renders.
 - Poly Haven asset types: hdris (environment lighting), textures (materials), models (3D models).
+- NEVER set `collection.name` — it is read-only in this Blender environment. To organize objects, create new collections with `bpy.data.collections.new("Name")` and link them to the scene with `bpy.context.scene.collection.children.link(new_collection)` instead of renaming existing ones.
+- When a tool returns an image in markdown format (e.g. `![screenshot](url)` or `![render](url)`), you MUST include that exact markdown image link in your response so the chat client can display the image. Never omit, summarize, or rewrite the image URL.
 """,
             tools=[
                 get_scene_info,
