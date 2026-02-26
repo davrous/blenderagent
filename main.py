@@ -17,6 +17,13 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+from agent_framework import (
+    AgentMiddleware,
+    AgentRunContext,
+    AgentRunResponseUpdate,
+    FunctionCallContent,
+    TextContent,
+)
 from agent_framework.azure import AzureAIAgentClient
 from azure.ai.agentserver.agentframework import from_agent_framework
 from azure.identity.aio import DefaultAzureCredential
@@ -642,6 +649,60 @@ print("Render complete: {output_path}")
 
 
 # ──────────────────────────────────────────────
+# Middleware - stream status updates to the client
+# ──────────────────────────────────────────────
+
+_TOOL_STATUS_MESSAGES: dict[str, str] = {
+    "get_scene_info": "Inspecting the scene…",
+    "get_object_info": "Getting object details…",
+    "create_object": "Creating object…",
+    "modify_object": "Modifying object…",
+    "delete_object": "Deleting object…",
+    "apply_material": "Applying material…",
+    "execute_blender_code": "Executing Blender code…",
+    "get_viewport_screenshot": "Capturing viewport screenshot…",
+    "search_polyhaven_assets": "Searching Poly Haven assets…",
+    "download_polyhaven_asset": "Downloading asset from Poly Haven…",
+    "apply_polyhaven_texture": "Applying Poly Haven texture…",
+    "setup_scene": "Setting up the scene…",
+    "render_scene": "Rendering the scene…",
+}
+
+
+class ToolStatusMiddleware(AgentMiddleware):
+    """Injects short status text updates into the SSE stream before each tool call."""
+
+    async def process(self, context: AgentRunContext, next) -> None:
+        await next(context)
+
+        if not context.is_streaming:
+            return
+
+        original_stream = context.result
+
+        async def _wrapped():
+            announced: set[str] = set()
+            async for update in original_stream:
+                # Look for a new function-call content we haven't announced yet
+                for content in (update.contents or []):
+                    if isinstance(content, FunctionCallContent):
+                        call_id = content.call_id or content.name
+                        if call_id and call_id not in announced:
+                            announced.add(call_id)
+                            status = _TOOL_STATUS_MESSAGES.get(
+                                content.name, "Working on it…"
+                            )
+                            yield AgentRunResponseUpdate(
+                                contents=[TextContent(text=f"\n\n*{status}*\n\n")],
+                                role="assistant",
+                                message_id=f"status-{call_id}",
+                            )
+                yield update
+
+        context.result = _wrapped()
+
+
+# ──────────────────────────────────────────────
 # Main entry point
 # ──────────────────────────────────────────────
 
@@ -658,6 +719,7 @@ async def main():
     ):
         agent = client.create_agent(
             name="BlenderSceneAgent",
+            middleware=ToolStatusMiddleware(),
             instructions="""You are an expert 3D scene creation assistant powered by Blender.
 
 ## Guidelines
