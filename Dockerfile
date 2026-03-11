@@ -28,12 +28,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # locally in Docker with: -v ~/.azure:/root/.azure:ro
 RUN curl -sL https://aka.ms/InstallAzureCLIDeb | bash
 
-# ── 2. Install Blender 4.2 LTS ──
+# ── 2. Install Blender 4.4 ──
 # Note: Blender only provides x64 Linux builds, so this image must be
 # built with --platform linux/amd64 on Apple Silicon Macs.
-ARG BLENDER_VERSION=4.2.10
+ARG BLENDER_VERSION=4.4.3
 RUN echo "Downloading Blender ${BLENDER_VERSION}..." \
-    && wget -q "https://mirror.clarkson.edu/blender/release/Blender4.2/blender-${BLENDER_VERSION}-linux-x64.tar.xz" -O /tmp/blender.tar.xz \
+    && wget -q "https://download.blender.org/release/Blender4.4/blender-${BLENDER_VERSION}-linux-x64.tar.xz" -O /tmp/blender.tar.xz \
     && mkdir -p /opt/blender \
     && tar -xf /tmp/blender.tar.xz -C /opt/blender --strip-components=1 \
     && rm /tmp/blender.tar.xz \
