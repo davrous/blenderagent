@@ -7,7 +7,9 @@ Uses Microsoft Agent Framework with Azure AI Foundry.
 import asyncio
 import base64
 import json
+import logging
 import os
+import re
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -22,16 +24,26 @@ from agent_framework import (
     AgentRunContext,
     AgentRunResponseUpdate,
     FunctionCallContent,
+    FunctionResultContent,
     TextContent,
 )
 from agent_framework.azure import AzureAIAgentClient
 from azure.ai.agentserver.agentframework import from_agent_framework
+from azure.ai.agentserver.agentframework.persistence import InMemoryAgentThreadRepository
 from azure.identity.aio import DefaultAzureCredential
 
 from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
 from blender_connection import get_blender_connection, close_blender_connection
+
+logger = logging.getLogger("blender_agent")
+logger.setLevel(logging.DEBUG)
+logger.propagate = False
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(_handler)
 
 # Azure AI Foundry configuration
 PROJECT_ENDPOINT = os.getenv("PROJECT_ENDPOINT")
@@ -43,6 +55,7 @@ BLOB_CONTAINER_NAME = "screenshots"
 
 def upload_image_to_blob(image_bytes: bytes, blob_name: str) -> str:
     """Upload image bytes to Azure Blob Storage and return the public URL."""
+    logger.info("Uploading image to blob: %s (%d bytes)", blob_name, len(image_bytes))
     account_url = f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
     credential = SyncDefaultAzureCredential()
     blob_service_client = BlobServiceClient(account_url, credential=credential)
@@ -75,6 +88,7 @@ def get_scene_info() -> str:
     all objects, their types, locations, and material counts.
     Always call this first to understand the current state of the scene.
     """
+    logger.info("Tool called: get_scene_info")
     try:
         blender = get_blender_connection()
         result = blender.send_command("get_scene_info")
@@ -85,8 +99,10 @@ def get_scene_info() -> str:
         for obj in result.get("objects", []):
             loc = obj.get("location", [0, 0, 0])
             lines.append(f"  - {obj.get('name', '?')} ({obj.get('type', '?')}) at ({loc[0]}, {loc[1]}, {loc[2]})")
+        logger.info("get_scene_info succeeded: %d objects, %d materials", obj_count, mat_count)
         return "\n".join(lines)
     except Exception as e:
+        logger.error("get_scene_info failed", exc_info=True)
         return f"Error getting scene info: {str(e)}"
 
 
@@ -97,6 +113,7 @@ def get_object_info(
     Get detailed information about a specific object in the Blender scene
     including its location, rotation, scale, materials, and mesh data.
     """
+    logger.info("Tool called: get_object_info(object_name=%r)", object_name)
     try:
         blender = get_blender_connection()
         result = blender.send_command("get_object_info", {"name": object_name})
@@ -118,8 +135,10 @@ def get_object_info(
         if result.get("mesh"):
             mesh = result["mesh"]
             lines.append(f"  Mesh: {mesh.get('vertices', '?')} verts, {mesh.get('faces', '?')} faces")
+        logger.info("get_object_info succeeded for %r", object_name)
         return "\n".join(lines)
     except Exception as e:
+        logger.error("get_object_info failed for %r", object_name, exc_info=True)
         return f"Error getting object info: {str(e)}"
 
 
@@ -155,8 +174,12 @@ def create_object(
         "monkey": "bpy.ops.mesh.primitive_monkey_add",
     }
 
+    logger.info("Tool called: create_object(type=%r, name=%r, loc=(%s,%s,%s), scale=(%s,%s,%s))",
+                object_type, name, location_x, location_y, location_z, scale_x, scale_y, scale_z)
+
     op = ops_map.get(object_type.lower())
     if not op:
+        logger.warning("create_object: unknown type %r", object_type)
         return f"Error: Unknown object type '{object_type}'. Use one of: {', '.join(ops_map.keys())}"
 
     code = f"""
@@ -169,8 +192,10 @@ print(f"Created {{obj.name}} at ({{obj.location.x}}, {{obj.location.y}}, {{obj.l
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
+        logger.info("create_object succeeded: %s '%s'", object_type, name)
         return f"Created {object_type} named '{name}' at ({location_x}, {location_y}, {location_z})."
     except Exception as e:
+        logger.error("create_object failed for type=%r name=%r", object_type, name, exc_info=True)
         return f"Error creating object: {str(e)}"
 
 
@@ -191,6 +216,7 @@ def modify_object(
     Only the specified parameters will be changed.
     Rotation values are in degrees.
     """
+    logger.info("Tool called: modify_object(object_name=%r)", object_name)
     lines = ["import bpy", "import math"]
     lines.append(f'obj = bpy.data.objects.get("{object_name}")')
     lines.append("if not obj:")
@@ -224,8 +250,10 @@ def modify_object(
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
+        logger.info("modify_object succeeded for %r", object_name)
         return f"Modified '{object_name}'."
     except Exception as e:
+        logger.error("modify_object failed for %r", object_name, exc_info=True)
         return f"Error modifying object: {str(e)}"
 
 
@@ -233,6 +261,7 @@ def delete_object(
     object_name: Annotated[str, "Name of the object to delete"],
 ) -> str:
     """Delete an object from the Blender scene by name."""
+    logger.info("Tool called: delete_object(object_name=%r)", object_name)
     code = f"""
 import bpy
 obj = bpy.data.objects.get("{object_name}")
@@ -244,8 +273,10 @@ print("Deleted {object_name}")
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
+        logger.info("delete_object succeeded for %r", object_name)
         return f"Deleted '{object_name}'."
     except Exception as e:
+        logger.error("delete_object failed for %r", object_name, exc_info=True)
         return f"Error deleting object: {str(e)}"
 
 
@@ -268,6 +299,8 @@ def apply_material(
     Create and apply a material with the specified color to an object.
     Color should be a hex code like '#FF0000' for red.
     """
+    logger.info("Tool called: apply_material(object=%r, color=%r, metallic=%s, roughness=%s)",
+                object_name, color_hex, metallic, roughness)
     mat_name = material_name or f"Material_{object_name}"
     code = f"""
 import bpy
@@ -299,8 +332,10 @@ print(f"Applied material '{{mat.name}}' with color ({color_hex}) to {{obj.name}}
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
+        logger.info("apply_material succeeded for %r with color %s", object_name, color_hex)
         return f"Applied {color_hex} material to '{object_name}'."
     except Exception as e:
+        logger.error("apply_material failed for %r", object_name, exc_info=True)
         return f"Error applying material: {str(e)}"
 
 
@@ -321,6 +356,8 @@ def execute_blender_code(
     Use this for complex operations not covered by other tools.
     Break large operations into smaller steps for reliability.
     """
+    logger.info("Tool called: execute_blender_code (code length=%d)", len(code))
+    logger.debug("execute_blender_code code:\n%s", code)
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
@@ -328,8 +365,10 @@ def execute_blender_code(
         # Truncate verbose Blender stdout to save LLM tokens
         if len(raw) > 500:
             raw = raw[:500] + "... [truncated]"
+        logger.info("execute_blender_code succeeded")
         return f"Code executed successfully. {raw}".strip()
     except Exception as e:
+        logger.error("execute_blender_code failed", exc_info=True)
         return f"Error executing code: {str(e)}"
 
 
@@ -349,6 +388,7 @@ def get_viewport_screenshot(
     Returns the screenshot as a base64-encoded PNG image string.
     Use this to show the user what the scene looks like.
     """
+    logger.info("Tool called: get_viewport_screenshot(max_size=%d)", max_size)
     try:
         blender = get_blender_connection()
         temp_dir = tempfile.gettempdir()
@@ -378,8 +418,10 @@ def get_viewport_screenshot(
         blob_url = upload_image_to_blob(image_bytes, blob_name)
         width = result.get('width', '?')
         height = result.get('height', '?')
+        logger.info("get_viewport_screenshot succeeded: %sx%s, uploaded to blob", width, height)
         return f"Screenshot captured ({width}x{height} pixels).\nInclude the following image link in your response exactly as-is:\n\n![screenshot]({blob_url})"
     except Exception as e:
+        logger.error("get_viewport_screenshot failed", exc_info=True)
         return f"Error capturing screenshot: {str(e)}"
 
 
@@ -402,6 +444,7 @@ def search_polyhaven_assets(
     Search for free assets on Poly Haven (HDRIs, textures, 3D models).
     Use this to find high-quality assets to enhance the scene.
     """
+    logger.info("Tool called: search_polyhaven_assets(type=%r, categories=%r)", asset_type, categories)
     try:
         blender = get_blender_connection()
         result = blender.send_command(
@@ -433,8 +476,10 @@ def search_polyhaven_assets(
             output += f" | {type_names.get(data.get('type', 0), 'Unknown')}"
             output += f" | {', '.join(data.get('categories', []))}\n"
 
+        logger.info("search_polyhaven_assets succeeded: %d total assets found", total)
         return output
     except Exception as e:
+        logger.error("search_polyhaven_assets failed", exc_info=True)
         return f"Error searching Poly Haven: {str(e)}"
 
 
@@ -456,6 +501,8 @@ def download_polyhaven_asset(
     - Textures: Created as a material that can be applied to objects
     - Models: Imported directly into the scene
     """
+    logger.info("Tool called: download_polyhaven_asset(id=%r, type=%r, res=%r, fmt=%r)",
+                asset_id, asset_type, resolution, file_format)
     try:
         blender = get_blender_connection()
         result = blender.send_command(
@@ -481,10 +528,14 @@ def download_polyhaven_asset(
                 return f"{message}. Created material '{material}' with maps: {maps}."
             elif asset_type == "models":
                 return f"{message}. The model has been imported into the scene."
+            logger.info("download_polyhaven_asset succeeded: %s", asset_id)
             return message
         else:
+            logger.warning("download_polyhaven_asset failed for %r: %s",
+                           asset_id, result.get('message', 'Unknown error'))
             return f"Failed to download asset: {result.get('message', 'Unknown error')}"
     except Exception as e:
+        logger.error("download_polyhaven_asset failed for %r", asset_id, exc_info=True)
         return f"Error downloading asset: {str(e)}"
 
 
@@ -498,6 +549,7 @@ def apply_polyhaven_texture(
     Apply a previously downloaded Poly Haven texture to an object.
     The texture must be downloaded first using download_polyhaven_asset.
     """
+    logger.info("Tool called: apply_polyhaven_texture(object=%r, texture=%r)", object_name, texture_id)
     try:
         blender = get_blender_connection()
         result = blender.send_command(
@@ -509,10 +561,14 @@ def apply_polyhaven_texture(
             return f"Error: {result['error']}"
 
         if result.get("success"):
+            logger.info("apply_polyhaven_texture succeeded: %r -> %r", texture_id, object_name)
             return f"Applied texture '{texture_id}' to '{object_name}'. Material: {result.get('material', '')}"
         else:
+            logger.warning("apply_polyhaven_texture failed: %s", result.get('message', 'Unknown error'))
             return f"Failed to apply texture: {result.get('message', 'Unknown error')}"
     except Exception as e:
+        logger.error("apply_polyhaven_texture failed for object=%r texture=%r",
+                     object_name, texture_id, exc_info=True)
         return f"Error applying texture: {str(e)}"
 
 
@@ -538,6 +594,8 @@ def setup_scene(
     Set up the Blender scene with camera, lighting, and optionally a ground plane.
     This is a good first step when creating a new scene.
     """
+    logger.info("Tool called: setup_scene(clear=%s, camera=%s, light=%s, ground=%s)",
+                clear_default, add_camera, add_light, add_ground_plane)
     cam_parts = [float(x.strip()) for x in camera_location.split(",")]
     cam_x, cam_y, cam_z = cam_parts[0], cam_parts[1], cam_parts[2]
 
@@ -595,25 +653,24 @@ print("Added ground plane")
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
+        logger.info("setup_scene succeeded")
         return "Scene setup complete."
     except Exception as e:
+        logger.error("setup_scene failed", exc_info=True)
         return f"Error setting up scene: {str(e)}"
 
 
-def render_scene(
-    output_path: Annotated[
-        str, "Output file path for the render (e.g. '/tmp/render.png')"
-    ] = "/tmp/render.png",
-    resolution_x: Annotated[int, "Render width in pixels"] = 1920,
-    resolution_y: Annotated[int, "Render height in pixels"] = 1080,
-    samples: Annotated[int, "Number of render samples (higher = better quality but slower)"] = 64,
-    engine: Annotated[str, "Render engine: 'CYCLES' or 'BLENDER_EEVEE_NEXT'"] = "BLENDER_EEVEE_NEXT",
+def _do_render(
+    label: str,
+    output_path: str,
+    resolution_x: int,
+    resolution_y: int,
+    samples: int,
+    engine: str,
 ) -> str:
-    """
-    Render the current scene to an image file using the specified render engine.
-    Returns the rendered image as base64 PNG.
-    EEVEE is faster, Cycles produces higher quality.
-    """
+    """Shared render helper used by render_preview and render_final."""
+    logger.info("%s: rendering %dx%d, samples=%d, engine=%r",
+                label, resolution_x, resolution_y, samples, engine)
     code = f"""
 import bpy
 
@@ -637,15 +694,49 @@ print("Render complete: {output_path}")
         if os.path.exists(output_path):
             with open(output_path, "rb") as f:
                 image_bytes = f.read()
-            # Upload to Azure Blob Storage and return URL
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            blob_name = f"render_{timestamp}_{uuid.uuid4().hex[:8]}.png"
+            blob_name = f"{label}_{timestamp}_{uuid.uuid4().hex[:8]}.png"
             blob_url = upload_image_to_blob(image_bytes, blob_name)
-            return f"Render complete ({resolution_x}x{resolution_y}).\nInclude the following image link in your response exactly as-is:\n\n![render]({blob_url})"
+            logger.info("%s succeeded: %dx%d, uploaded to blob", label, resolution_x, resolution_y)
+            return f"Render complete ({resolution_x}x{resolution_y}).\nInclude the following image link in your response exactly as-is:\n\n![{label}]({blob_url})"
         else:
+            logger.warning("%s: output file not found at %r", label, output_path)
             return f"Render command executed but output file not found. {result.get('result', '')}"
     except Exception as e:
+        logger.error("%s failed", label, exc_info=True)
         return f"Error rendering: {str(e)}"
+
+
+def render_preview(
+    output_path: Annotated[
+        str, "Output file path for the preview render"
+    ] = "/tmp/preview.png",
+    resolution_x: Annotated[int, "Preview width in pixels"] = 960,
+    resolution_y: Annotated[int, "Preview height in pixels"] = 540,
+    samples: Annotated[int, "Number of preview samples (keep low for speed)"] = 16,
+    engine: Annotated[str, "Render engine: 'CYCLES' or 'BLENDER_EEVEE_NEXT'"] = "BLENDER_EEVEE_NEXT",
+) -> str:
+    """
+    Fast low-resolution preview render. Use this FIRST so the user can see a
+    quick result before committing to a full-quality render.
+    """
+    return _do_render("preview", output_path, resolution_x, resolution_y, samples, engine)
+
+
+def render_final(
+    output_path: Annotated[
+        str, "Output file path for the final render"
+    ] = "/tmp/render.png",
+    resolution_x: Annotated[int, "Render width in pixels"] = 1920,
+    resolution_y: Annotated[int, "Render height in pixels"] = 1080,
+    samples: Annotated[int, "Number of render samples (higher = better quality)"] = 128,
+    engine: Annotated[str, "Render engine: 'CYCLES' or 'BLENDER_EEVEE_NEXT'"] = "BLENDER_EEVEE_NEXT",
+) -> str:
+    """
+    Full-resolution final render. Always call render_preview() first so the
+    user gets a quick result, then follow up with this for the polished image.
+    """
+    return _do_render("render", output_path, resolution_x, resolution_y, samples, engine)
 
 
 # ──────────────────────────────────────────────
@@ -665,12 +756,15 @@ _TOOL_STATUS_MESSAGES: dict[str, str] = {
     "download_polyhaven_asset": "Downloading asset from Poly Haven…",
     "apply_polyhaven_texture": "Applying Poly Haven texture…",
     "setup_scene": "Setting up the scene…",
-    "render_scene": "Rendering the scene…",
+    "render_preview": "Rendering a quick preview…",
+    "render_final": "Rendering the final image (this may take a moment)…",
 }
 
 
 class ToolStatusMiddleware(AgentMiddleware):
-    """Injects short status text updates into the SSE stream before each tool call."""
+    """Injects status updates and streams preview images immediately."""
+
+    _PREVIEW_IMAGE_RE = re.compile(r"!\[preview\]\([^)]+\)")
 
     async def process(self, context: AgentRunContext, next) -> None:
         await next(context)
@@ -682,13 +776,18 @@ class ToolStatusMiddleware(AgentMiddleware):
 
         async def _wrapped():
             announced: set[str] = set()
+            # Track which call_ids belong to render_preview
+            preview_call_ids: set[str] = set()
+
             async for update in original_stream:
-                # Look for a new function-call content we haven't announced yet
                 for content in (update.contents or []):
+                    # ── Status messages before each tool call ──
                     if isinstance(content, FunctionCallContent):
                         call_id = content.call_id or content.name
                         if call_id and call_id not in announced:
                             announced.add(call_id)
+                            if content.name == "render_preview":
+                                preview_call_ids.add(call_id)
                             status = _TOOL_STATUS_MESSAGES.get(
                                 content.name, "Working on it…"
                             )
@@ -697,6 +796,25 @@ class ToolStatusMiddleware(AgentMiddleware):
                                 role="assistant",
                                 message_id=f"status-{call_id}",
                             )
+
+                    # ── Stream preview image to user immediately ──
+                    if isinstance(content, FunctionResultContent):
+                        cid = content.call_id or ""
+                        if cid in preview_call_ids:
+                            match = self._PREVIEW_IMAGE_RE.search(
+                                content.result or ""
+                            )
+                            if match:
+                                yield AgentRunResponseUpdate(
+                                    contents=[
+                                        TextContent(
+                                            text=f"\n\nHere's a quick preview while the final render is in progress:\n\n{match.group(0)}\n\n"
+                                        )
+                                    ],
+                                    role="assistant",
+                                    message_id=f"preview-img-{cid}",
+                                )
+
                 yield update
 
         context.result = _wrapped()
@@ -730,7 +848,8 @@ async def main():
 - Use setup_scene() to initialize camera and lighting when starting a new scene.
 - Use Poly Haven assets for high-quality textures, HDRIs, and models.
 - Position objects thoughtfully — avoid overlapping, ensure proper scale (1 unit = 1 meter).
-- Rotation values are in degrees. Use render_scene() for high-quality final renders.
+- Rotation values are in degrees.
+- **Rendering workflow**: When the user asks for a render, ALWAYS call render_preview() first, then IMMEDIATELY call render_final(). The preview image is automatically streamed to the user by the system — do NOT include the preview image in your text response. Only include the final render image from render_final() in your response.
 - Poly Haven asset types: hdris (environment lighting), textures (materials), models (3D models).
 - NEVER set `collection.name` — it is read-only in this Blender environment. To organize objects, create new collections with `bpy.data.collections.new("Name")` and link them to the scene with `bpy.context.scene.collection.children.link(new_collection)` instead of renaming existing ones.
 - When a tool returns an image in markdown format (e.g. `![screenshot](url)` or `![render](url)`), you MUST include that exact markdown image link in your response so the chat client can display the image. Never omit, summarize, or rewrite the image URL.
@@ -748,12 +867,13 @@ async def main():
                 download_polyhaven_asset,
                 apply_polyhaven_texture,
                 setup_scene,
-                render_scene,
+                render_preview,
+                render_final,
             ],
         )
 
         print("Blender Scene Agent running on http://localhost:8088")
-        server = from_agent_framework(agent)
+        server = from_agent_framework(agent, thread_repository=InMemoryAgentThreadRepository())
         await server.run_async()
 
 

@@ -1,7 +1,7 @@
 {
   "hostedAgentDeployOptions": {
-    "dockerContextPath": "/Users/davrous/AIFoundryProjects/mypythonhotels",
-    "dockerfilePath": "/Users/davrous/AIFoundryProjects/mypythonhotels/Dockerfile",
+    "dockerContextPath": "d:\\Code\\blenderagent",
+    "dockerfilePath": "d:\\Code\\blenderagent\\Dockerfile",
     "cpu": "2.0",
     "memory": "4.0Gi"
   }

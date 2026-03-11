@@ -7,6 +7,7 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DISPLAY=:99
+ENV PYTHONUNBUFFERED=1
 
 # ── 1. System packages ──
 RUN apt-get update && apt-get install -y --no-install-recommends \
