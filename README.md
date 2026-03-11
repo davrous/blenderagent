@@ -74,6 +74,8 @@ docker run -it --rm \
   blender-scene-agent
 ```
 
+#### macOS / Linux
+
 ```bash
 docker run -it --rm -p 8088:8088 \
   --env-file .env \
@@ -81,7 +83,27 @@ docker run -it --rm -p 8088:8088 \
   blender-scene-agent
 ```
 
-Or mount Azure CLI credentials for local development:
+#### Windows (PowerShell)
+
+On Windows, the Azure CLI token cache is encrypted via DPAPI and cannot be read inside a Linux container. The entrypoint will automatically detect this and prompt you to log in via device code flow.
+
+1. **Ensure your `.env` file uses Unix (LF) line endings**, not Windows (CRLF). CRLF line endings cause `\r` to be appended to environment variable values inside the container, which breaks authentication. You can convert it in VS Code (click "CRLF" in the status bar and select "LF") or run:
+   ```powershell
+   $c = Get-Content .env -Raw; $c -replace "`r`n","`n" | Set-Content .env -NoNewline
+   ```
+
+2. Run the container — no volume mount needed:
+   ```powershell
+   docker run -it --rm -p 8088:8088 --env-file .env blender-scene-agent
+   ```
+   The container will display an `az login` device code prompt. Open the URL in your browser, enter the code, and the agent will start.
+
+   If you prefer to mount credentials explicitly (e.g., if you've set up an unencrypted token cache), use:
+   ```powershell
+   docker run -it --rm -p 8088:8088 --env-file .env -v "${env:USERPROFILE}/.azure:/root/.azure:ro" blender-scene-agent
+   ```
+
+Or mount Azure CLI credentials for local development (macOS/Linux):
 
 ```bash
 docker run -it --rm \

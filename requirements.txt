@@ -1,7 +1,7 @@
-azure-ai-agentserver-agentframework==1.0.0b10
+azure-ai-agentserver-agentframework==1.0.0b15
 # azure-ai-projects 2.0.0b4 breaks PromptAgentDefinitionText; 2.0.0b3 is the last compatible
-azure-ai-projects==2.0.0b3
-opentelemetry-semantic-conventions-ai==0.4.13
+# azure-ai-projects==2.0.0b3
+# opentelemetry-semantic-conventions-ai==0.4.13
 python-dotenv
 azure-identity
 azure-storage-blob

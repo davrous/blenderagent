@@ -48,7 +48,21 @@ while ! nc -z localhost 9876 2>/dev/null; do
 done
 echo "Blender MCP socket server is ready (waited ${WAITED}s)"
 
-# ── 4. Start the Python Agent server ──
+# ── 4. Ensure Azure credentials are available ──
+# On Windows, the MSAL token cache is encrypted (DPAPI) and unreadable
+# inside a Linux container. If no valid credential is found, prompt
+# the user to log in interactively via device code.
+if ! az account show > /dev/null 2>&1; then
+    echo ""
+    echo "=============================================="
+    echo " No valid Azure credentials detected."
+    echo " Logging in via device code flow..."
+    echo "=============================================="
+    echo ""
+    az login --use-device-code
+fi
+
+# ── 5. Start the Python Agent server ──
 # Authentication is handled by DefaultAzureCredential in Python.
 # In Foundry Hosted, managed identity is injected automatically.
 echo "Starting Blender Scene Agent on port 8088..."

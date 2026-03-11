@@ -388,7 +388,17 @@ class BlenderMCPServer:
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""
         try:
-            namespace = {"bpy": bpy}
+            import mathutils
+            namespace = {
+                "bpy": bpy,
+                "mathutils": mathutils,
+                "Vector": mathutils.Vector,
+                "Matrix": mathutils.Matrix,
+                "Euler": mathutils.Euler,
+                "Quaternion": mathutils.Quaternion,
+                "Color": mathutils.Color,
+                "math": __import__("math"),
+            }
             capture_buffer = io.StringIO()
             with redirect_stdout(capture_buffer):
                 exec(code, namespace)
