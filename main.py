@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import sys
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -41,9 +42,18 @@ logger = logging.getLogger("blender_agent")
 logger.setLevel(logging.DEBUG)
 logger.propagate = False
 if not logger.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    logger.addHandler(_handler)
+    _fmt = logging.Formatter("%(levelname)s: %(name)s: %(message)s")
+    # DEBUG / INFO → stdout (so they don't appear as errors in console)
+    _stdout_handler = logging.StreamHandler(sys.stdout)
+    _stdout_handler.setLevel(logging.DEBUG)
+    _stdout_handler.addFilter(lambda r: r.levelno < logging.WARNING)
+    _stdout_handler.setFormatter(_fmt)
+    # WARNING+ → stderr
+    _stderr_handler = logging.StreamHandler(sys.stderr)
+    _stderr_handler.setLevel(logging.WARNING)
+    _stderr_handler.setFormatter(_fmt)
+    logger.addHandler(_stdout_handler)
+    logger.addHandler(_stderr_handler)
 
 # Azure AI Foundry configuration
 PROJECT_ENDPOINT = os.getenv("PROJECT_ENDPOINT")
@@ -358,6 +368,31 @@ def execute_blender_code(
     """
     logger.info("Tool called: execute_blender_code (code length=%d)", len(code))
     logger.debug("execute_blender_code code:\n%s", code)
+
+    # ── Blender 4.x compatibility patches (defense-in-depth) ──
+    _compat_replacements = [
+        ("ShaderNodeTexMusgrave", "ShaderNodeTexNoise"),
+        ("ShaderNodeMixRGB", "ShaderNodeMix"),
+        ("inputs['Specular']", "inputs['Specular IOR Level']"),
+        ('inputs["Specular"]', 'inputs["Specular IOR Level"]'),
+        ("inputs['Subsurface']", "inputs['Subsurface Weight']"),
+        ('inputs["Subsurface"]', 'inputs["Subsurface Weight"]'),
+        ("inputs['Transmission']", "inputs['Transmission Weight']"),
+        ('inputs["Transmission"]', 'inputs["Transmission Weight"]'),
+        ("inputs['Emission']", "inputs['Emission Color']"),
+        ('inputs["Emission"]', 'inputs["Emission Color"]'),
+        ("inputs['Clearcoat']", "inputs['Coat']"),
+        ('inputs["Clearcoat"]', 'inputs["Coat"]'),
+        ("inputs['Clearcoat Roughness']", "inputs['Coat Roughness']"),
+        ('inputs["Clearcoat Roughness"]', 'inputs["Coat Roughness"]'),
+        ("inputs['Sheen']", "inputs['Sheen Weight']"),
+        ('inputs["Sheen"]', 'inputs["Sheen Weight"]'),
+    ]
+    for old, new in _compat_replacements:
+        if old in code:
+            logger.warning("Blender 4.x compat: replacing deprecated '%s' → '%s'", old, new)
+            code = code.replace(old, new)
+
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
@@ -727,14 +762,16 @@ def render_final(
     output_path: Annotated[
         str, "Output file path for the final render"
     ] = "/tmp/render.png",
-    resolution_x: Annotated[int, "Render width in pixels"] = 1920,
-    resolution_y: Annotated[int, "Render height in pixels"] = 1080,
-    samples: Annotated[int, "Number of render samples (higher = better quality)"] = 128,
+    resolution_x: Annotated[int, "Render width in pixels"] = 640,
+    resolution_y: Annotated[int, "Render height in pixels"] = 480,
+    samples: Annotated[int, "Number of render samples (higher = better quality)"] = 32,
     engine: Annotated[str, "Render engine: 'CYCLES' or 'BLENDER_EEVEE_NEXT'"] = "BLENDER_EEVEE_NEXT",
 ) -> str:
     """
-    Full-resolution final render. Always call render_preview() first so the
-    user gets a quick result, then follow up with this for the polished image.
+    High-fidelity render. Default resolution is 640x480 at 32 samples.
+    For higher resolutions requested by the user, first render a quick
+    640x480 preview, return it, and ask the user to confirm before
+    proceeding with the full resolution at 256 samples.
     """
     return _do_render("render", output_path, resolution_x, resolution_y, samples, engine)
 
@@ -775,7 +812,11 @@ class ToolStatusMiddleware(AgentMiddleware):
         original_stream = context.result
 
         async def _wrapped():
-            announced: set[str] = set()
+            # Deduplicate by tool *name* so that multiple streaming chunks
+            # for the same logical invocation don't produce repeated status
+            # messages (the framework can emit several FunctionCallContent
+            # objects with different call_ids for one invocation).
+            announced_names: set[str] = set()
             # Track which call_ids belong to render_preview
             preview_call_ids: set[str] = set()
 
@@ -784,17 +825,17 @@ class ToolStatusMiddleware(AgentMiddleware):
                     # ── Status messages before each tool call ──
                     if isinstance(content, FunctionCallContent):
                         call_id = content.call_id or content.name
-                        if call_id and call_id not in announced:
-                            announced.add(call_id)
-                            if content.name == "render_preview":
-                                preview_call_ids.add(call_id)
+                        if content.name == "render_preview" and call_id:
+                            preview_call_ids.add(call_id)
+                        if content.name and content.name not in announced_names:
+                            announced_names.add(content.name)
                             status = _TOOL_STATUS_MESSAGES.get(
                                 content.name, "Working on it…"
                             )
                             yield AgentRunResponseUpdate(
                                 contents=[TextContent(text=f"\n\n*{status}*\n\n")],
                                 role="assistant",
-                                message_id=f"status-{call_id}",
+                                message_id=f"status-{content.name}",
                             )
 
                     # ── Stream preview image to user immediately ──
@@ -840,6 +881,8 @@ async def main():
             middleware=ToolStatusMiddleware(),
             instructions="""You are an expert 3D scene creation assistant powered by Blender.
 
+**CRITICAL: This environment runs Blender 4.4. All generated Python code MUST use the Blender 4.x Python API. Many Blender 3.x APIs were removed or renamed in 4.0. NEVER use deprecated Blender 3.x node types, input names, or enums — they will cause runtime errors. When uncertain about an API, prefer the Blender 4.x naming conventions listed in the "Blender 4.x API Compatibility" section below.**
+
 ## Guidelines
 - Call get_scene_info() ONLY when you need to know what objects already exist (e.g. before modifying or deleting). Skip it for fresh scene creation.
 - Take ONE viewport screenshot at the very end after ALL changes are complete, or when the user explicitly asks. NEVER take intermediate screenshots between steps.
@@ -849,10 +892,36 @@ async def main():
 - Use Poly Haven assets for high-quality textures, HDRIs, and models.
 - Position objects thoughtfully — avoid overlapping, ensure proper scale (1 unit = 1 meter).
 - Rotation values are in degrees.
-- **Rendering workflow**: When the user asks for a render, ALWAYS call render_preview() first, then IMMEDIATELY call render_final(). The preview image is automatically streamed to the user by the system — do NOT include the preview image in your text response. Only include the final render image from render_final() in your response.
+- **Rendering workflow**:
+  1. When the user asks for a high-fidelity render WITHOUT specifying a resolution (or at 640x480 or smaller): call render_final() ONCE at **640x480 with 32 samples**. Do NOT call render_preview() — a single render_final() call is sufficient. Include the render image from render_final() in your response.
+  2. When the user asks for a high-fidelity render at a resolution HIGHER than 640x480 (e.g. 1920x1080): first call render_final() at **640x480 with 32 samples** as a quick preview, return that image to the user immediately, then ASK the user to confirm whether they want to generate the higher-resolution version. If confirmed, call render_final() again at the **requested resolution with 256 samples** and return that image.
 - Poly Haven asset types: hdris (environment lighting), textures (materials), models (3D models).
 - NEVER set `collection.name` — it is read-only in this Blender environment. To organize objects, create new collections with `bpy.data.collections.new("Name")` and link them to the scene with `bpy.context.scene.collection.children.link(new_collection)` instead of renaming existing ones.
+- The render engine enum for Eevee in Blender 4.x is `'BLENDER_EEVEE_NEXT'`, NOT `'BLENDER_EEVEE'`. Valid engines are: `'BLENDER_EEVEE_NEXT'`, `'BLENDER_WORKBENCH'`, `'CYCLES'`.
 - When a tool returns an image in markdown format (e.g. `![screenshot](url)` or `![render](url)`), you MUST include that exact markdown image link in your response so the chat client can display the image. Never omit, summarize, or rewrite the image URL.
+
+## Blender 4.x API Compatibility (MUST follow)
+This environment runs **Blender 4.4**. The following Blender 3.x APIs were removed or renamed and MUST NOT be used:
+
+### Removed Shader Nodes
+- `ShaderNodeTexMusgrave` → REMOVED. Use `ShaderNodeTexNoise` instead. For Musgrave-like marble/terrain effects, use noise textures with appropriate scale, detail, roughness, and distortion settings.
+- `ShaderNodeMixRGB` → REMOVED. Use `ShaderNodeMix` with `data_type = 'RGBA'` for color mixing. Inputs are named `A`, `B`, `Factor` (NOT `Color1`/`Color2`/`Fac`). Output is named `Result` (NOT `Color`).
+
+### Renamed Principled BSDF Inputs (ShaderNodeBsdfPrincipled)
+- `'Specular'` → use `'Specular IOR Level'`
+- `'Transmission'` → use `'Transmission Weight'`
+- `'Subsurface'` → use `'Subsurface Weight'`
+- `'Subsurface Color'` → REMOVED (use `'Base Color'` directly)
+- `'Emission'` → use `'Emission Color'`
+- `'Clearcoat'` → use `'Coat'`; `'Clearcoat Roughness'` → `'Coat Roughness'`; `'Clearcoat Normal'` → `'Coat Normal'`
+- `'Sheen'` → use `'Sheen Weight'`
+
+### Render Engine Enums
+- `'BLENDER_EEVEE'` → use `'BLENDER_EEVEE_NEXT'`
+
+### Other Changes
+- `ShaderNodeValToRGB` (ColorRamp): Cannot remove all elements (minimum 1 required). Modify existing elements' position and color instead of deleting and recreating.
+- Never set `collection.name` (read-only). Use `bpy.data.collections.new("Name")` instead.
 """,
             tools=[
                 get_scene_info,

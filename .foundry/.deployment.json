@@ -1,8 +1,8 @@
 {
   "hostedAgentDeployOptions": {
-    "dockerContextPath": "d:\\Code\\blenderagent",
-    "dockerfilePath": "d:\\Code\\blenderagent\\Dockerfile",
-    "cpu": "2.0",
-    "memory": "4.0Gi"
+    "dockerContextPath": "/Users/davrous/AIFoundryProjects/HostedBlenderAgent",
+    "dockerfilePath": "/Users/davrous/AIFoundryProjects/HostedBlenderAgent/Dockerfile",
+    "cpu": "3.0",
+    "memory": "6.0Gi"
   }
 }

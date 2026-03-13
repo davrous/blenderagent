@@ -7,7 +7,11 @@ running inside Blender. Uses the same JSON-over-TCP protocol as blender-mcp.
 import json
 import logging
 import os
+import select
 import socket
+import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -19,6 +23,14 @@ logger = logging.getLogger("BlenderConnection")
 
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9876
+
+# Retry configuration (overridable via environment variables)
+CONNECT_MAX_RETRIES = int(os.getenv("BLENDER_CONNECT_RETRIES", "5"))
+COMMAND_MAX_RETRIES = int(os.getenv("BLENDER_COMMAND_RETRIES", "3"))
+RETRY_BACKOFF_BASE = float(os.getenv("BLENDER_RETRY_BACKOFF", "1.0"))
+
+# Transient errors that warrant a retry
+_TRANSIENT_ERRORS = (ConnectionError, BrokenPipeError, ConnectionResetError, socket.timeout, OSError)
 
 
 @dataclass
@@ -119,60 +131,130 @@ class BlenderConnection:
     def send_command(
         self, command_type: str, params: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """Send a command to Blender and return the response."""
-        if not self.sock and not self.connect():
-            raise ConnectionError("Not connected to Blender")
+        """Send a command to Blender and return the response.
 
-        command = {"type": command_type, "params": params or {}}
+        On transient connection errors, automatically retries up to
+        COMMAND_MAX_RETRIES times with exponential backoff.
+        Blender application-level errors are never retried.
+        """
+        last_error: Optional[Exception] = None
 
-        try:
-            logger.debug(
-                f"Sending command: {command_type}"
-            )
-            self.sock.sendall(json.dumps(command).encode("utf-8"))
-            logger.debug("Command sent, waiting for response...")
+        for attempt in range(1, COMMAND_MAX_RETRIES + 1):
+            # Ensure we have a live socket
+            if not self.sock and not self.connect():
+                last_error = ConnectionError("Not connected to Blender")
+                if attempt < COMMAND_MAX_RETRIES:
+                    delay = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                    logger.warning(
+                        "send_command connect failed (attempt %d/%d), retrying in %.1fs",
+                        attempt, COMMAND_MAX_RETRIES, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise last_error
 
-            self.sock.settimeout(180.0)
-            response_data = self._receive_full_response(self.sock)
-            logger.debug(f"Received {len(response_data)} bytes of data")
+            command = {"type": command_type, "params": params or {}}
 
-            response = json.loads(response_data.decode("utf-8"))
-            logger.debug(
-                f"Response parsed, status: {response.get('status', 'unknown')}"
-            )
+            try:
+                logger.debug(f"Sending command: {command_type} (attempt {attempt}/{COMMAND_MAX_RETRIES})")
+                self.sock.sendall(json.dumps(command).encode("utf-8"))
+                logger.debug("Command sent, waiting for response...")
 
-            if response.get("status") == "error":
-                logger.error(f"Blender error: {response.get('message')}")
-                raise Exception(
-                    response.get("message", "Unknown error from Blender")
+                self.sock.settimeout(180.0)
+                response_data = self._receive_full_response(self.sock)
+                logger.debug(f"Received {len(response_data)} bytes of data")
+
+                response = json.loads(response_data.decode("utf-8"))
+                logger.debug(
+                    f"Response parsed, status: {response.get('status', 'unknown')}"
                 )
 
-            return response.get("result", {})
+                # Application-level Blender errors are NOT retried
+                if response.get("status") == "error":
+                    logger.error(f"Blender error: {response.get('message')}")
+                    raise Exception(
+                        response.get("message", "Unknown error from Blender")
+                    )
 
-        except socket.timeout:
-            logger.error(
-                "Socket timeout while waiting for response from Blender"
-            )
-            self.sock = None
-            raise Exception(
-                "Timeout waiting for Blender response - try simplifying your request"
-            )
-        except (
-            ConnectionError,
-            BrokenPipeError,
-            ConnectionResetError,
-        ) as e:
-            logger.error(f"Socket connection error: {str(e)}")
-            self.sock = None
-            raise Exception(f"Connection to Blender lost: {str(e)}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON response from Blender: {str(e)}")
-            self.sock = None
-            raise Exception(f"Invalid response from Blender: {str(e)}")
-        except Exception as e:
-            logger.error(f"Error communicating with Blender: {str(e)}")
-            self.sock = None
-            raise Exception(f"Communication error with Blender: {str(e)}")
+                return response.get("result", {})
+
+            except _TRANSIENT_ERRORS as e:
+                # Transient connection/socket error — invalidate and retry
+                logger.warning(
+                    "Transient error on attempt %d/%d for '%s': %s",
+                    attempt, COMMAND_MAX_RETRIES, command_type, e,
+                )
+                self.disconnect()
+                last_error = e
+                if attempt < COMMAND_MAX_RETRIES:
+                    if not _is_blender_alive():
+                        logger.error("Blender process is not running — skipping remaining retries")
+                        raise Exception(
+                            f"Blender process is not running. Connection lost after {attempt} attempt(s)."
+                        )
+                    delay = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                    logger.warning("Retrying in %.1fs…", delay)
+                    time.sleep(delay)
+                    continue
+                raise Exception(
+                    f"Connection to Blender lost after {COMMAND_MAX_RETRIES} attempts: {e}"
+                )
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON response from Blender: {str(e)}")
+                self.disconnect()
+                raise Exception(f"Invalid response from Blender: {str(e)}")
+
+            except Exception as e:
+                # Non-transient error (e.g. Blender app error) — do not retry
+                error_msg = str(e)
+                if self.sock is None or not error_msg:
+                    self.disconnect()
+                logger.error(f"Error communicating with Blender: {error_msg}")
+                raise
+
+        # Should not reach here, but safety net
+        raise Exception(
+            f"Failed to send command '{command_type}' after {COMMAND_MAX_RETRIES} attempts"
+        )
+
+
+# ──────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────
+
+
+def _is_blender_alive() -> bool:
+    """Check whether a Blender process is running on this machine."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "blender"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        # pgrep not available (e.g. minimal container) — assume alive
+        return True
+
+
+def _is_socket_healthy(sock: socket.socket) -> bool:
+    """Lightweight check: socket is connected and has no pending errors."""
+    try:
+        sock.getpeername()
+        # select with timeout 0 → check if socket is readable (would mean
+        # data waiting or EOF/error). A healthy idle socket is NOT readable.
+        readable, _, errored = select.select([sock], [], [sock], 0)
+        if errored:
+            return False
+        if readable:
+            # Peek without consuming — if recv returns b'' the peer closed.
+            data = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+            if not data:
+                return False
+        return True
+    except Exception:
+        return False
 
 
 # ──────────────────────────────────────────────
@@ -180,44 +262,64 @@ class BlenderConnection:
 # ──────────────────────────────────────────────
 
 _blender_connection: Optional[BlenderConnection] = None
+_connection_lock = threading.Lock()
 
 
 def get_blender_connection() -> BlenderConnection:
-    """Get or create a persistent Blender connection (singleton)."""
+    """Get or create a persistent Blender connection (singleton).
+
+    Thread-safe. Retries with exponential backoff up to CONNECT_MAX_RETRIES
+    times if the initial connection attempt fails.
+    """
     global _blender_connection
 
-    # Validate existing connection with a lightweight socket check (no TCP round-trip)
-    if _blender_connection is not None:
-        try:
-            if _blender_connection.sock is not None:
-                _blender_connection.sock.getpeername()
+    with _connection_lock:
+        # Validate existing connection
+        if _blender_connection is not None:
+            if _blender_connection.sock is not None and _is_socket_healthy(_blender_connection.sock):
                 return _blender_connection
-            else:
-                raise Exception("Socket is None")
-        except Exception as e:
-            logger.warning(
-                f"Existing connection is no longer valid: {str(e)}"
-            )
+            # Socket is dead — tear down
+            reason = "socket dropped" if _blender_connection.sock is not None else "socket is None"
+            logger.warning("Existing connection is no longer valid: %s", reason)
             try:
                 _blender_connection.disconnect()
-            except:
+            except Exception:
                 pass
             _blender_connection = None
 
-    # Create new connection
-    if _blender_connection is None:
+        # Create new connection with retry + backoff
         host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
         port = int(os.getenv("BLENDER_PORT", str(DEFAULT_PORT)))
-        _blender_connection = BlenderConnection(host=host, port=port)
-        if not _blender_connection.connect():
-            logger.error("Failed to connect to Blender")
-            _blender_connection = None
-            raise Exception(
-                "Could not connect to Blender. Make sure Blender is running with the addon."
-            )
-        logger.debug("Created new persistent connection to Blender")
 
-    return _blender_connection
+        for attempt in range(1, CONNECT_MAX_RETRIES + 1):
+            conn = BlenderConnection(host=host, port=port)
+            if conn.connect():
+                _blender_connection = conn
+                logger.info(
+                    "Connected to Blender at %s:%s (attempt %d/%d)",
+                    host, port, attempt, CONNECT_MAX_RETRIES,
+                )
+                return _blender_connection
+
+            # Connection failed — check if Blender is even running
+            if not _is_blender_alive():
+                logger.error("Blender process is not running — aborting connection attempts")
+                raise Exception(
+                    "Blender process is not running. Cannot establish connection."
+                )
+
+            if attempt < CONNECT_MAX_RETRIES:
+                delay = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                logger.warning(
+                    "Connection attempt %d/%d failed, retrying in %.1fs…",
+                    attempt, CONNECT_MAX_RETRIES, delay,
+                )
+                time.sleep(delay)
+
+        raise Exception(
+            f"Could not connect to Blender after {CONNECT_MAX_RETRIES} attempts. "
+            "Make sure Blender is running with the addon."
+        )
 
 
 def close_blender_connection():

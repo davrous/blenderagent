@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/microsoft/AgentSchema/refs/heads/main/schemas/v1.0/ContainerAgent.yaml
 
 kind: hosted
-name: blender-scene-agent
+name: blender-scene-agent-v2
 description: >
   An AI agent that creates and manipulates 3D scenes in Blender.
   Communicates with a headless Blender instance via TCP socket to create
