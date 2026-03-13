@@ -53,6 +53,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY blender_startup.py .
 COPY blender_connection.py .
+COPY scene_manager.py .
 COPY entrypoint.sh .
 COPY agent.yaml .
 

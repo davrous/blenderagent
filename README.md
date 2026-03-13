@@ -33,6 +33,7 @@ An AI agent that creates and manipulates 3D scenes in a headless Blender instanc
 - **Viewport screenshots**: Capture and return the current viewport as base64 PNG
 - **Full render**: Render scenes with EEVEE or Cycles engines
 - **Arbitrary code execution**: Run custom Blender Python code for advanced operations
+- **Per-conversation scene isolation**: Each conversation gets its own Blender scene, saved/restored from Azure Blob Storage
 
 ## Files
 
@@ -41,15 +42,36 @@ An AI agent that creates and manipulates 3D scenes in a headless Blender instanc
 | `main.py` | Agent server with 13 tool functions, Azure AI Foundry client |
 | `blender_startup.py` | Blender addon (runs inside Blender) - TCP socket server on port 9876 |
 | `blender_connection.py` | TCP client module used by the agent to talk to Blender |
+| `scene_manager.py` | Per-conversation Blender scene isolation with Azure Blob Storage persistence |
 | `entrypoint.sh` | Docker entrypoint: starts Xvfb, Blender, then Agent server |
 | `agent.yaml` | Agent metadata and environment variable declarations |
 | `Dockerfile` | Ubuntu 22.04 + Blender 4.2 + Python deps |
+
+## Per-Conversation Scene Isolation
+
+The agent supports **multiple concurrent conversations**, each with its own isolated Blender scene. This is handled by the `SceneIsolationMiddleware` (in `main.py`) and `SceneManager` (in `scene_manager.py`).
+
+### How it works
+
+1. **User A** starts a conversation and builds a scene. At the end of each request, the Blender scene is saved as a `.blend` file and uploaded to Azure Blob Storage, keyed by the conversation's thread ID.
+2. **User B** starts a separate conversation. User A's scene is automatically saved, Blender is reset to a clean state, and User B gets a fresh scene.
+3. **User A returns** in the same conversation. User B's scene is saved, and User A's scene is restored from Blob Storage — exactly as they left it.
+
+Scenes are stored in the `blender-scenes` container in Azure Blob Storage under `scenes/<thread-id>.blend`. The container is created automatically on first use.
+
+### Thread ID lifecycle
+
+The conversation identifier comes from `context.thread.service_thread_id` in the Microsoft Agent Framework. On the **first request** of a new conversation, this ID is `None` (the Azure AI service assigns it during the streaming run). The middleware handles this by:
+- Skipping scene activation on first request (Blender starts clean)
+- Reading the thread ID **after streaming completes** (by which point the framework has set it) for the save operation
+- On subsequent requests, the thread is loaded from the `InMemoryAgentThreadRepository` with the ID already set
 
 ## Prerequisites
 
 - Docker
 - An Azure AI Foundry project with a deployed model (e.g., `gpt-4.1-mini`)
 - Azure credentials configured (e.g., `az login`)
+- The Azure account used with `az login` (for local development) must have the **Storage Blob Data Contributor** role on the storage account. This is required to upload screenshots and save Blender scenes to Blob Storage. See [step 2](#2-assign-the-storage-blob-data-contributor-role) below for the role assignment command.
 
 ## Setup for your own Azure environment
 
@@ -72,11 +94,21 @@ az storage account create \
 
 ### 2. Assign the Storage Blob Data Contributor role
 
-The agent authenticates to Blob Storage using `DefaultAzureCredential`. When running as a hosted agent in Azure AI Foundry, this means the **Foundry Project's managed identity (service principal)** needs the **Storage Blob Data Contributor** role on your storage account.
+The agent authenticates to Blob Storage using `DefaultAzureCredential`. This role is needed to upload screenshots and save/restore per-conversation Blender scenes.
+
+- **Hosted in Azure AI Foundry**: assign the role to the **Foundry Project's managed identity (service principal)**.
+- **Local development**: assign the role to **your own Azure account** (the one used with `az login`).
 
 ```bash
+# For the Foundry managed identity:
 az role assignment create \
   --assignee <foundry-project-service-principal-id> \
+  --role "Storage Blob Data Contributor" \
+  --scope /subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<your-storage-account-name>
+
+# For your local dev account:
+az role assignment create \
+  --assignee <your-azure-account-email-or-object-id> \
   --role "Storage Blob Data Contributor" \
   --scope /subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<your-storage-account-name>
 ```

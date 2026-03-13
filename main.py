@@ -37,6 +37,7 @@ from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
 from blender_connection import get_blender_connection, close_blender_connection
+from scene_manager import SceneManager
 
 logger = logging.getLogger("blender_agent")
 logger.setLevel(logging.DEBUG)
@@ -861,6 +862,128 @@ class ToolStatusMiddleware(AgentMiddleware):
         context.result = _wrapped()
 
 
+class SceneIsolationMiddleware(AgentMiddleware):
+    """Activates/saves per-conversation Blender scenes via blob storage.
+
+    Wraps an inner middleware (ToolStatusMiddleware) so that scene
+    isolation runs before/after the agent while status streaming
+    continues to work.
+
+    Key insight on thread lifecycle:
+      - On the FIRST request for a new conversation, the framework creates
+        a thread with service_thread_id = None.  The Azure AI service assigns
+        the real ID during the streaming run, and the framework mutates the
+        thread object in-place AFTER the last streaming chunk is yielded
+        (via _update_thread_with_type_and_conversation_id).
+      - On SUBSEQUENT requests, the thread is loaded from InMemoryAgentThread-
+        Repository and already has service_thread_id set.
+
+    Therefore:
+      - ACTIVATION (before run): uses service_thread_id if available.
+        On the first request it is None → we skip activation (no saved scene
+        exists yet anyway — Blender starts with a clean scene).
+      - SAVE (after streaming ends): reads service_thread_id from the thread
+        object which has been mutated by the framework by this point, so it
+        is always available.
+    """
+
+    def __init__(self, inner: AgentMiddleware, scene_manager: SceneManager):
+        self._inner = inner
+        self._scene_manager = scene_manager
+
+    @staticmethod
+    def _get_thread_id(context: AgentRunContext) -> str | None:
+        """Read service_thread_id from the context's thread, if available."""
+        thread = getattr(context, "thread", None)
+        if thread is not None:
+            sid = getattr(thread, "service_thread_id", None)
+            if sid:
+                return sid
+        return None
+
+    async def process(self, context: AgentRunContext, next) -> None:
+        thread = getattr(context, "thread", None)
+        logger.info(
+            "Scene isolation: process() called. thread=%r, service_thread_id=%r, is_streaming=%s",
+            thread,
+            getattr(thread, "service_thread_id", "N/A") if thread else "N/A",
+            context.is_streaming,
+        )
+
+        # ── ACTIVATE (before the agent runs) ──
+        conversation_id = self._get_thread_id(context)
+        if conversation_id:
+            logger.info("Scene isolation: activating scene for conversation %s", conversation_id)
+            await asyncio.to_thread(self._scene_manager.activate_scene, conversation_id)
+        else:
+            # First request for this conversation — no saved scene exists yet.
+            # Blender already has a clean scene or the previous scene for another
+            # conversation. We must save the OTHER conversation's scene (if any)
+            # and reset to a clean state.
+            prev = self._scene_manager._active_conversation_id
+            if prev:
+                logger.info(
+                    "Scene isolation: new conversation (no thread id yet). "
+                    "Saving previous conversation %s and resetting scene.",
+                    prev,
+                )
+                await asyncio.to_thread(self._scene_manager.save_scene, prev)
+                await asyncio.to_thread(self._scene_manager.reset_to_clean)
+            else:
+                logger.info("Scene isolation: first-ever request, no previous scene to save.")
+
+        # ── RUN the agent (inner middleware → actual LLM + tools) ──
+        await self._inner.process(context, next)
+
+        # ── SAVE (after the agent finishes) ──
+        # For streaming responses the agent hasn't fully run yet — the stream is
+        # lazily consumed.  We wrap the stream so that SAVE happens in a finally
+        # block after the very last chunk.
+        if context.is_streaming:
+            original_stream = context.result
+
+            async def _save_after_stream():
+                try:
+                    async for update in original_stream:
+                        yield update
+                finally:
+                    # By now the framework has finished streaming and has called
+                    # _update_thread_with_type_and_conversation_id, so the thread
+                    # object has service_thread_id set (even on the first request).
+                    save_id = self._get_thread_id(context)
+                    logger.info(
+                        "Scene isolation: stream ended. service_thread_id=%r",
+                        save_id,
+                    )
+                    if save_id:
+                        try:
+                            await asyncio.to_thread(self._scene_manager.save_scene, save_id)
+                            logger.info("Scene isolation: scene saved for conversation %s", save_id)
+                        except Exception:
+                            logger.error(
+                                "Scene isolation: failed to save scene for conversation %s",
+                                save_id, exc_info=True,
+                            )
+                    else:
+                        logger.error(
+                            "Scene isolation: stream ended but still no service_thread_id! "
+                            "thread=%r, attrs=%s",
+                            thread,
+                            {a: getattr(thread, a, None) for a in dir(thread) if not a.startswith("_")}
+                            if thread else "no thread",
+                        )
+
+            context.result = _save_after_stream()
+        else:
+            # Non-streaming: tools already ran, thread is updated.
+            save_id = self._get_thread_id(context)
+            if save_id:
+                logger.info("Scene isolation: saving scene (non-streaming) for conversation %s", save_id)
+                await asyncio.to_thread(self._scene_manager.save_scene, save_id)
+            else:
+                logger.error("Scene isolation: non-streaming run ended but no service_thread_id!")
+
+
 # ──────────────────────────────────────────────
 # Main entry point
 # ──────────────────────────────────────────────
@@ -876,9 +999,11 @@ async def main():
             credential=credential,
         ) as client,
     ):
+        scene_manager = SceneManager()
+
         agent = client.create_agent(
             name="BlenderSceneAgent",
-            middleware=ToolStatusMiddleware(),
+            middleware=SceneIsolationMiddleware(ToolStatusMiddleware(), scene_manager),
             instructions="""You are an expert 3D scene creation assistant powered by Blender.
 
 **CRITICAL: This environment runs Blender 4.4. All generated Python code MUST use the Blender 4.x Python API. Many Blender 3.x APIs were removed or renamed in 4.0. NEVER use deprecated Blender 3.x node types, input names, or enums — they will cause runtime errors. When uncertain about an API, prefer the Blender 4.x naming conventions listed in the "Blender 4.x API Compatibility" section below.**
