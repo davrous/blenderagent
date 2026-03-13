@@ -153,6 +153,11 @@ docker run -it --rm \
 | `setup_scene` | Initialize camera, lighting, and ground plane |
 | `render_scene` | Render the scene with EEVEE or Cycles |
 
+## Demos prompts
+
+- "Load a table from Poly Haven, place it at the center, create 12 metallic cubes of various colors around it and share a high fidelity rendering of the result""
+- "Add a plastic yellow sphere on top of the table"
+
 ## Credits
 
 - [BlenderMCP](https://github.com/ahujasid/blender-mcp) by Siddharth Ahuja - TCP socket protocol
