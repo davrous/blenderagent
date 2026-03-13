@@ -158,6 +158,8 @@ docker run -it --rm \
 - "Load a table from Poly Haven, place it at the center, create 12 metallic cubes of various colors around it and share a high fidelity rendering of the result""
 - "Add a plastic yellow sphere on top of the table"
 
+![Screenshot of the Foundry Hosted Blender Agent in action](ScreenshotDemoFoundryBlenderAgent.jpg)
+
 ## Credits
 
 - [BlenderMCP](https://github.com/ahujasid/blender-mcp) by Siddharth Ahuja - TCP socket protocol
