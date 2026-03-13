@@ -51,6 +51,57 @@ An AI agent that creates and manipulates 3D scenes in a headless Blender instanc
 - An Azure AI Foundry project with a deployed model (e.g., `gpt-4.1-mini`)
 - Azure credentials configured (e.g., `az login`)
 
+## Setup for your own Azure environment
+
+### 1. Create an Azure Blob Storage account and container
+
+The agent uploads viewport screenshots and rendered images to Azure Blob Storage so they can be returned as URLs to the user (see the `upload_image_to_blob` function in `main.py`). The container used is called **`screenshots`**.
+
+Create a storage account (or use an existing one):
+
+```bash
+az storage account create \
+  --name <your-storage-account-name> \
+  --resource-group <your-resource-group> \
+  --location <your-location> \
+  --sku Standard_LRS \
+  --allow-blob-public-access true
+```
+
+> The `screenshots` container will be created automatically by the agent on first use if it does not exist.
+
+### 2. Assign the Storage Blob Data Contributor role
+
+The agent authenticates to Blob Storage using `DefaultAzureCredential`. When running as a hosted agent in Azure AI Foundry, this means the **Foundry Project's managed identity (service principal)** needs the **Storage Blob Data Contributor** role on your storage account.
+
+```bash
+az role assignment create \
+  --assignee <foundry-project-service-principal-id> \
+  --role "Storage Blob Data Contributor" \
+  --scope /subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<your-storage-account-name>
+```
+
+> **Tip:** You can find the Foundry Project service principal (object ID) in the Azure Portal under your AI Foundry project's **Identity** blade, or by running:
+> ```bash
+> az ad sp show --id <client-id-of-your-foundry-project> --query id -o tsv
+> ```
+
+### 3. Update the `.env` file
+
+Copy or edit the `.env` file at the root of this project to match your environment:
+
+```env
+PROJECT_ENDPOINT=https://<your-foundry-resource>.services.ai.azure.com/api/projects/<your-project-name>
+MODEL_DEPLOYMENT_NAME=gpt-4.1-mini
+AZURE_STORAGE_ACCOUNT_NAME=<your-storage-account-name>
+```
+
+| Variable | Description |
+|----------|-------------|
+| `PROJECT_ENDPOINT` | The full endpoint URL of your Azure AI Foundry project |
+| `MODEL_DEPLOYMENT_NAME` | The name of the model deployment to use (e.g., `gpt-4.1-mini`) |
+| `AZURE_STORAGE_ACCOUNT_NAME` | The name of the Azure Storage account created in step 1 |
+
 ## Build & Run
 
 ### Build the Docker image
