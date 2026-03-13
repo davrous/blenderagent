@@ -56,6 +56,10 @@ if not logger.handlers:
     logger.addHandler(_stdout_handler)
     logger.addHandler(_stderr_handler)
 
+# Suppress harmless "Failed to detach context" errors from the framework's
+# internal OpenTelemetry instrumentation (async generator context mismatch).
+logging.getLogger("opentelemetry.context").setLevel(logging.CRITICAL)
+
 # Azure AI Foundry configuration
 PROJECT_ENDPOINT = os.getenv("PROJECT_ENDPOINT")
 

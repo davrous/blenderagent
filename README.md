@@ -168,22 +168,30 @@ docker run -it --rm -p 8088:8088 \
 
 #### Windows (PowerShell)
 
-On Windows, the Azure CLI token cache is encrypted via DPAPI and cannot be read inside a Linux container. The entrypoint will automatically detect this and prompt you to log in via device code flow.
+By default, the Azure CLI on Windows encrypts the token cache with DPAPI (a Windows-only API), so a Linux container cannot read mounted credentials. To get the same seamless experience as macOS, disable token cache encryption on your Windows host:
+
+```powershell
+# Run once on your Windows host:
+az config set core.encrypt_token_cache=false
+az account clear
+az login
+```
+
+> **Security note:** This stores Azure tokens in plaintext in `%USERPROFILE%\.azure`. This is the same behavior as on macOS/Linux. Re-enable encryption later with `az config set core.encrypt_token_cache=true` if needed.
 
 1. **Ensure your `.env` file uses Unix (LF) line endings**, not Windows (CRLF). CRLF line endings cause `\r` to be appended to environment variable values inside the container, which breaks authentication. You can convert it in VS Code (click "CRLF" in the status bar and select "LF") or run:
    ```powershell
    $c = Get-Content .env -Raw; $c -replace "`r`n","`n" | Set-Content .env -NoNewline
    ```
 
-2. Run the container — no volume mount needed:
-   ```powershell
-   docker run -it --rm -p 8088:8088 --env-file .env blender-scene-agent
-   ```
-   The container will display an `az login` device code prompt. Open the URL in your browser, enter the code, and the agent will start.
-
-   If you prefer to mount credentials explicitly (e.g., if you've set up an unencrypted token cache), use:
+2. Run the container with the volume mount — same as macOS:
    ```powershell
    docker run -it --rm -p 8088:8088 --env-file .env -v "${env:USERPROFILE}/.azure:/root/.azure:ro" blender-scene-agent
+   ```
+
+**Fallback (without unencrypted cache):** If you prefer not to disable encryption, omit the `-v` mount. The container will detect missing credentials and prompt an `az login --use-device-code` flow:
+   ```powershell
+   docker run -it --rm -p 8088:8088 --env-file .env blender-scene-agent
    ```
 
 Or mount Azure CLI credentials for local development (macOS/Linux):
