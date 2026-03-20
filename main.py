@@ -22,15 +22,14 @@ load_dotenv(override=True)
 
 from agent_framework import (
     AgentMiddleware,
-    AgentRunContext,
-    AgentRunResponseUpdate,
-    FunctionCallContent,
-    FunctionResultContent,
-    TextContent,
+    AgentContext,
+    AgentResponseUpdate,
+    Content,
+    ResponseStream,
 )
-from agent_framework.azure import AzureAIAgentClient
+from agent_framework.azure import AzureAIClient
 from azure.ai.agentserver.agentframework import from_agent_framework
-from azure.ai.agentserver.agentframework.persistence import InMemoryAgentThreadRepository
+from azure.ai.agentserver.agentframework.persistence import InMemoryAgentSessionRepository
 from azure.identity.aio import DefaultAzureCredential
 
 from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
@@ -134,15 +133,15 @@ def get_object_info(
         result = blender.send_command("get_object_info", {"name": object_name})
         # Return a concise summary instead of raw JSON to save LLM tokens
         lines = [f"Object '{result.get('name', object_name)}' ({result.get('type', '?')})"]
-        loc = result.get("location", {})
+        loc = result.get("location", [0, 0, 0])
         if loc:
-            lines.append(f"  Location: ({loc.get('x', 0)}, {loc.get('y', 0)}, {loc.get('z', 0)})")
-        rot = result.get("rotation", {})
+            lines.append(f"  Location: ({loc[0]}, {loc[1]}, {loc[2]})")
+        rot = result.get("rotation", [0, 0, 0])
         if rot:
-            lines.append(f"  Rotation: ({rot.get('x', 0)}, {rot.get('y', 0)}, {rot.get('z', 0)})")
-        sc = result.get("scale", {})
+            lines.append(f"  Rotation: ({rot[0]}, {rot[1]}, {rot[2]})")
+        sc = result.get("scale", [1, 1, 1])
         if sc:
-            lines.append(f"  Scale: ({sc.get('x', 1)}, {sc.get('y', 1)}, {sc.get('z', 1)})")
+            lines.append(f"  Scale: ({sc[0]}, {sc[1]}, {sc[2]})")
         mats = result.get("materials", [])
         if mats:
             mat_names = [m.get("name", "?") if isinstance(m, dict) else str(m) for m in mats]
@@ -804,14 +803,24 @@ _TOOL_STATUS_MESSAGES: dict[str, str] = {
 
 
 class ToolStatusMiddleware(AgentMiddleware):
-    """Injects status updates and streams preview images immediately."""
+    """Injects status updates and streams images from tools immediately."""
 
-    _PREVIEW_IMAGE_RE = re.compile(r"!\[preview\]\([^)]+\)")
+    # Matches any markdown image: ![alt](url)
+    _IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
 
-    async def process(self, context: AgentRunContext, next) -> None:
-        await next(context)
+    # Tools whose function_result may contain an image to surface
+    _IMAGE_TOOLS = {"get_viewport_screenshot", "render_preview", "render_final"}
 
-        if not context.is_streaming:
+    _IMAGE_LABELS: dict[str, str] = {
+        "render_preview": "Here's a quick preview while the final render is in progress:",
+        "render_final": "Here's the rendered image:",
+        "get_viewport_screenshot": "Here's the current viewport:",
+    }
+
+    async def process(self, context: AgentContext, call_next) -> None:
+        await call_next()
+
+        if not context.stream:
             return
 
         original_stream = context.result
@@ -822,48 +831,50 @@ class ToolStatusMiddleware(AgentMiddleware):
             # messages (the framework can emit several FunctionCallContent
             # objects with different call_ids for one invocation).
             announced_names: set[str] = set()
-            # Track which call_ids belong to render_preview
-            preview_call_ids: set[str] = set()
+            # Track call_ids for image-producing tools → tool name
+            image_call_ids: dict[str, str] = {}
 
             async for update in original_stream:
                 for content in (update.contents or []):
                     # ── Status messages before each tool call ──
-                    if isinstance(content, FunctionCallContent):
+                    if content.type == "function_call":
                         call_id = content.call_id or content.name
-                        if content.name == "render_preview" and call_id:
-                            preview_call_ids.add(call_id)
+                        if content.name in self._IMAGE_TOOLS and call_id:
+                            image_call_ids[call_id] = content.name
                         if content.name and content.name not in announced_names:
                             announced_names.add(content.name)
                             status = _TOOL_STATUS_MESSAGES.get(
                                 content.name, "Working on it…"
                             )
-                            yield AgentRunResponseUpdate(
-                                contents=[TextContent(text=f"\n\n*{status}*\n\n")],
+                            yield AgentResponseUpdate(
+                                contents=[Content.from_text(f"\n\n*{status}*\n\n")],
                                 role="assistant",
                                 message_id=f"status-{content.name}",
                             )
 
-                    # ── Stream preview image to user immediately ──
-                    if isinstance(content, FunctionResultContent):
+                    # ── Stream images from tool results immediately ──
+                    if content.type == "function_result":
                         cid = content.call_id or ""
-                        if cid in preview_call_ids:
-                            match = self._PREVIEW_IMAGE_RE.search(
+                        if cid in image_call_ids:
+                            match = self._IMAGE_RE.search(
                                 content.result or ""
                             )
                             if match:
-                                yield AgentRunResponseUpdate(
+                                tool_name = image_call_ids[cid]
+                                label = self._IMAGE_LABELS.get(tool_name, "")
+                                yield AgentResponseUpdate(
                                     contents=[
-                                        TextContent(
-                                            text=f"\n\nHere's a quick preview while the final render is in progress:\n\n{match.group(0)}\n\n"
+                                        Content.from_text(
+                                            f"\n\n{label}\n\n{match.group(0)}\n\n"
                                         )
                                     ],
                                     role="assistant",
-                                    message_id=f"preview-img-{cid}",
+                                    message_id=f"tool-img-{cid}",
                                 )
 
                 yield update
 
-        context.result = _wrapped()
+        context.result = ResponseStream(_wrapped())
 
 
 class SceneIsolationMiddleware(AgentMiddleware):
@@ -896,26 +907,26 @@ class SceneIsolationMiddleware(AgentMiddleware):
         self._scene_manager = scene_manager
 
     @staticmethod
-    def _get_thread_id(context: AgentRunContext) -> str | None:
-        """Read service_thread_id from the context's thread, if available."""
-        thread = getattr(context, "thread", None)
-        if thread is not None:
-            sid = getattr(thread, "service_thread_id", None)
+    def _get_conversation_id(context: AgentContext) -> str | None:
+        """Read session_id from the context's session, if available."""
+        session = context.session
+        if session is not None:
+            sid = getattr(session, "session_id", None)
             if sid:
                 return sid
         return None
 
-    async def process(self, context: AgentRunContext, next) -> None:
-        thread = getattr(context, "thread", None)
+    async def process(self, context: AgentContext, call_next) -> None:
+        session = context.session
         logger.info(
-            "Scene isolation: process() called. thread=%r, service_thread_id=%r, is_streaming=%s",
-            thread,
-            getattr(thread, "service_thread_id", "N/A") if thread else "N/A",
-            context.is_streaming,
+            "Scene isolation: process() called. session=%r, session_id=%r, stream=%s",
+            session,
+            getattr(session, "session_id", "N/A") if session else "N/A",
+            context.stream,
         )
 
         # ── ACTIVATE (before the agent runs) ──
-        conversation_id = self._get_thread_id(context)
+        conversation_id = self._get_conversation_id(context)
         if conversation_id:
             logger.info("Scene isolation: activating scene for conversation %s", conversation_id)
             await asyncio.to_thread(self._scene_manager.activate_scene, conversation_id)
@@ -937,13 +948,13 @@ class SceneIsolationMiddleware(AgentMiddleware):
                 logger.info("Scene isolation: first-ever request, no previous scene to save.")
 
         # ── RUN the agent (inner middleware → actual LLM + tools) ──
-        await self._inner.process(context, next)
+        await self._inner.process(context, call_next)
 
         # ── SAVE (after the agent finishes) ──
         # For streaming responses the agent hasn't fully run yet — the stream is
         # lazily consumed.  We wrap the stream so that SAVE happens in a finally
         # block after the very last chunk.
-        if context.is_streaming:
+        if context.stream:
             original_stream = context.result
 
             async def _save_after_stream():
@@ -954,9 +965,9 @@ class SceneIsolationMiddleware(AgentMiddleware):
                     # By now the framework has finished streaming and has called
                     # _update_thread_with_type_and_conversation_id, so the thread
                     # object has service_thread_id set (even on the first request).
-                    save_id = self._get_thread_id(context)
+                    save_id = self._get_conversation_id(context)
                     logger.info(
-                        "Scene isolation: stream ended. service_thread_id=%r",
+                        "Scene isolation: stream ended. session_id=%r",
                         save_id,
                     )
                     if save_id:
@@ -969,23 +980,20 @@ class SceneIsolationMiddleware(AgentMiddleware):
                                 save_id, exc_info=True,
                             )
                     else:
-                        logger.error(
-                            "Scene isolation: stream ended but still no service_thread_id! "
-                            "thread=%r, attrs=%s",
-                            thread,
-                            {a: getattr(thread, a, None) for a in dir(thread) if not a.startswith("_")}
-                            if thread else "no thread",
+                        logger.warning(
+                            "Scene isolation: stream ended but no session_id "
+                            "(first request for new conversation — scene stays in memory)."
                         )
 
-            context.result = _save_after_stream()
+            context.result = ResponseStream(_save_after_stream())
         else:
             # Non-streaming: tools already ran, thread is updated.
-            save_id = self._get_thread_id(context)
+            save_id = self._get_conversation_id(context)
             if save_id:
                 logger.info("Scene isolation: saving scene (non-streaming) for conversation %s", save_id)
                 await asyncio.to_thread(self._scene_manager.save_scene, save_id)
             else:
-                logger.error("Scene isolation: non-streaming run ended but no service_thread_id!")
+                logger.warning("Scene isolation: non-streaming run ended but no session_id (first request).")
 
 
 # ──────────────────────────────────────────────
@@ -995,19 +1003,18 @@ class SceneIsolationMiddleware(AgentMiddleware):
 
 async def main():
     """Main function to run the Blender Scene Agent as a web server."""
+    scene_manager = SceneManager()
+
     async with (
         DefaultAzureCredential() as credential,
-        AzureAIAgentClient(
+        AzureAIClient(
             project_endpoint=PROJECT_ENDPOINT,
             model_deployment_name=MODEL_DEPLOYMENT_NAME,
             credential=credential,
-        ) as client,
-    ):
-        scene_manager = SceneManager()
-
-        agent = client.create_agent(
+        ).as_agent(
             name="BlenderSceneAgent",
-            middleware=SceneIsolationMiddleware(ToolStatusMiddleware(), scene_manager),
+            middleware=[SceneIsolationMiddleware(ToolStatusMiddleware(), scene_manager)],
+
             instructions="""You are an expert 3D scene creation assistant powered by Blender.
 
 **CRITICAL: This environment runs Blender 4.4. All generated Python code MUST use the Blender 4.x Python API. Many Blender 3.x APIs were removed or renamed in 4.0. NEVER use deprecated Blender 3.x node types, input names, or enums — they will cause runtime errors. When uncertain about an API, prefer the Blender 4.x naming conventions listed in the "Blender 4.x API Compatibility" section below.**
@@ -1068,10 +1075,10 @@ This environment runs **Blender 4.4**. The following Blender 3.x APIs were remov
                 render_preview,
                 render_final,
             ],
-        )
-
+        ) as agent,
+    ):
         print("Blender Scene Agent running on http://localhost:8088")
-        server = from_agent_framework(agent, thread_repository=InMemoryAgentThreadRepository())
+        server = from_agent_framework(agent, session_repository=InMemoryAgentSessionRepository())
         await server.run_async()
 
 

@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python -c \"from agent_framework import Content, Message, AgentResponseUpdate; print\\('Content attrs:', \\[x for x in dir\\(Content\\) if not x\\.startswith\\('_'\\)\\]\\); print\\('Message attrs:', \\[x for x in dir\\(Message\\) if not x\\.startswith\\('_'\\)\\]\\); print\\('Update attrs:', \\[x for x in dir\\(AgentResponseUpdate\\) if not x\\.startswith\\('_'\\)\\]\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

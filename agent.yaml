@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/microsoft/AgentSchema/refs/heads/main/schemas/v1.0/ContainerAgent.yaml
 
 kind: hosted
-name: blender-scene-agent-v2
+name: blender-scene-agent-v3
 description: >
   An AI agent that creates and manipulates 3D scenes in Blender.
   Communicates with a headless Blender instance via TCP socket to create
@@ -29,3 +29,11 @@ environment_variables:
     value: "9876"
   - name: AZURE_STORAGE_ACCOUNT_NAME
     value: "{{AZURE_STORAGE_ACCOUNT_NAME}}"
+dockerfile_path: Dockerfile
+resources:
+  cpu: '3.0'
+  memory: 6.0Gi
+  cpu: '3.0'
+  memory: 6.0Gi
+name: blenderagent
+dockerfile_path: Dockerfile

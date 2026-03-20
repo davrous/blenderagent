@@ -4,5 +4,6 @@
     "dockerfilePath": "d:\\Code\\blenderagent\\Dockerfile",
     "cpu": "3.0",
     "memory": "6.0Gi"
-  }
+  },
+  "projectId": "a0f29974-e42a-4877-ae3b-cfb974bfca79"
 }
