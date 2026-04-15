@@ -252,7 +252,7 @@ docker run -it --rm \
 
 ![Screenshot of the Foundry Hosted Blender Agent in action](ScreenshotDemoFoundryBlenderAgent.jpg)
 
-- Create a scene containing 1 table and 2 chairs and put 3 food items right on top of the table, make sure the food scale fits on top. Make sure the camera is as closed as possible to the objects to fill the whole screen. Share a high fidelity rendering.
+- Create a scene containing 1 table and 2 chairs and put 3 food items right on top of the table, make sure the food scale fits on top. Make sure the camera is as closed as possible to the objects to fill the whole screen. Make sure the objects are not intersecting and then place realistically. The camera should point to the table and can see also the chairs. Share a high fidelity rendering.
 - let me download it
 
 ## Credits

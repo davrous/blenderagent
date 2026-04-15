@@ -471,6 +471,32 @@ class BlenderMCPServer:
             response = requests.get(url, params=params, headers=REQ_HEADERS)
             if response.status_code == 200:
                 assets = response.json()
+
+                # If no results with category filter, fetch valid categories and
+                # retry without the filter so the caller can pick the right one.
+                if len(assets) == 0 and categories:
+                    cat_url = "https://api.polyhaven.com/categories/" + (asset_type if asset_type and asset_type != "all" else "assets")
+                    cat_resp = requests.get(cat_url, headers=REQ_HEADERS)
+                    valid_cats = list(cat_resp.json().keys()) if cat_resp.status_code == 200 else []
+
+                    # Retry without category filter
+                    fallback_params = {k: v for k, v in params.items() if k != "categories"}
+                    fb_response = requests.get(url, params=fallback_params, headers=REQ_HEADERS)
+                    if fb_response.status_code == 200:
+                        assets = fb_response.json()
+
+                    limited_assets = {}
+                    for i, (key, value) in enumerate(assets.items()):
+                        if i >= 20:
+                            break
+                        limited_assets[key] = value
+                    return {
+                        "assets": limited_assets,
+                        "total_count": len(assets),
+                        "returned_count": len(limited_assets),
+                        "note": f"No assets matched categories '{categories}'. Showing all {asset_type or 'assets'} instead. Valid categories: {', '.join(valid_cats[:30])}",
+                    }
+
                 limited_assets = {}
                 for i, (key, value) in enumerate(assets.items()):
                     if i >= 20:

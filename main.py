@@ -543,7 +543,11 @@ def search_polyhaven_assets(
     ] = "all",
     categories: Annotated[
         str,
-        "Optional comma-separated list of categories to filter by",
+        "Optional comma-separated list of categories to filter by. "
+        "For models, valid categories include: furniture, seating, table, food, dishes, "
+        "plants, nature, rocks, trees, props, decorative, industrial, containers, tools, "
+        "electronics, appliances, lighting, shelves, structures, buildings, office. "
+        "Note: use 'seating' for chairs/benches, 'food' for food items, 'dishes' for plates/bowls.",
     ] = None,
 ) -> str:
     """
@@ -564,8 +568,12 @@ def search_polyhaven_assets(
         assets = result.get("assets", {})
         total = result.get("total_count", 0)
         returned = result.get("returned_count", 0)
+        note = result.get("note")
 
-        output = f"Found {total} assets"
+        output = ""
+        if note:
+            output += f"⚠️ {note}\n\n"
+        output += f"Found {total} assets"
         if categories:
             output += f" in categories: {categories}"
         output += f"\nShowing {returned} assets:\n\n"
@@ -968,8 +976,14 @@ class ToolStatusMiddleware(AgentMiddleware):
     # Matches any markdown image: ![alt](url)
     _IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
 
+    # Matches any markdown link: [text](url)
+    _LINK_RE = re.compile(r"\[[^\]]+\]\([^)]+\)")
+
     # Tools whose function_result may contain an image to surface
     _IMAGE_TOOLS = {"get_viewport_screenshot", "render_preview", "render_final"}
+
+    # Tools whose function_result contains a download link to surface
+    _LINK_TOOLS = {"save_scene_for_download"}
 
     _IMAGE_LABELS: dict[str, str] = {
         "render_preview": "Here's a quick preview while the final render is in progress:",
@@ -993,6 +1007,8 @@ class ToolStatusMiddleware(AgentMiddleware):
             announced_names: set[str] = set()
             # Track call_ids for image-producing tools → tool name
             image_call_ids: dict[str, str] = {}
+            # Track call_ids for link-producing tools → tool name
+            link_call_ids: dict[str, str] = {}
 
             async for update in original_stream:
                 for content in (update.contents or []):
@@ -1001,6 +1017,8 @@ class ToolStatusMiddleware(AgentMiddleware):
                         call_id = content.call_id or content.name
                         if content.name in self._IMAGE_TOOLS and call_id:
                             image_call_ids[call_id] = content.name
+                        if content.name in self._LINK_TOOLS and call_id:
+                            link_call_ids[call_id] = content.name
                         if content.name and content.name not in announced_names:
                             announced_names.add(content.name)
                             status = _TOOL_STATUS_MESSAGES.get(
@@ -1030,6 +1048,22 @@ class ToolStatusMiddleware(AgentMiddleware):
                                     ],
                                     role="assistant",
                                     message_id=f"tool-img-{cid}",
+                                )
+
+                        # ── Stream download links from tool results immediately ──
+                        if cid in link_call_ids:
+                            match = self._LINK_RE.search(
+                                content.result or ""
+                            )
+                            if match:
+                                yield AgentResponseUpdate(
+                                    contents=[
+                                        Content.from_text(
+                                            f"\n\n{match.group(0)}\n\n"
+                                        )
+                                    ],
+                                    role="assistant",
+                                    message_id=f"tool-link-{cid}",
                                 )
 
                 yield update
