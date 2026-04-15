@@ -243,6 +243,7 @@ docker run -it --rm \
 | `apply_polyhaven_texture` | Apply a downloaded texture to an object |
 | `setup_scene` | Initialize camera, lighting, and ground plane |
 | `render_scene` | Render the scene with EEVEE or Cycles |
+| `save_scene_for_download` | Save the scene as a .blend file and return a download link (expires after 1 hour) |
 
 ## Demos prompts
 
@@ -250,6 +251,9 @@ docker run -it --rm \
 - "Add a plastic yellow sphere on top of the table"
 
 ![Screenshot of the Foundry Hosted Blender Agent in action](ScreenshotDemoFoundryBlenderAgent.jpg)
+
+- Create a scene containing 1 table and 2 chairs and put 3 food items right on top of the table, make sure the food scale fits on top. Make sure the camera is as closed as possible to the objects to fill the whole screen. Share a high fidelity rendering.
+- let me download it
 
 ## Credits
 

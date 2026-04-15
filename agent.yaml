@@ -33,7 +33,3 @@ dockerfile_path: Dockerfile
 resources:
   cpu: '3.0'
   memory: 6.0Gi
-  cpu: '3.0'
-  memory: 6.0Gi
-name: blenderagent
-dockerfile_path: Dockerfile

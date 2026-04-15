@@ -33,10 +33,13 @@ from azure.ai.agentserver.agentframework.persistence import InMemoryAgentSession
 from azure.identity.aio import DefaultAzureCredential
 
 from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
-from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSettings, generate_blob_sas
 
 from blender_connection import get_blender_connection, close_blender_connection
 from scene_manager import SceneManager
+
+# Module-level reference so _do_render can recover the scene after a Blender crash.
+_scene_manager: SceneManager | None = None
 
 logger = logging.getLogger("blender_agent")
 logger.setLevel(logging.DEBUG)
@@ -79,7 +82,7 @@ def upload_image_to_blob(image_bytes: bytes, blob_name: str) -> str:
     try:
         container_client.get_container_properties()
     except Exception:
-        container_client.create_container(public_access="blob")
+        container_client.create_container()
 
     blob_client = container_client.get_blob_client(blob_name)
     blob_client.upload_blob(
@@ -87,7 +90,71 @@ def upload_image_to_blob(image_bytes: bytes, blob_name: str) -> str:
         overwrite=True,
         content_settings=ContentSettings(content_type="image/png"),
     )
-    return f"{account_url}/{BLOB_CONTAINER_NAME}/{blob_name}"
+
+    # Generate a user-delegation SAS token (1-hour expiry)
+    from datetime import timedelta
+    sas_start = datetime.now(timezone.utc)
+    sas_expiry = sas_start + timedelta(hours=1)
+    user_delegation_key = blob_service_client.get_user_delegation_key(
+        key_start_time=sas_start,
+        key_expiry_time=sas_expiry,
+    )
+    sas_token = generate_blob_sas(
+        account_name=AZURE_STORAGE_ACCOUNT_NAME,
+        container_name=BLOB_CONTAINER_NAME,
+        blob_name=blob_name,
+        user_delegation_key=user_delegation_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=sas_expiry,
+    )
+    return f"{account_url}/{BLOB_CONTAINER_NAME}/{blob_name}?{sas_token}"
+
+
+def upload_blend_to_blob(local_path: str, blob_name: str) -> str:
+    """Upload a .blend file to Azure Blob Storage and return a download URL."""
+    file_size = os.path.getsize(local_path)
+    logger.info("Uploading .blend to blob: %s (%d bytes)", blob_name, file_size)
+    account_url = f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
+    credential = SyncDefaultAzureCredential()
+    blob_service_client = BlobServiceClient(account_url, credential=credential)
+    container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
+
+    # Ensure container exists
+    try:
+        container_client.get_container_properties()
+    except Exception:
+        container_client.create_container()
+
+    blob_client = container_client.get_blob_client(blob_name)
+    with open(local_path, "rb") as f:
+        blob_client.upload_blob(
+            f,
+            overwrite=True,
+            content_settings=ContentSettings(
+                content_type="application/x-blender",
+                content_disposition="attachment; filename=blender_scene.blend",
+            ),
+        )
+
+    # Generate a user-delegation SAS token (1-hour expiry)
+    from datetime import timedelta
+    sas_start = datetime.now(timezone.utc)
+    sas_expiry = sas_start + timedelta(hours=1)
+    user_delegation_key = blob_service_client.get_user_delegation_key(
+        key_start_time=sas_start,
+        key_expiry_time=sas_expiry,
+    )
+    sas_token = generate_blob_sas(
+        account_name=AZURE_STORAGE_ACCOUNT_NAME,
+        container_name=BLOB_CONTAINER_NAME,
+        blob_name=blob_name,
+        user_delegation_key=user_delegation_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=sas_expiry,
+    )
+    return f"{account_url}/{BLOB_CONTAINER_NAME}/{blob_name}?{sas_token}"
+
+
 MODEL_DEPLOYMENT_NAME = os.getenv("MODEL_DEPLOYMENT_NAME", "gpt-4.1")
 
 
@@ -707,7 +774,12 @@ def _do_render(
     samples: int,
     engine: str,
 ) -> str:
-    """Shared render helper used by render_preview and render_final."""
+    """Shared render helper used by render_preview and render_final.
+
+    Includes a recovery mechanism: if the Blender connection drops (e.g.
+    Blender crashes mid-render), waits for the supervisor to restart it,
+    reloads the conversation's scene from blob storage, and retries once.
+    """
     logger.info("%s: rendering %dx%d, samples=%d, engine=%r",
                 label, resolution_x, resolution_y, samples, engine)
     code = f"""
@@ -726,24 +798,66 @@ if '{engine}' == 'CYCLES':
 bpy.ops.render.render(write_still=True)
 print("Render complete: {output_path}")
 """
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("execute_code", {"code": code})
+    max_attempts = 2  # first try + one recovery retry
+    for attempt in range(1, max_attempts + 1):
+        try:
+            blender = get_blender_connection()
+            result = blender.send_command("execute_code", {"code": code})
 
-        if os.path.exists(output_path):
-            with open(output_path, "rb") as f:
-                image_bytes = f.read()
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            blob_name = f"{label}_{timestamp}_{uuid.uuid4().hex[:8]}.png"
-            blob_url = upload_image_to_blob(image_bytes, blob_name)
-            logger.info("%s succeeded: %dx%d, uploaded to blob", label, resolution_x, resolution_y)
-            return f"Render complete ({resolution_x}x{resolution_y}).\nInclude the following image link in your response exactly as-is:\n\n![{label}]({blob_url})"
-        else:
-            logger.warning("%s: output file not found at %r", label, output_path)
-            return f"Render command executed but output file not found. {result.get('result', '')}"
-    except Exception as e:
-        logger.error("%s failed", label, exc_info=True)
-        return f"Error rendering: {str(e)}"
+            if os.path.exists(output_path):
+                with open(output_path, "rb") as f:
+                    image_bytes = f.read()
+                timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                blob_name = f"{label}_{timestamp}_{uuid.uuid4().hex[:8]}.png"
+                blob_url = upload_image_to_blob(image_bytes, blob_name)
+                logger.info("%s succeeded: %dx%d, uploaded to blob", label, resolution_x, resolution_y)
+                return f"Render complete ({resolution_x}x{resolution_y}).\nInclude the following image link in your response exactly as-is:\n\n![{label}]({blob_url})"
+            else:
+                logger.warning("%s: output file not found at %r", label, output_path)
+                return f"Render command executed but output file not found. {result.get('result', '')}"
+
+        except Exception as e:
+            logger.error("%s failed (attempt %d/%d)", label, attempt, max_attempts, exc_info=True)
+
+            if attempt >= max_attempts:
+                return f"Error rendering: {str(e)}"
+
+            # ── Recovery: wait for Blender to come back, reload scene, retry ──
+            logger.info("%s: attempting recovery — waiting for Blender to restart…", label)
+            recovered = _wait_for_blender(timeout=60)
+            if not recovered:
+                return f"Error rendering: Blender did not recover after crash. {e}"
+
+            # Reload the conversation scene into the fresh Blender instance
+            conversation_id = _scene_manager._active_conversation_id if _scene_manager else None
+            if conversation_id and _scene_manager:
+                try:
+                    logger.info("%s: reloading scene for conversation %s", label, conversation_id)
+                    _scene_manager.activate_scene(conversation_id)
+                except Exception as restore_err:
+                    logger.error("%s: failed to restore scene after recovery: %s", label, restore_err)
+                    return f"Error rendering: Blender recovered but scene restore failed. {restore_err}"
+            else:
+                logger.warning("%s: no active conversation id — rendering on clean scene", label)
+
+            logger.info("%s: recovery complete, retrying render…", label)
+
+    return f"Error rendering: exhausted all {max_attempts} attempts"
+
+
+def _wait_for_blender(timeout: int = 60) -> bool:
+    """Poll until Blender's socket server is reachable or timeout is exceeded."""
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        try:
+            get_blender_connection()
+            logger.info("Blender connection re-established after restart")
+            return True
+        except Exception:
+            _time.sleep(2)
+    logger.error("Blender did not become reachable within %ds", timeout)
+    return False
 
 
 def render_preview(
@@ -753,7 +867,7 @@ def render_preview(
     resolution_x: Annotated[int, "Preview width in pixels"] = 960,
     resolution_y: Annotated[int, "Preview height in pixels"] = 540,
     samples: Annotated[int, "Number of preview samples (keep low for speed)"] = 16,
-    engine: Annotated[str, "Render engine: 'CYCLES' or 'BLENDER_EEVEE_NEXT'"] = "BLENDER_EEVEE_NEXT",
+    engine: Annotated[str, "Render engine: 'CYCLES' or 'BLENDER_EEVEE_NEXT'"] = "CYCLES",
 ) -> str:
     """
     Fast low-resolution preview render. Use this FIRST so the user can see a
@@ -769,7 +883,7 @@ def render_final(
     resolution_x: Annotated[int, "Render width in pixels"] = 640,
     resolution_y: Annotated[int, "Render height in pixels"] = 480,
     samples: Annotated[int, "Number of render samples (higher = better quality)"] = 32,
-    engine: Annotated[str, "Render engine: 'CYCLES' or 'BLENDER_EEVEE_NEXT'"] = "BLENDER_EEVEE_NEXT",
+    engine: Annotated[str, "Render engine: 'CYCLES' or 'BLENDER_EEVEE_NEXT'"] = "CYCLES",
 ) -> str:
     """
     High-fidelity render. Default resolution is 640x480 at 32 samples.
@@ -778,6 +892,51 @@ def render_final(
     proceeding with the full resolution at 256 samples.
     """
     return _do_render("render", output_path, resolution_x, resolution_y, samples, engine)
+
+
+# ──────────────────────────────────────────────
+# Agent tools - Scene download
+# ──────────────────────────────────────────────
+
+
+def save_scene_for_download() -> str:
+    """
+    Save the current Blender scene as a .blend file and upload it to cloud storage.
+    Returns a download link so the user can open the scene on their own machine.
+    The link expires after 1 hour.
+    """
+    logger.info("Tool called: save_scene_for_download")
+    try:
+        blender = get_blender_connection()
+        temp_dir = tempfile.gettempdir()
+        temp_path = os.path.join(temp_dir, f"blender_scene_{uuid.uuid4().hex[:8]}.blend")
+        safe_path = temp_path.replace("\\", "/")
+
+        code = f"""import bpy
+bpy.ops.wm.save_as_mainfile(filepath="{safe_path}", check_existing=False)
+print("Saved scene to {safe_path}")
+"""
+        result = blender.send_command("execute_code", {"code": code})
+
+        if not os.path.exists(temp_path):
+            return "Error: Blender save command ran but the .blend file was not created."
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        blob_name = f"scenes/scene_{timestamp}_{uuid.uuid4().hex[:8]}.blend"
+        blob_url = upload_blend_to_blob(temp_path, blob_name)
+
+        file_size = os.path.getsize(temp_path)
+        os.remove(temp_path)
+
+        logger.info("save_scene_for_download succeeded: %d bytes, uploaded to blob", file_size)
+        return (
+            f"Scene saved ({file_size / 1024:.0f} KB).\n"
+            f"Include the following download link in your response exactly as-is:\n\n"
+            f"[Download your Blender scene (.blend)]({blob_url})"
+        )
+    except Exception as e:
+        logger.error("save_scene_for_download failed", exc_info=True)
+        return f"Error saving scene for download: {str(e)}"
 
 
 # ──────────────────────────────────────────────
@@ -799,6 +958,7 @@ _TOOL_STATUS_MESSAGES: dict[str, str] = {
     "setup_scene": "Setting up the scene…",
     "render_preview": "Rendering a quick preview…",
     "render_final": "Rendering the final image (this may take a moment)…",
+    "save_scene_for_download": "Saving scene for download…",
 }
 
 
@@ -945,7 +1105,7 @@ class SceneIsolationMiddleware(AgentMiddleware):
                 await asyncio.to_thread(self._scene_manager.save_scene, prev)
                 await asyncio.to_thread(self._scene_manager.reset_to_clean)
             else:
-                logger.info("Scene isolation: first-ever request, no previous scene to save.")
+                logger.info("Scene isolation: no thread id yet, keeping current scene.")
 
         # ── RUN the agent (inner middleware → actual LLM + tools) ──
         await self._inner.process(context, call_next)
@@ -1005,6 +1165,9 @@ async def main():
     """Main function to run the Blender Scene Agent as a web server."""
     scene_manager = SceneManager()
 
+    global _scene_manager
+    _scene_manager = scene_manager
+
     async with (
         DefaultAzureCredential() as credential,
         AzureAIClient(
@@ -1018,6 +1181,11 @@ async def main():
             instructions="""You are an expert 3D scene creation assistant powered by Blender.
 
 **CRITICAL: This environment runs Blender 4.4. All generated Python code MUST use the Blender 4.x Python API. Many Blender 3.x APIs were removed or renamed in 4.0. NEVER use deprecated Blender 3.x node types, input names, or enums — they will cause runtime errors. When uncertain about an API, prefer the Blender 4.x naming conventions listed in the "Blender 4.x API Compatibility" section below.**
+
+## Scene state
+- The Blender scene starts **empty** (no objects at all — no default cube, no camera, no light) but already has a **neutral studio HDRI environment** (studio_small_09) providing realistic hemisphere lighting.
+- Always call setup_scene() as your **first action** when creating a new scene to add a camera and optional sun light. Do NOT assume a default cube exists — there is none.
+- Do NOT add a cube unless the user explicitly asks for one.
 
 ## Guidelines
 - Call get_scene_info() ONLY when you need to know what objects already exist (e.g. before modifying or deleting). Skip it for fresh scene creation.
@@ -1074,6 +1242,7 @@ This environment runs **Blender 4.4**. The following Blender 3.x APIs were remov
                 setup_scene,
                 render_preview,
                 render_final,
+                save_scene_for_download,
             ],
         ) as agent,
     ):

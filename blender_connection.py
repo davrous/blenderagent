@@ -79,7 +79,7 @@ class BlenderConnection:
                     chunk = sock.recv(buffer_size)
                     if not chunk:
                         if not chunks:
-                            raise Exception(
+                            raise ConnectionError(
                                 "Connection closed before receiving any data"
                             )
                         break
@@ -124,9 +124,9 @@ class BlenderConnection:
                 json.loads(data.decode("utf-8"))
                 return data
             except json.JSONDecodeError:
-                raise Exception("Incomplete JSON response received")
+                raise ConnectionError("Incomplete JSON response received")
         else:
-            raise Exception("No data received")
+            raise ConnectionError("No data received")
 
     def send_command(
         self, command_type: str, params: Optional[Dict[str, Any]] = None

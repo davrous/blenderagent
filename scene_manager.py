@@ -223,5 +223,13 @@ print("Scene reset to clean state")
             blender = get_blender_connection()
             blender.send_command("execute_code", {"code": code})
             logger.info("Scene reset to clean state")
+
+            # Download a neutral studio HDRI for default hemisphere lighting
+            logger.info("Downloading default HDRI (studio_small_09) for scene lighting")
+            blender.send_command(
+                "download_polyhaven_asset",
+                {"asset_id": "studio_small_09", "asset_type": "hdris", "resolution": "1k"},
+            )
+            logger.info("Default HDRI applied successfully")
         except Exception:
             logger.error("Failed to reset scene", exc_info=True)

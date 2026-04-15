@@ -1015,7 +1015,24 @@ if __name__ == "__main__":
 
     # Use a timer to start the server after Blender is fully initialized
     def _deferred_start():
-        start_server_headless()
+        server = start_server_headless()
+
+        # Clear default scene objects (Cube, Camera, Light) so Blender starts empty
+        for obj in list(bpy.data.objects):
+            bpy.data.objects.remove(obj, do_unlink=True)
+        print("Cleared default scene objects")
+
+        # Download a neutral studio HDRI for default hemisphere lighting
+        try:
+            result = server.download_polyhaven_asset(
+                asset_id="studio_small_09",
+                asset_type="hdris",
+                resolution="1k",
+            )
+            print(f"Default HDRI applied: {result}")
+        except Exception as e:
+            print(f"Warning: failed to apply default HDRI: {e}")
+
         return None  # Don't repeat
 
     bpy.app.timers.register(_deferred_start, first_interval=1.0)
