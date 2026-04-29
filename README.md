@@ -179,10 +179,7 @@ az login
 
 > **Security note:** This stores Azure tokens in plaintext in `%USERPROFILE%\.azure`. This is the same behavior as on macOS/Linux. Re-enable encryption later with `az config set core.encrypt_token_cache=true` if needed.
 
-1. **Ensure your `.env` file uses Unix (LF) line endings**, not Windows (CRLF). CRLF line endings cause `\r` to be appended to environment variable values inside the container, which breaks authentication. You can convert it in VS Code (click "CRLF" in the status bar and select "LF") or run:
-   ```powershell
-   $c = Get-Content .env -Raw; $c -replace "`r`n","`n" | Set-Content .env -NoNewline
-   ```
+1. **Line endings are handled automatically** by the `.gitattributes` file in this repo — all text files are normalized to Unix (LF) line endings. If you create a new `.env` file manually, ensure it uses LF endings (in VS Code, click "CRLF" in the status bar and select "LF").
 
 2. Run the container with the volume mount — same as macOS:
    ```powershell
@@ -252,7 +249,7 @@ docker run -it --rm \
 
 ![Screenshot of the Foundry Hosted Blender Agent in action](ScreenshotDemoFoundryBlenderAgent.jpg)
 
-- Create a scene containing 1 table and 2 chairs and put 3 food items right on top of the table, make sure the food scale fits on top. Make sure the camera is as closed as possible to the objects to fill the whole screen. Make sure the objects are not intersecting and then place realistically. The camera should point to the table and can see also the chairs. Share a high fidelity rendering.
+- Create a scene containing 1 table and 2 chairs and put 3 food items right on top of the table, make sure the food scale fits on top. Make sure the objects are not intersecting and then place realistically. Share a high fidelity rendering.
 - let me download it
 
 ## Credits

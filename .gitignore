@@ -1,2 +1,3 @@
 .env
 .foundry/.deployment.json
+build-source-*.tar.gz

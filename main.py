@@ -425,6 +425,96 @@ print(f"Applied material '{{mat.name}}' with color ({color_hex}) to {{obj.name}}
 # ──────────────────────────────────────────────
 
 
+# Error categories and hints for enriched error context
+_ERROR_HINTS = [
+    (
+        re.compile(r"Object '(.+?)' not in collection '(.+?)'"),
+        lambda m: (
+            f"The object '{m.group(1)}' is not in '{m.group(2)}'. "
+            f"This usually happens because bpy.ops.*_add() places new objects "
+            f"in the ACTIVE collection, not necessarily Scene Collection. "
+            f"Use `safe_move_to_collection(obj, target_collection)` (available "
+            f"in the execution namespace) to safely move objects between collections, "
+            f"or use `ensure_active_collection(collection)` before creating objects "
+            f"so they are placed directly in the desired collection."
+        ),
+    ),
+    (
+        re.compile(r"Object '(.+?)' not found", re.IGNORECASE),
+        lambda m: (
+            f"The object '{m.group(1)}' does not exist in the scene. "
+            f"Check the exact object names using get_scene_info()."
+        ),
+    ),
+    (
+        re.compile(r"read-only", re.IGNORECASE),
+        lambda _: (
+            "You tried to set a read-only attribute. "
+            "collection.name is read-only — use bpy.data.collections.new('Name') instead."
+        ),
+    ),
+    (
+        re.compile(r"has no attribute '(\w+)'"),
+        lambda m: (
+            f"Attribute '{m.group(1)}' does not exist. This may be a Blender 3.x API "
+            f"that was renamed or removed in Blender 4.x. Check the Blender 4.x API docs."
+        ),
+    ),
+]
+
+
+def _enrich_error_context(error_msg: str, code: str) -> str:
+    """Build an enriched error message with scene state and categorized hints."""
+    parts = [f"Error executing code: {error_msg}"]
+
+    # Add categorized hint
+    for pattern, hint_fn in _ERROR_HINTS:
+        m = pattern.search(error_msg)
+        if m:
+            parts.append(f"\nHint: {hint_fn(m)}")
+            break
+
+    # Fetch current scene state to give the LLM context for self-correction
+    try:
+        blender = get_blender_connection()
+        scene_result = blender.send_command("get_scene_info")
+        objects = scene_result.get("objects", [])
+        if objects:
+            obj_names = [f"  - {o.get('name', '?')} ({o.get('type', '?')})" for o in objects[:30]]
+            parts.append(f"\nCurrent scene objects ({len(objects)} total):")
+            parts.extend(obj_names)
+            if len(objects) > 30:
+                parts.append(f"  ... and {len(objects) - 30} more")
+
+        # Query collection names via a lightweight code execution
+        try:
+            col_result = blender.send_command("execute_code", {
+                "code": (
+                    "import bpy\n"
+                    "for c in bpy.data.collections:\n"
+                    "    print(f'{c.name} ({len(c.objects)} objects)')\n"
+                )
+            })
+            col_output = col_result.get("result", "").strip()
+            if col_output:
+                parts.append(f"\nCollections:")
+                for line in col_output.splitlines()[:20]:
+                    parts.append(f"  - {line}")
+        except Exception:
+            pass  # Collection info is supplementary — skip on failure
+    except Exception:
+        parts.append("\n(Could not fetch scene state — Blender may be recovering.)")
+
+    parts.append(
+        "\nPlease fix the code and try again. The execution namespace includes "
+        "safe helpers: safe_move_to_collection(obj, collection), "
+        "safe_link_to_collection(obj, collection), "
+        "ensure_active_collection(collection)."
+    )
+
+    return "\n".join(parts)
+
+
 def execute_blender_code(
     code: Annotated[
         str,
@@ -464,6 +554,35 @@ def execute_blender_code(
             logger.warning("Blender 4.x compat: replacing deprecated '%s' → '%s'", old, new)
             code = code.replace(old, new)
 
+    # ── Auto-patch unsafe collection patterns ──
+    # Pattern: scene.collection.objects.unlink(VAR)
+    # Wraps in try/except so it won't crash if the object isn't in Scene Collection.
+    # The safe_move_to_collection helper is available in the exec namespace as a
+    # better alternative, but this catches LLM code that uses the raw pattern.
+    _unlink_pattern = re.compile(
+        r'^(\s*)'                                         # leading whitespace
+        r'(?:bpy\.context\.scene\.collection|scene\.collection)'
+        r'\.objects\.unlink\((\w+)\)',                    # .objects.unlink(var)
+        re.MULTILINE,
+    )
+    if _unlink_pattern.search(code):
+        logger.warning(
+            "Auto-patch: wrapping unsafe scene.collection.objects.unlink() "
+            "in safe fallback (object may not be in Scene Collection)"
+        )
+
+        def _wrap_unlink(m):
+            indent = m.group(1)
+            var = m.group(2)
+            # Replace with safe_move_to_collection-aware fallback:
+            # unlink from whichever collection(s) the object is actually in
+            return (
+                f"{indent}for _col in list({var}.users_collection):\n"
+                f"{indent}    _col.objects.unlink({var})"
+            )
+
+        code = _unlink_pattern.sub(_wrap_unlink, code)
+
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
@@ -474,8 +593,8 @@ def execute_blender_code(
         logger.info("execute_blender_code succeeded")
         return f"Code executed successfully. {raw}".strip()
     except Exception as e:
-        logger.error("execute_blender_code failed", exc_info=True)
-        return f"Error executing code: {str(e)}"
+        logger.warning("execute_blender_code failed (will enrich error for LLM): %s", e)
+        return _enrich_error_context(str(e), code)
 
 
 # ──────────────────────────────────────────────
@@ -1237,6 +1356,35 @@ async def main():
 - NEVER set `collection.name` — it is read-only in this Blender environment. To organize objects, create new collections with `bpy.data.collections.new("Name")` and link them to the scene with `bpy.context.scene.collection.children.link(new_collection)` instead of renaming existing ones.
 - The render engine enum for Eevee in Blender 4.x is `'BLENDER_EEVEE_NEXT'`, NOT `'BLENDER_EEVEE'`. Valid engines are: `'BLENDER_EEVEE_NEXT'`, `'BLENDER_WORKBENCH'`, `'CYCLES'`.
 - When a tool returns an image in markdown format (e.g. `![screenshot](url)` or `![render](url)`), you MUST include that exact markdown image link in your response so the chat client can display the image. Never omit, summarize, or rewrite the image URL.
+
+## Collection Management Best Practices (IMPORTANT)
+`bpy.ops.mesh.primitive_*_add()` and similar operators add new objects to the **active collection**, which is NOT always `scene.collection` (the root "Scene Collection"). If you create a custom collection and link objects to it, the active collection may change — and calling `scene.collection.objects.unlink(obj)` will fail with `RuntimeError: Object 'X' not in collection 'Scene Collection'`.
+
+**Safe helpers available in the execution namespace** (no import needed):
+- `safe_move_to_collection(obj, target_collection)` — Unlinks the object from ALL its current collections, then links it to `target_collection`. Always works regardless of which collection the object is currently in.
+- `safe_link_to_collection(obj, target_collection)` — Links the object to `target_collection` without removing it from other collections. Skips silently if already linked.
+- `ensure_active_collection(collection)` — Sets `collection` as the active collection so that subsequent `bpy.ops.*_add()` calls place new objects directly into it. Call this once before a batch of creation operations.
+
+**Preferred patterns:**
+```python
+# BEST: Set active collection first, then create objects — they go directly into it
+my_col = bpy.data.collections.new('MyCollection')
+bpy.context.scene.collection.children.link(my_col)
+ensure_active_collection(my_col)
+bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0))
+cube = bpy.context.active_object  # already in my_col
+
+# ALSO GOOD: Create object, then move it with the safe helper
+bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0))
+cube = bpy.context.active_object
+safe_move_to_collection(cube, my_col)
+```
+
+**NEVER do this** (will crash if the object is not in Scene Collection):
+```python
+scene.collection.objects.unlink(obj)  # UNSAFE — may raise RuntimeError
+target_col.objects.link(obj)
+```
 
 ## Blender 4.x API Compatibility (MUST follow)
 This environment runs **Blender 4.4**. The following Blender 3.x APIs were removed or renamed and MUST NOT be used:

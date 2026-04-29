@@ -385,6 +385,51 @@ class BlenderMCPServer:
         except Exception as e:
             return {"error": str(e)}
 
+    @staticmethod
+    def _blender_helpers():
+        """Return a dict of safe helper functions injected into every exec() namespace."""
+
+        def safe_move_to_collection(obj, target_collection):
+            """Unlink *obj* from every collection it belongs to, then link it
+            into *target_collection*.  Handles the common case where the object
+            was added to a collection other than Scene Collection (e.g. when
+            the active collection changed mid-script)."""
+            for col in list(obj.users_collection):
+                col.objects.unlink(obj)
+            if obj.name not in target_collection.objects:
+                target_collection.objects.link(obj)
+
+        def safe_link_to_collection(obj, target_collection):
+            """Link *obj* into *target_collection* without touching its
+            existing collection memberships.  Skips silently if already
+            linked."""
+            if obj.name not in target_collection.objects:
+                target_collection.objects.link(obj)
+
+        def ensure_active_collection(collection):
+            """Set *collection* as the active collection so that subsequent
+            ``bpy.ops.*_add()`` calls place new objects directly into it.
+            *collection* must already be linked to the scene."""
+            def _find_layer(layer, col):
+                if layer.collection == col:
+                    return layer
+                for child in layer.children:
+                    found = _find_layer(child, col)
+                    if found:
+                        return found
+                return None
+
+            vl = bpy.context.view_layer
+            lc = _find_layer(vl.layer_collection, collection)
+            if lc:
+                vl.active_layer_collection = lc
+
+        return {
+            "safe_move_to_collection": safe_move_to_collection,
+            "safe_link_to_collection": safe_link_to_collection,
+            "ensure_active_collection": ensure_active_collection,
+        }
+
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""
         try:
@@ -398,6 +443,7 @@ class BlenderMCPServer:
                 "Quaternion": mathutils.Quaternion,
                 "Color": mathutils.Color,
                 "math": __import__("math"),
+                **self._blender_helpers(),
             }
             capture_buffer = io.StringIO()
             with redirect_stdout(capture_buffer):
