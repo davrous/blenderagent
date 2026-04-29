@@ -1,10 +1,14 @@
 azure-ai-agentserver-agentframework==1.0.0b17
-# azure-ai-projects 2.0.0b4 breaks PromptAgentDefinitionText; 2.0.0b3 is the last compatible
-# azure-ai-projects==2.0.0b3
-# opentelemetry-semantic-conventions-ai==0.4.13
-python-dotenv
-azure-identity
-azure-storage-blob
-debugpy
-# Agent development CLI tool (preview)
-agent-dev-cli
+# azure-ai-projects pinned transitively by agent-framework-core==1.0.0rc3 to 2.0.0b4
+python-dotenv>=1.2.2
+azure-identity>=1.25.3
+azure-storage-blob>=12.28.0
+debugpy>=1.8.20
+# Pin Azure Monitor OpenTelemetry. The agentserver bundle (azure-ai-agentserver-core
+# 1.0.0b17) constrains this to >=1.5.0,<1.8.5 — but its lower bound transitively
+# allows old exporter releases that import the removed `LogData` symbol from
+# `opentelemetry.sdk._logs`, breaking startup with:
+#   "cannot import name 'LogData' from 'opentelemetry.sdk._logs'".
+# Pinning to 1.8.4 (the highest compatible) forces a recent exporter (>=1.0.0b49)
+# that no longer references the removed symbol.
+azure-monitor-opentelemetry>=1.8.0,<1.8.5
