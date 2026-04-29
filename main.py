@@ -65,25 +65,69 @@ logging.getLogger("opentelemetry.context").setLevel(logging.CRITICAL)
 # Azure AI Foundry configuration
 PROJECT_ENDPOINT = os.getenv("PROJECT_ENDPOINT")
 
-# Azure Blob Storage configuration
-AZURE_STORAGE_ACCOUNT_NAME = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "david")
+# Azure Blob Storage configuration.
+# NOTE: no default value on purpose. If AZURE_STORAGE_ACCOUNT_NAME is unset
+# (e.g. agent.yaml template not substituted by the deployment pipeline) we want
+# to fail loudly rather than silently target somebody else's storage account.
+AZURE_STORAGE_ACCOUNT_NAME = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME")
 BLOB_CONTAINER_NAME = "screenshots"
+
+logger.info(
+    "Storage config: AZURE_STORAGE_ACCOUNT_NAME=%r (env_set=%s)",
+    AZURE_STORAGE_ACCOUNT_NAME,
+    "AZURE_STORAGE_ACCOUNT_NAME" in os.environ,
+)
+if not AZURE_STORAGE_ACCOUNT_NAME or AZURE_STORAGE_ACCOUNT_NAME.startswith("{{"):
+    logger.error(
+        "AZURE_STORAGE_ACCOUNT_NAME is not set or is an unsubstituted template (%r). "
+        "Blob uploads WILL fail. Check agent.yaml env var substitution.",
+        AZURE_STORAGE_ACCOUNT_NAME,
+    )
+
+
+def _log_storage_principal_once() -> None:
+    """One-shot diagnostic: log oid/appid/tid of the MSI principal used for storage auth.
+
+    This decodes the JWT payload (no signature verification — diagnostic only) so that
+    the runtime managed-identity principal is visible in container logs. Required for
+    diagnosing 'AuthorizationFailure' (HTTP 403) errors when the runtime identity
+    differs from the one previously granted RBAC on the storage account.
+    """
+    if getattr(_log_storage_principal_once, "_done", False):
+        return
+    _log_storage_principal_once._done = True  # type: ignore[attr-defined]
+    try:
+        cred = SyncDefaultAzureCredential()
+        token = cred.get_token("https://storage.azure.com/.default").token
+        # JWT = header.payload.signature
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        logger.info(
+            "Storage MSI principal: oid=%s appid=%s tid=%s xms_mirid=%s idp=%s",
+            payload.get("oid"),
+            payload.get("appid"),
+            payload.get("tid"),
+            payload.get("xms_mirid"),
+            payload.get("idp") or payload.get("idtyp"),
+        )
+    except Exception as e:  # pragma: no cover - diagnostic best-effort
+        logger.warning("Could not log storage MSI principal: %s", e)
 
 
 def upload_image_to_blob(image_bytes: bytes, blob_name: str) -> str:
     """Upload image bytes to Azure Blob Storage and return the public URL."""
     logger.info("Uploading image to blob: %s (%d bytes)", blob_name, len(image_bytes))
+    _log_storage_principal_once()
     account_url = f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
     credential = SyncDefaultAzureCredential()
     blob_service_client = BlobServiceClient(account_url, credential=credential)
     container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
 
-    # Ensure container exists
-    try:
-        container_client.get_container_properties()
-    except Exception:
-        container_client.create_container()
-
+    # Container is expected to be pre-created. We deliberately do NOT call
+    # create_container() here: under least-privilege RBAC ('Storage Blob Data
+    # Contributor') a 403 on get_container_properties masks the real upload
+    # error and is misleading in logs.
     blob_client = container_client.get_blob_client(blob_name)
     blob_client.upload_blob(
         image_bytes,
@@ -119,12 +163,7 @@ def upload_blend_to_blob(local_path: str, blob_name: str) -> str:
     blob_service_client = BlobServiceClient(account_url, credential=credential)
     container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
 
-    # Ensure container exists
-    try:
-        container_client.get_container_properties()
-    except Exception:
-        container_client.create_container()
-
+    # Container is expected to be pre-created (see note in upload_image_to_blob).
     blob_client = container_client.get_blob_client(blob_name)
     with open(local_path, "rb") as f:
         blob_client.upload_blob(
@@ -133,6 +172,46 @@ def upload_blend_to_blob(local_path: str, blob_name: str) -> str:
             content_settings=ContentSettings(
                 content_type="application/x-blender",
                 content_disposition="attachment; filename=blender_scene.blend",
+            ),
+        )
+
+    # Generate a user-delegation SAS token (1-hour expiry)
+    from datetime import timedelta
+    sas_start = datetime.now(timezone.utc)
+    sas_expiry = sas_start + timedelta(hours=1)
+    user_delegation_key = blob_service_client.get_user_delegation_key(
+        key_start_time=sas_start,
+        key_expiry_time=sas_expiry,
+    )
+    sas_token = generate_blob_sas(
+        account_name=AZURE_STORAGE_ACCOUNT_NAME,
+        container_name=BLOB_CONTAINER_NAME,
+        blob_name=blob_name,
+        user_delegation_key=user_delegation_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=sas_expiry,
+    )
+    return f"{account_url}/{BLOB_CONTAINER_NAME}/{blob_name}?{sas_token}"
+
+
+def upload_glb_to_blob(local_path: str, blob_name: str) -> str:
+    """Upload a .glb file to Azure Blob Storage and return a download URL."""
+    file_size = os.path.getsize(local_path)
+    logger.info("Uploading .glb to blob: %s (%d bytes)", blob_name, file_size)
+    account_url = f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
+    credential = SyncDefaultAzureCredential()
+    blob_service_client = BlobServiceClient(account_url, credential=credential)
+    container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
+
+    # Container is expected to be pre-created (see note in upload_image_to_blob).
+    blob_client = container_client.get_blob_client(blob_name)
+    with open(local_path, "rb") as f:
+        blob_client.upload_blob(
+            f,
+            overwrite=True,
+            content_settings=ContentSettings(
+                content_type="model/gltf-binary",
+                content_disposition="attachment; filename=blender_scene.glb",
             ),
         )
 
@@ -1066,6 +1145,52 @@ print("Saved scene to {safe_path}")
         return f"Error saving scene for download: {str(e)}"
 
 
+def export_scene_as_glb_for_download() -> str:
+    """
+    Export the current Blender scene as a binary glTF (.glb) file using Blender's
+    built-in glTF exporter and upload it to cloud storage.
+    Returns a download link the user can use to open the scene in any glTF viewer
+    (Babylon.js Sandbox, three.js editor, Windows 3D Viewer, etc.).
+    The link expires after 1 hour.
+    """
+    logger.info("Tool called: export_scene_as_glb_for_download")
+    try:
+        blender = get_blender_connection()
+        temp_dir = tempfile.gettempdir()
+        temp_path = os.path.join(temp_dir, f"blender_scene_{uuid.uuid4().hex[:8]}.glb")
+        safe_path = temp_path.replace("\\", "/")
+
+        code = f"""import bpy
+bpy.ops.export_scene.gltf(
+    filepath="{safe_path}",
+    export_format='GLB',
+    use_selection=False,
+)
+print("Exported scene to {safe_path}")
+"""
+        result = blender.send_command("execute_code", {"code": code})
+
+        if not os.path.exists(temp_path):
+            return "Error: Blender export command ran but the .glb file was not created."
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        blob_name = f"scenes/scene_{timestamp}_{uuid.uuid4().hex[:8]}.glb"
+        blob_url = upload_glb_to_blob(temp_path, blob_name)
+
+        file_size = os.path.getsize(temp_path)
+        os.remove(temp_path)
+
+        logger.info("export_scene_as_glb_for_download succeeded: %d bytes, uploaded to blob", file_size)
+        return (
+            f"Scene exported as GLB ({file_size / 1024:.0f} KB).\n"
+            f"Include the following download link in your response exactly as-is:\n\n"
+            f"[Download your Blender scene (.glb)]({blob_url})"
+        )
+    except Exception as e:
+        logger.error("export_scene_as_glb_for_download failed", exc_info=True)
+        return f"Error exporting scene as GLB: {str(e)}"
+
+
 # ──────────────────────────────────────────────
 # Middleware - stream status updates to the client
 # ──────────────────────────────────────────────
@@ -1086,6 +1211,7 @@ _TOOL_STATUS_MESSAGES: dict[str, str] = {
     "render_preview": "Rendering a quick preview…",
     "render_final": "Rendering the final image (this may take a moment)…",
     "save_scene_for_download": "Saving scene for download…",
+    "export_scene_as_glb_for_download": "Exporting scene as GLB…",
 }
 
 
@@ -1102,7 +1228,7 @@ class ToolStatusMiddleware(AgentMiddleware):
     _IMAGE_TOOLS = {"get_viewport_screenshot", "render_preview", "render_final"}
 
     # Tools whose function_result contains a download link to surface
-    _LINK_TOOLS = {"save_scene_for_download"}
+    _LINK_TOOLS = {"save_scene_for_download", "export_scene_as_glb_for_download"}
 
     _IMAGE_LABELS: dict[str, str] = {
         "render_preview": "Here's a quick preview while the final render is in progress:",
@@ -1425,6 +1551,7 @@ This environment runs **Blender 4.4**. The following Blender 3.x APIs were remov
                 render_preview,
                 render_final,
                 save_scene_for_download,
+                export_scene_as_glb_for_download,
             ],
         ) as agent,
     ):

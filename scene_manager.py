@@ -24,8 +24,17 @@ from blender_connection import get_blender_connection
 
 logger = logging.getLogger("blender_agent.scene_manager")
 
-AZURE_STORAGE_ACCOUNT_NAME = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "david")
+# No default value on purpose: see note in main.py. Failing loud beats
+# silently writing to a foreign storage account when the deployment
+# pipeline forgets to substitute the env var.
+AZURE_STORAGE_ACCOUNT_NAME = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME")
 SCENE_CONTAINER_NAME = "blender-scenes"
+
+logger.info(
+    "Scene storage config: AZURE_STORAGE_ACCOUNT_NAME=%r (env_set=%s)",
+    AZURE_STORAGE_ACCOUNT_NAME,
+    "AZURE_STORAGE_ACCOUNT_NAME" in os.environ,
+)
 
 # Temp directory for .blend files during save/load
 _SCENE_DIR = os.path.join(tempfile.gettempdir(), "blender_scenes")
@@ -53,16 +62,17 @@ def _local_blend_path(conversation_id: str) -> str:
 
 
 def _get_blob_container():
-    """Get or create the blob container client for scene storage."""
+    """Get the blob container client for scene storage.
+
+    The container is expected to be pre-created. We deliberately do NOT call
+    create_container() here: under least-privilege RBAC ('Storage Blob Data
+    Contributor') a 403 on get_container_properties masks the real upload
+    error and pollutes the logs.
+    """
     account_url = f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
     credential = SyncDefaultAzureCredential()
     blob_service_client = BlobServiceClient(account_url, credential=credential)
-    container_client = blob_service_client.get_container_client(SCENE_CONTAINER_NAME)
-    try:
-        container_client.get_container_properties()
-    except Exception:
-        container_client.create_container()
-    return container_client
+    return blob_service_client.get_container_client(SCENE_CONTAINER_NAME)
 
 
 class SceneManager:

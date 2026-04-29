@@ -57,7 +57,7 @@ The agent supports **multiple concurrent conversations**, each with its own isol
 2. **User B** starts a separate conversation. User A's scene is automatically saved, Blender is reset to a clean state, and User B gets a fresh scene.
 3. **User A returns** in the same conversation. User B's scene is saved, and User A's scene is restored from Blob Storage — exactly as they left it.
 
-Scenes are stored in the `blender-scenes` container in Azure Blob Storage under `scenes/<thread-id>.blend`. The container is created automatically on first use.
+Scenes are stored in the `blender-scenes` container in Azure Blob Storage under `scenes/<thread-id>.blend`. **Both the `screenshots` and `blender-scenes` containers must be pre-created** — the agent no longer creates them at runtime (least-privilege RBAC on the Foundry agent identity does not include management-plane permissions).
 
 ### Thread ID lifecycle
 
@@ -71,7 +71,9 @@ The conversation identifier comes from `context.thread.service_thread_id` in the
 - Docker
 - An Azure AI Foundry project with a deployed model (e.g., `gpt-4.1-mini`)
 - Azure credentials configured (e.g., `az login`)
-- The Azure account used with `az login` (for local development) must have the **Storage Blob Data Contributor** role on the storage account. This is required to upload screenshots and save Blender scenes to Blob Storage. See [step 2](#2-assign-the-storage-blob-data-contributor-role) below for the role assignment command.
+- The principal that runs the agent must have the **Storage Blob Data Contributor** *and* **Storage Blob Delegator** roles on the storage account. The first lets it upload/download blobs; the second is required by `get_user_delegation_key` to mint the SAS URLs returned to the user. The principal is:
+  - **Local development:** your own Azure account (the one used with `az login`).
+  - **Hosted in Azure AI Foundry (ADC, current platform):** a per-agent service identity automatically provisioned by Foundry, named `<foundry>-<project>-<agent>-AgentIdentity` (type `ServiceIdentity`). **This is not the Foundry project's managed identity** — it is a separate principal created for each agent. See [step 2](#2-assign-the-storage-blob-data-contributor-role) below for how to find its object ID and grant the roles.
 
 ## Setup for your own Azure environment
 
@@ -90,33 +92,80 @@ az storage account create \
   --allow-blob-public-access true
 ```
 
-> The `screenshots` container will be created automatically by the agent on first use if it does not exist.
+Then **pre-create both containers** (the agent does not create them at runtime):
+
+```bash
+az storage container create --account-name <your-storage-account-name> --auth-mode login --name screenshots
+az storage container create --account-name <your-storage-account-name> --auth-mode login --name blender-scenes
+```
 
 ### 2. Assign the Storage Blob Data Contributor role
 
-The agent authenticates to Blob Storage using `DefaultAzureCredential`. This role is needed to upload screenshots and save/restore per-conversation Blender scenes.
+The agent authenticates to Blob Storage using `DefaultAzureCredential`. Two roles are required on the storage account:
 
-- **Hosted in Azure AI Foundry**: assign the role to the **Foundry Project's managed identity (service principal)**.
-- **Local development**: assign the role to **your own Azure account** (the one used with `az login`).
+- **`Storage Blob Data Contributor`** — read/write/delete blobs (screenshots, `.blend` scene files).
+- **`Storage Blob Delegator`** — mint user-delegation SAS tokens (the agent returns SAS URLs for screenshots; without this role the upload succeeds but the URL is unusable).
+
+#### 2a. Hosted in Azure AI Foundry (ADC platform)
+
+Since the migration from ACA to ADC, Foundry runs each agent under its own auto-provisioned **service identity** — *not* the Foundry project's managed identity. The identity is named `<foundry>-<project>-<agent>-AgentIdentity` and only has `Azure AI User` on the project by default. **Any RBAC you previously granted to your own user-assigned MI on ACA does not carry over and must be re-granted to this new principal.**
+
+To discover the object ID of the agent identity, the easiest way is to deploy the agent once and let it log the principal at first use — [main.py](main.py) calls `_log_storage_principal_once()` on the first blob upload, which prints a line like:
+
+```
+INFO: blender_agent: Storage MSI principal: oid=<GUID> appid=<GUID> tid=<GUID> ...
+```
+
+Alternatively, list it directly:
 
 ```bash
-# For the Foundry managed identity:
-az role assignment create \
-  --assignee <foundry-project-service-principal-id> \
-  --role "Storage Blob Data Contributor" \
-  --scope /subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<your-storage-account-name>
+az ad sp list --display-name "<foundry-resource>-<project>-<agent>-AgentIdentity" --query "[].{displayName:displayName,id:id,appId:appId}" -o table
+```
 
-# For your local dev account:
+Then grant both roles:
+
+```bash
+OID=<object-id-of-the-AgentIdentity>
+SCOPE=/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<your-storage-account-name>
+
+az role assignment create \
+  --assignee-object-id $OID \
+  --assignee-principal-type ServicePrincipal \
+  --role "Storage Blob Data Contributor" \
+  --scope $SCOPE
+
+az role assignment create \
+  --assignee-object-id $OID \
+  --assignee-principal-type ServicePrincipal \
+  --role "Storage Blob Delegator" \
+  --scope $SCOPE
+```
+
+Verify:
+
+```bash
+az role assignment list --assignee $OID --all -o table
+```
+
+#### 2b. Local development
+
+Assign the same two roles to your own Azure account:
+
+```bash
 az role assignment create \
   --assignee <your-azure-account-email-or-object-id> \
   --role "Storage Blob Data Contributor" \
   --scope /subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<your-storage-account-name>
+
+az role assignment create \
+  --assignee <your-azure-account-email-or-object-id> \
+  --role "Storage Blob Delegator" \
+  --scope /subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<your-storage-account-name>
 ```
 
-> **Tip:** You can find the Foundry Project service principal (object ID) in the Azure Portal under your AI Foundry project's **Identity** blade, or by running:
-> ```bash
-> az ad sp show --id <client-id-of-your-foundry-project> --query id -o tsv
-> ```
+#### Troubleshooting `AuthorizationPermissionMismatch`
+
+If blob calls return HTTP 403 `AuthorizationPermissionMismatch` (different from `AuthorizationFailure`), it means the principal **has a token but the wrong role**. Check the logs for the `Storage MSI principal: oid=...` line and confirm that exact OID has both roles on the storage account scope. RBAC propagation can take 1–2 minutes.
 
 ### 3. Update the `.env` file
 
@@ -133,6 +182,24 @@ AZURE_STORAGE_ACCOUNT_NAME=<your-storage-account-name>
 | `PROJECT_ENDPOINT` | The full endpoint URL of your Azure AI Foundry project |
 | `MODEL_DEPLOYMENT_NAME` | The name of the model deployment to use (e.g., `gpt-4.1-mini`) |
 | `AZURE_STORAGE_ACCOUNT_NAME` | The name of the Azure Storage account created in step 1 |
+
+## Deploying to Azure AI Foundry
+
+> ⚠️ **Set `AI_FOUNDRY_ACR_BUILD_WAIT_UNTIL_DONE=true` before deploying.**
+>
+> This agent's Docker image installs Blender (and its system dependencies), which makes the Azure Container Registry build noticeably long. Without this flag, the Foundry deploy command may return a timeout while the ACR build is still running, leaving you unsure whether the deployment succeeded. Setting it forces the deploy tooling to wait until the ACR build actually finishes.
+>
+> Set it in the **shell from which you launch the deployment** (not inside the container):
+>
+> **PowerShell**
+> ```powershell
+> $env:AI_FOUNDRY_ACR_BUILD_WAIT_UNTIL_DONE = "true"
+> ```
+>
+> **bash / zsh**
+> ```bash
+> export AI_FOUNDRY_ACR_BUILD_WAIT_UNTIL_DONE=true
+> ```
 
 ## Build & Run
 
@@ -168,28 +235,25 @@ docker run -it --rm -p 8088:8088 \
 
 #### Windows (PowerShell)
 
-By default, the Azure CLI on Windows encrypts the token cache with DPAPI (a Windows-only API), so a Linux container cannot read mounted credentials. To get the same seamless experience as macOS, disable token cache encryption on your Windows host:
+```powershell
+docker run -it --rm -p 8088:8088 --env-file .env -v ~/.azure:/root/.azure:ro blender-scene-agent
+```
+
+If the container can't read your Azure credentials (you'll see a `DefaultAzureCredential` error at startup), it's because the Azure CLI on Windows encrypts the token cache with DPAPI by default and a Linux container can't decrypt it. Run this once on your host to switch to a plaintext cache (same behaviour as macOS/Linux), then retry:
 
 ```powershell
-# Run once on your Windows host:
 az config set core.encrypt_token_cache=false
 az account clear
 az login
 ```
 
-> **Security note:** This stores Azure tokens in plaintext in `%USERPROFILE%\.azure`. This is the same behavior as on macOS/Linux. Re-enable encryption later with `az config set core.encrypt_token_cache=true` if needed.
+> **Security note:** tokens are then stored in plaintext in `%USERPROFILE%\.azure`. Re-enable later with `az config set core.encrypt_token_cache=true` if needed.
 
-1. **Line endings are handled automatically** by the `.gitattributes` file in this repo — all text files are normalized to Unix (LF) line endings. If you create a new `.env` file manually, ensure it uses LF endings (in VS Code, click "CRLF" in the status bar and select "LF").
+**Fallback** (no host changes): omit the `-v` mount and the container will fall back to `az login --use-device-code`:
 
-2. Run the container with the volume mount — same as macOS:
-   ```powershell
-   docker run -it --rm -p 8088:8088 --env-file .env -v "${env:USERPROFILE}/.azure:/root/.azure:ro" blender-scene-agent
-   ```
-
-**Fallback (without unencrypted cache):** If you prefer not to disable encryption, omit the `-v` mount. The container will detect missing credentials and prompt an `az login --use-device-code` flow:
-   ```powershell
-   docker run -it --rm -p 8088:8088 --env-file .env blender-scene-agent
-   ```
+```powershell
+docker run -it --rm -p 8088:8088 --env-file .env blender-scene-agent
+```
 
 Or mount Azure CLI credentials for local development (macOS/Linux):
 
@@ -249,8 +313,12 @@ docker run -it --rm \
 
 ![Screenshot of the Foundry Hosted Blender Agent in action](ScreenshotDemoFoundryBlenderAgent.jpg)
 
-- Create a scene containing 1 table and 2 chairs and put 3 food items right on top of the table, make sure the food scale fits on top. Make sure the objects are not intersecting and then place realistically. Share a high fidelity rendering.
-- let me download it
+- Create a fantasy world for kids, use basic primitives to build 6 houses and 10 trees. A kid should later be able to navigate in this 3D world on a path connecting each house. Give me a high fidelity rendering at the end
+- give me the GLB version
+
+Then, drag'n'drop the GLB file in https://sandbox.babylonjs.com for instance
+
+![Screenshot of a glTF export of the Blender Hosted Agent running in Babylon.js](ScreenshotFoundryHAGLB.png)
 
 ## Credits
 
