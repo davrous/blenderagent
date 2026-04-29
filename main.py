@@ -23,6 +23,7 @@ load_dotenv(override=True)
 from agent_framework import (
     AgentMiddleware,
     AgentContext,
+    AgentResponse,
     AgentResponseUpdate,
     Content,
     ResponseStream,
@@ -1313,7 +1314,7 @@ class ToolStatusMiddleware(AgentMiddleware):
 
                 yield update
 
-        context.result = ResponseStream(_wrapped())
+        context.result = ResponseStream(_wrapped(), finalizer=AgentResponse.from_updates)
 
 
 class SceneIsolationMiddleware(AgentMiddleware):
@@ -1424,7 +1425,7 @@ class SceneIsolationMiddleware(AgentMiddleware):
                             "(first request for new conversation — scene stays in memory)."
                         )
 
-            context.result = ResponseStream(_save_after_stream())
+            context.result = ResponseStream(_save_after_stream(), finalizer=AgentResponse.from_updates)
         else:
             # Non-streaming: tools already ran, thread is updated.
             save_id = self._get_conversation_id(context)
