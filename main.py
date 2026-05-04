@@ -239,6 +239,92 @@ MODEL_DEPLOYMENT_NAME = os.getenv("MODEL_DEPLOYMENT_NAME", "gpt-4.1")
 
 
 # ──────────────────────────────────────────────
+# Crash detection & recovery helpers
+# ──────────────────────────────────────────────
+
+# Per-conversation crash counter — circuit breaker to avoid retry storms
+# when Blender keeps crashing on the same input (e.g. a problematic asset).
+_MAX_CRASHES_PER_CONVERSATION = 2
+_crash_counts: dict[str, int] = {}
+
+
+def _is_blender_crash_error(err: Exception) -> bool:
+    """Heuristic: True if the error indicates Blender is dead/restarted, not an app-level error."""
+    msg = str(err).lower()
+    return any(
+        marker in msg
+        for marker in (
+            "connection lost",
+            "connection refused",
+            "not connected to blender",
+            "process is not running",
+            "connection closed before receiving any data",
+            "broken pipe",
+        )
+    )
+
+
+def _recover_blender_scene(label: str) -> tuple[bool, str | None]:
+    """Wait for Blender to come back and reload the active conversation's scene.
+
+    Returns (recovered, conversation_id_or_None). If recovered is False, the
+    caller should surface a friendly error to the LLM/user.
+    """
+    logger.error("BLENDER_CRASH_DETECTED in %s — attempting recovery", label)
+
+    if _scene_manager is None:
+        logger.error("%s: scene manager not initialized — cannot recover", label)
+        return (False, None)
+
+    conversation_id = _scene_manager._active_conversation_id
+    if conversation_id is None:
+        logger.warning("%s: no active conversation id — cannot reload scene", label)
+        # Still wait for Blender so subsequent calls don't pile up failures.
+        recovered = _wait_for_blender(timeout=60)
+        return (recovered, None)
+
+    # Circuit breaker
+    count = _crash_counts.get(conversation_id, 0) + 1
+    _crash_counts[conversation_id] = count
+    if count > _MAX_CRASHES_PER_CONVERSATION:
+        logger.error(
+            "%s: conversation %s exceeded %d crashes — circuit breaker tripped",
+            label, conversation_id, _MAX_CRASHES_PER_CONVERSATION,
+        )
+        return (False, conversation_id)
+
+    if not _wait_for_blender(timeout=60):
+        return (False, conversation_id)
+
+    try:
+        _scene_manager.reload_scene_from_blob(conversation_id)
+        logger.info("%s: scene reloaded for conversation %s after crash", label, conversation_id)
+        return (True, conversation_id)
+    except Exception:
+        logger.error("%s: failed to reload scene after crash", label, exc_info=True)
+        return (False, conversation_id)
+
+
+def _crash_user_message(label: str, conversation_id: str | None, original: Exception) -> str:
+    """Build an actionable error string for the LLM when Blender crashed."""
+    count = _crash_counts.get(conversation_id, 0) if conversation_id else 0
+    if count > _MAX_CRASHES_PER_CONVERSATION:
+        return (
+            f"Blender has crashed {count} times in this conversation and the safety "
+            f"circuit breaker has been tripped. Please ask the user to start a new "
+            f"conversation. Last error from {label}: {original}"
+        )
+    return (
+        f"Blender crashed during '{label}' (likely caused by the operation just "
+        f"attempted — large/complex assets and certain glTF imports are common "
+        f"triggers). The previous scene has been restored from the saved state. "
+        f"Please apologize briefly to the user and try a different approach: "
+        f"smaller resolution (e.g. '1k'), a simpler asset, or build the missing "
+        f"geometry with primitives. Original error: {original}"
+    )
+
+
+# ──────────────────────────────────────────────
 # Agent tools - Scene inspection
 # ──────────────────────────────────────────────
 
@@ -250,21 +336,27 @@ def get_scene_info() -> str:
     Always call this first to understand the current state of the scene.
     """
     logger.info("Tool called: get_scene_info")
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("get_scene_info")
-        # Return a concise summary instead of raw JSON to save LLM tokens
-        obj_count = result.get("object_count", 0)
-        mat_count = result.get("materials_count", 0)
-        lines = [f"Scene '{result.get('name', '?')}': {obj_count} objects, {mat_count} materials."]
-        for obj in result.get("objects", []):
-            loc = obj.get("location", [0, 0, 0])
-            lines.append(f"  - {obj.get('name', '?')} ({obj.get('type', '?')}) at ({loc[0]}, {loc[1]}, {loc[2]})")
-        logger.info("get_scene_info succeeded: %d objects, %d materials", obj_count, mat_count)
-        return "\n".join(lines)
-    except Exception as e:
-        logger.error("get_scene_info failed", exc_info=True)
-        return f"Error getting scene info: {str(e)}"
+    for attempt in (1, 2):
+        try:
+            blender = get_blender_connection()
+            result = blender.send_command("get_scene_info")
+            # Return a concise summary instead of raw JSON to save LLM tokens
+            obj_count = result.get("object_count", 0)
+            mat_count = result.get("materials_count", 0)
+            lines = [f"Scene '{result.get('name', '?')}': {obj_count} objects, {mat_count} materials."]
+            for obj in result.get("objects", []):
+                loc = obj.get("location", [0, 0, 0])
+                lines.append(f"  - {obj.get('name', '?')} ({obj.get('type', '?')}) at ({loc[0]}, {loc[1]}, {loc[2]})")
+            logger.info("get_scene_info succeeded: %d objects, %d materials", obj_count, mat_count)
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error("get_scene_info failed (attempt %d/2)", attempt, exc_info=True)
+            if attempt == 1 and _is_blender_crash_error(e):
+                recovered, _ = _recover_blender_scene("get_scene_info")
+                if recovered:
+                    continue  # retry once on the restored scene
+            return f"Error getting scene info: {str(e)}"
+    return "Error getting scene info: exhausted retries"
 
 
 def get_object_info(
@@ -673,6 +765,15 @@ def execute_blender_code(
         logger.info("execute_blender_code succeeded")
         return f"Code executed successfully. {raw}".strip()
     except Exception as e:
+        if _is_blender_crash_error(e):
+            logger.error("execute_blender_code: Blender crashed", exc_info=True)
+            recovered, conv_id = _recover_blender_scene("execute_blender_code")
+            if recovered:
+                return _crash_user_message("execute_blender_code", conv_id, e)
+            return (
+                f"Blender crashed while executing code and could not recover. "
+                f"Please ask the user to retry. Original error: {e}"
+            )
         logger.warning("execute_blender_code failed (will enrich error for LLM): %s", e)
         return _enrich_error_context(str(e), code)
 
@@ -849,6 +950,18 @@ def download_polyhaven_asset(
             return f"Failed to download asset: {result.get('message', 'Unknown error')}"
     except Exception as e:
         logger.error("download_polyhaven_asset failed for %r", asset_id, exc_info=True)
+        if _is_blender_crash_error(e):
+            recovered, conv_id = _recover_blender_scene("download_polyhaven_asset")
+            if recovered:
+                return _crash_user_message(
+                    f"download_polyhaven_asset(id={asset_id!r}, res={resolution!r})",
+                    conv_id, e,
+                )
+            return (
+                f"Blender crashed while importing '{asset_id}' and could not recover. "
+                f"Please ask the user to retry; the saved scene was preserved. "
+                f"Original error: {e}"
+            )
         return f"Error downloading asset: {str(e)}"
 
 
@@ -1483,6 +1596,13 @@ async def main():
 - NEVER set `collection.name` — it is read-only in this Blender environment. To organize objects, create new collections with `bpy.data.collections.new("Name")` and link them to the scene with `bpy.context.scene.collection.children.link(new_collection)` instead of renaming existing ones.
 - The render engine enum for Eevee in Blender 4.x is `'BLENDER_EEVEE_NEXT'`, NOT `'BLENDER_EEVEE'`. Valid engines are: `'BLENDER_EEVEE_NEXT'`, `'BLENDER_WORKBENCH'`, `'CYCLES'`.
 - When a tool returns an image in markdown format (e.g. `![screenshot](url)` or `![render](url)`), you MUST include that exact markdown image link in your response so the chat client can display the image. Never omit, summarize, or rewrite the image URL.
+
+## Recovering from Blender crashes
+Some operations (especially importing large or complex Poly Haven models, or running heavy `execute_blender_code` scripts) can occasionally crash the Blender process. When this happens, a tool will return a message that begins with **"Blender crashed"**. The previous scene has already been automatically restored from the saved state — you do NOT need to rebuild it. When you see such a message:
+1. Acknowledge the crash to the user briefly (one short sentence).
+2. Try a different approach for that step: a smaller resolution (e.g. `'1k'` instead of `'2k'`), a simpler asset, or build the missing geometry with `create_object` primitives.
+3. Do NOT immediately retry the EXACT same operation — it is likely to crash again.
+4. If the message says the circuit breaker has tripped, stop attempting Blender operations and ask the user to start a new conversation.
 
 ## Collection Management Best Practices (IMPORTANT)
 `bpy.ops.mesh.primitive_*_add()` and similar operators add new objects to the **active collection**, which is NOT always `scene.collection` (the root "Scene Collection"). If you create a custom collection and link objects to it, the active collection may change — and calling `scene.collection.objects.unlink(obj)` will fail with `RuntimeError: Object 'X' not in collection 'Scene Collection'`.

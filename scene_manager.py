@@ -20,7 +20,7 @@ import tempfile
 from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
-from blender_connection import get_blender_connection
+from blender_connection import current_epoch, get_blender_connection
 
 logger = logging.getLogger("blender_agent.scene_manager")
 
@@ -80,6 +80,11 @@ class SceneManager:
 
     def __init__(self):
         self._active_conversation_id: str | None = None
+        # Connection epoch captured the last time we successfully activated
+        # (loaded or reset) the scene. If the live epoch differs at save time,
+        # Blender was restarted in between and the in-memory scene is NOT the
+        # one the user/agent built — refuse to overwrite the saved blob.
+        self._active_epoch: int | None = None
 
     def activate_scene(self, conversation_id: str) -> None:
         """Load the scene for the given conversation, or reset to a clean scene.
@@ -129,8 +134,9 @@ class SceneManager:
             self._reset_scene()
 
         self._active_conversation_id = conversation_id
-        logger.info("Scene activation complete for conversation %s (loaded_from_blob=%s)",
-                    conversation_id, loaded)
+        self._active_epoch = current_epoch()
+        logger.info("Scene activation complete for conversation %s (loaded_from_blob=%s, epoch=%d)",
+                    conversation_id, loaded, self._active_epoch)
 
     def save_scene(self, conversation_id: str) -> None:
         """Save the current Blender scene to blob storage for the given conversation."""
@@ -138,6 +144,25 @@ class SceneManager:
         blob_name = _safe_blob_name(conversation_id)
         logger.info("save_scene called for conversation %s (blob=%s, local=%s)",
                     conversation_id, blob_name, local_path)
+
+        # ── Crash-corruption guard ──
+        # If Blender's connection epoch has bumped since we activated this
+        # conversation's scene, Blender was restarted by the supervisor mid-
+        # conversation. The current in-memory scene is therefore the empty
+        # default scene, NOT the user's work. Refuse to overwrite the blob.
+        live_epoch = current_epoch()
+        if (
+            self._active_conversation_id == conversation_id
+            and self._active_epoch is not None
+            and live_epoch != self._active_epoch
+        ):
+            logger.error(
+                "BLENDER_CRASH_DETECTED save_scene for %s aborted: connection epoch "
+                "changed (%s -> %s) since scene activation. Saved blob NOT overwritten "
+                "to preserve previous scene.",
+                conversation_id, self._active_epoch, live_epoch,
+            )
+            return
 
         try:
             logger.info("Saving Blender scene to local .blend file: %s", local_path)
@@ -159,6 +184,7 @@ class SceneManager:
             logger.info("Scene uploaded to blob successfully: %s (%d bytes)", blob_name, file_size)
             # Track which conversation owns the current Blender state
             self._active_conversation_id = conversation_id
+            self._active_epoch = current_epoch()
         except Exception:
             logger.error("Failed to save scene for conversation %s (blob=%s)",
                          conversation_id, blob_name, exc_info=True)
@@ -168,6 +194,47 @@ class SceneManager:
         logger.info("reset_to_clean: clearing active conversation %s", self._active_conversation_id)
         self._reset_scene()
         self._active_conversation_id = None
+        self._active_epoch = None
+
+    def reload_scene_from_blob(self, conversation_id: str) -> bool:
+        """Force-reload the conversation's scene from blob storage.
+
+        Used to recover from a Blender process crash mid-conversation. Unlike
+        activate_scene(), this:
+          - bypasses the "already active, skip" early-return,
+          - does NOT save any previous in-memory scene (it is presumed lost),
+          - falls back to a clean reset if no blob exists.
+
+        Returns True if a saved blob was successfully loaded, False otherwise.
+        """
+        local_path = _local_blend_path(conversation_id)
+        blob_name = _safe_blob_name(conversation_id)
+        logger.info("reload_scene_from_blob: conversation=%s blob=%s", conversation_id, blob_name)
+
+        loaded = False
+        try:
+            container = _get_blob_container()
+            blob_client = container.get_blob_client(blob_name)
+            with open(local_path, "wb") as f:
+                stream = blob_client.download_blob()
+                stream.readinto(f)
+            logger.info("reload_scene_from_blob: downloaded %s (%d bytes)",
+                        blob_name, os.path.getsize(local_path))
+            loaded = True
+        except Exception as e:
+            logger.warning("reload_scene_from_blob: no saved scene for %s (%s); resetting",
+                           conversation_id, e)
+
+        if loaded:
+            self._load_blend_file(local_path)
+        else:
+            self._reset_scene()
+
+        self._active_conversation_id = conversation_id
+        self._active_epoch = current_epoch()
+        logger.info("reload_scene_from_blob complete for %s (loaded=%s, epoch=%d)",
+                    conversation_id, loaded, self._active_epoch)
+        return loaded
 
     def _load_blend_file(self, filepath: str) -> None:
         """Load a .blend file into Blender, replacing the current scene."""
