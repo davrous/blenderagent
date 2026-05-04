@@ -237,6 +237,25 @@ def upload_glb_to_blob(local_path: str, blob_name: str) -> str:
 
 MODEL_DEPLOYMENT_NAME = os.getenv("MODEL_DEPLOYMENT_NAME", "gpt-4.1")
 
+# ──────────────────────────────────────────────
+# Resilience knobs (overridable via env)
+# ──────────────────────────────────────────────
+# Time without any streaming chunk before we emit a "still working" heartbeat
+# to keep the client connection alive and reassure the user.
+HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("AGENT_HEARTBEAT_SECONDS", "30"))
+# Hard wall-clock cap for a single agent turn. Aborts cleanly with a friendly
+# message rather than letting the request hang indefinitely.
+TURN_TIMEOUT_SECONDS = float(os.getenv("AGENT_TURN_TIMEOUT_SECONDS", "180"))
+# User-facing message when the upstream model fails or the turn times out.
+_FRIENDLY_MODEL_ERROR_TEXT = (
+    "\n\n⚠️ The model service hit a transient error and could not finish this "
+    "response. Your scene has been saved — please retry your last message."
+)
+_FRIENDLY_TIMEOUT_TEXT = (
+    "\n\n⚠️ This turn took too long and was aborted to keep the session healthy. "
+    "Your scene has been saved — please retry, ideally with a simpler request."
+)
+
 
 # ──────────────────────────────────────────────
 # Crash detection & recovery helpers
@@ -1369,63 +1388,171 @@ class ToolStatusMiddleware(AgentMiddleware):
             # Track call_ids for link-producing tools → tool name
             link_call_ids: dict[str, str] = {}
 
-            async for update in original_stream:
-                for content in (update.contents or []):
-                    # ── Status messages before each tool call ──
-                    if content.type == "function_call":
-                        call_id = content.call_id or content.name
-                        if content.name in self._IMAGE_TOOLS and call_id:
-                            image_call_ids[call_id] = content.name
-                        if content.name in self._LINK_TOOLS and call_id:
-                            link_call_ids[call_id] = content.name
-                        if content.name and content.name not in announced_names:
-                            announced_names.add(content.name)
-                            status = _TOOL_STATUS_MESSAGES.get(
-                                content.name, "Working on it…"
-                            )
-                            yield AgentResponseUpdate(
-                                contents=[Content.from_text(f"\n\n*{status}*\n\n")],
-                                role="assistant",
-                                message_id=f"status-{content.name}",
-                            )
+            # Resilience state for this turn
+            turn_started = asyncio.get_running_loop().time()
+            chunks_seen = 0
+            heartbeat_idx = 0
+            session_id = (
+                getattr(context.session, "session_id", None)
+                if context.session is not None
+                else None
+            )
 
-                    # ── Stream images from tool results immediately ──
-                    if content.type == "function_result":
-                        cid = content.call_id or ""
-                        if cid in image_call_ids:
-                            match = self._IMAGE_RE.search(
-                                content.result or ""
-                            )
-                            if match:
-                                tool_name = image_call_ids[cid]
-                                label = self._IMAGE_LABELS.get(tool_name, "")
+            # Pump upstream chunks into a queue from a background task so we can
+            # interleave heartbeat messages without cancelling an in-flight HTTP
+            # read (which would leave the underlying stream in a broken state).
+            _SENTINEL_DONE = object()
+            queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+
+            async def _pump():
+                try:
+                    async for upd in original_stream:
+                        await queue.put(("update", upd))
+                except BaseException as ex:  # noqa: BLE001 — propagate to consumer
+                    await queue.put(("error", ex))
+                else:
+                    await queue.put(("done", _SENTINEL_DONE))
+
+            pump_task = asyncio.create_task(_pump())
+
+            async def _drain_pump():
+                if not pump_task.done():
+                    pump_task.cancel()
+                try:
+                    await pump_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            try:
+                while True:
+                    elapsed = asyncio.get_running_loop().time() - turn_started
+                    remaining = TURN_TIMEOUT_SECONDS - elapsed
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError("turn wall-clock cap exceeded")
+                    wait_for = min(HEARTBEAT_INTERVAL_SECONDS, remaining)
+                    try:
+                        kind, payload = await asyncio.wait_for(
+                            queue.get(), timeout=wait_for
+                        )
+                    except asyncio.TimeoutError:
+                        if (asyncio.get_running_loop().time() - turn_started) >= TURN_TIMEOUT_SECONDS:
+                            raise asyncio.TimeoutError("turn wall-clock cap exceeded")
+                        heartbeat_idx += 1
+                        yield AgentResponseUpdate(
+                            contents=[Content.from_text("\n\n*Still working…*\n\n")],
+                            role="assistant",
+                            message_id=f"heartbeat-{heartbeat_idx}",
+                        )
+                        continue
+
+                    if kind == "done":
+                        break
+                    if kind == "error":
+                        raise payload
+                    # kind == "update"
+                    update = payload
+                    chunks_seen += 1
+                    for content in (update.contents or []):
+                        # ── Status messages before each tool call ──
+                        if content.type == "function_call":
+                            call_id = content.call_id or content.name
+                            if content.name in self._IMAGE_TOOLS and call_id:
+                                image_call_ids[call_id] = content.name
+                            if content.name in self._LINK_TOOLS and call_id:
+                                link_call_ids[call_id] = content.name
+                            if content.name and content.name not in announced_names:
+                                announced_names.add(content.name)
+                                status = _TOOL_STATUS_MESSAGES.get(
+                                    content.name, "Working on it…"
+                                )
                                 yield AgentResponseUpdate(
-                                    contents=[
-                                        Content.from_text(
-                                            f"\n\n{label}\n\n{match.group(0)}\n\n"
-                                        )
-                                    ],
+                                    contents=[Content.from_text(f"\n\n*{status}*\n\n")],
                                     role="assistant",
-                                    message_id=f"tool-img-{cid}",
+                                    message_id=f"status-{content.name}",
                                 )
 
-                        # ── Stream download links from tool results immediately ──
-                        if cid in link_call_ids:
-                            match = self._LINK_RE.search(
-                                content.result or ""
-                            )
-                            if match:
-                                yield AgentResponseUpdate(
-                                    contents=[
-                                        Content.from_text(
-                                            f"\n\n{match.group(0)}\n\n"
-                                        )
-                                    ],
-                                    role="assistant",
-                                    message_id=f"tool-link-{cid}",
+                        # ── Stream images from tool results immediately ──
+                        if content.type == "function_result":
+                            cid = content.call_id or ""
+                            if cid in image_call_ids:
+                                match = self._IMAGE_RE.search(
+                                    content.result or ""
                                 )
+                                if match:
+                                    tool_name = image_call_ids[cid]
+                                    label = self._IMAGE_LABELS.get(tool_name, "")
+                                    yield AgentResponseUpdate(
+                                        contents=[
+                                            Content.from_text(
+                                                f"\n\n{label}\n\n{match.group(0)}\n\n"
+                                            )
+                                        ],
+                                        role="assistant",
+                                        message_id=f"tool-img-{cid}",
+                                    )
 
-                yield update
+                            # ── Stream download links from tool results immediately ──
+                            if cid in link_call_ids:
+                                match = self._LINK_RE.search(
+                                    content.result or ""
+                                )
+                                if match:
+                                    yield AgentResponseUpdate(
+                                        contents=[
+                                            Content.from_text(
+                                                f"\n\n{match.group(0)}\n\n"
+                                            )
+                                        ],
+                                        role="assistant",
+                                        message_id=f"tool-link-{cid}",
+                                    )
+
+                    yield update
+            except asyncio.TimeoutError:
+                elapsed_ms = int(
+                    (asyncio.get_running_loop().time() - turn_started) * 1000
+                )
+                logger.error(
+                    "Agent turn timed out: session_id=%s elapsed_ms=%d "
+                    "chunks_seen=%d cap_seconds=%.0f",
+                    session_id, elapsed_ms, chunks_seen, TURN_TIMEOUT_SECONDS,
+                )
+                yield AgentResponseUpdate(
+                    contents=[Content.from_text(_FRIENDLY_TIMEOUT_TEXT)],
+                    role="assistant",
+                    message_id="agent-turn-timeout",
+                )
+                # Re-raise so server-side telemetry records the failure.
+                raise
+            except Exception as exc:
+                elapsed_ms = int(
+                    (asyncio.get_running_loop().time() - turn_started) * 1000
+                )
+                # Try to extract an upstream request id / status code for
+                # actionable diagnostics.
+                request_id = getattr(exc, "request_id", None) or getattr(
+                    getattr(exc, "response", None), "headers", {}
+                ).get("x-request-id") if hasattr(exc, "response") else None
+                status_code = getattr(exc, "status_code", None) or getattr(
+                    getattr(exc, "response", None), "status_code", None
+                )
+                logger.error(
+                    "Agent stream failed: session_id=%s elapsed_ms=%d "
+                    "chunks_seen=%d status=%s request_id=%s exc_type=%s",
+                    session_id, elapsed_ms, chunks_seen,
+                    status_code, request_id, type(exc).__name__,
+                    exc_info=True,
+                )
+                yield AgentResponseUpdate(
+                    contents=[Content.from_text(_FRIENDLY_MODEL_ERROR_TEXT)],
+                    role="assistant",
+                    message_id="agent-stream-error",
+                )
+                # Re-raise so server-side telemetry records the failure and
+                # the framework's normal error path runs.
+                raise
+            finally:
+                await _drain_pump()
 
         context.result = ResponseStream(_wrapped(), finalizer=AgentResponse.from_updates)
 
