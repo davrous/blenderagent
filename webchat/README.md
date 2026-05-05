@@ -44,13 +44,17 @@ Open <http://localhost:5173>. The default `.env` values target `http://localhost
 copy .env.example .env
 # Edit .env and set:
 #   AGENT_MODE=foundry
-#   AGENT_FOUNDRY_URL=https://<foundry>.services.ai.azure.com/api/projects/<project>/agents/<agent>
-#   MODEL_NAME=<deployed-agent-id>
+#   AGENT_FOUNDRY_URL=https://<foundry>.services.ai.azure.com/api/projects/<project>
+#   AGENT_NAME=<deployed-agent-name>
+#   AGENT_API_VERSION=v1
+#   MODEL_NAME=<deployed-agent-name>   # cosmetic in foundry mode
 
 az login
 npm install
 npm run dev
 ```
+
+> **Breaking change.** `AGENT_FOUNDRY_URL` now points at the **project endpoint** (no `/agents/<name>` suffix). The agent name is supplied separately via `AGENT_NAME` so the proxy can manage hosted-agent sessions.
 
 If you get HTTP 401 from the proxy, try setting `AGENT_TOKEN_SCOPE=https://cognitiveservices.azure.com/.default` in `.env` — the exact required scope depends on how the deployed Foundry agent endpoint validates tokens.
 
@@ -62,9 +66,11 @@ All settings live in `webchat/.env`. See [`.env.example`](.env.example) for the 
 |---|---|---|
 | `AGENT_MODE` | `local` | `local` or `foundry`. |
 | `AGENT_LOCAL_URL` | `http://localhost:8088` | Used when `AGENT_MODE=local`. |
-| `AGENT_FOUNDRY_URL` | _(required for foundry mode)_ | Full base URL of the deployed agent. |
+| `AGENT_FOUNDRY_URL` | _(required for foundry)_ | **Project endpoint** root, e.g. `https://<acct>.services.ai.azure.com/api/projects/<project>`. |
+| `AGENT_NAME` | _(required for foundry)_ | Hosted agent name, appended by the proxy. |
+| `AGENT_API_VERSION` | `v1` | Foundry control-plane API version. |
 | `AGENT_TOKEN_SCOPE` | `https://ai.azure.com/.default` | OAuth scope for the bearer token. |
-| `MODEL_NAME` | `BlenderSceneAgent` | Sent as `model` in the Responses request. |
+| `MODEL_NAME` | `BlenderSceneAgent` | Sent as `model` in the Responses request body (cosmetic in foundry mode). |
 | `PORT` | `5174` | Proxy listen port. |
 
 ## Project layout
@@ -73,8 +79,9 @@ All settings live in `webchat/.env`. See [`.env.example`](.env.example) for the 
 webchat/
 ├── server/                 # Express proxy: SSE pass-through + Entra auth
 │   └── src/
-│       ├── index.ts        # POST /api/chat, GET /api/health
+│       ├── index.ts        # POST /api/chat, POST /api/reset, GET /api/health, GET /api/blob
 │       ├── auth.ts         # Cached DefaultAzureCredential token
+│       ├── sessions.ts     # Foundry hosted-agent session cache
 │       └── config.ts
 └── client/                 # Vite + React + TypeScript chat UI
     └── src/
@@ -90,11 +97,12 @@ webchat/
 ## How it works
 
 - **Streaming.** The proxy forwards the agent's native SSE (`response.created`, `response.output_text.delta`, `response.completed`, …) untouched. The client parses these frames manually and appends each `delta` to the active assistant message; `react-markdown` re-renders incrementally so images appear as soon as the closing `)` of their markdown lands.
-- **Multi-turn.** On `response.completed`, the client stores `response.id` and sends it as `previous_response_id` on the next request. The agent uses this to maintain `service_thread_id`, which the `SceneIsolationMiddleware` keys on for per-conversation Blender scene isolation.
+- **Multi-turn — local mode.** On `response.completed`, the client stores `response.id` and sends it as `previous_response_id` on the next request. The agent uses this to maintain `service_thread_id`, which the `SceneIsolationMiddleware` keys on for per-conversation Blender scene isolation.
+- **Multi-turn — foundry mode.** The client mints a UUID `conversation_id` per session and sends it on every request. The proxy lazily creates a Foundry hosted-agent session (`POST /agents/{name}/endpoint/sessions`) keyed off that id and reuses the resulting `agent_session_id` on every `/responses` call. `Reset` (and the `/api/reset` endpoint) deletes the session server-side and rotates the conversation id, which gives the next message a fresh Blender scene.
 - **Status pills.** The agent's `ToolStatusMiddleware` emits italic single-line markers like `*Rendering the final image…*`. The client extracts complete blocks of this shape from the streamed buffer and renders them as a pulsing badge above the message instead of inline italic text. The latest one replaces the previous; they disappear when the response completes.
 - **Inline images.** Tools like `get_viewport_screenshot`, `render_preview`, and `render_final` return their results as `![label](sas-url)`. The client's custom `img` renderer wraps them in a button that opens a full-screen lightbox (click backdrop or press `Esc` to close).
 - **Download buttons.** `save_scene_for_download` and `export_scene_as_glb_for_download` return `[Download…](sas-url)`. The custom `a` renderer detects `.blend` / `.glb` URLs and renders a styled download button instead of a plain link.
-- **Reset.** Clears local state and forgets `previous_response_id` so the next message starts a fresh conversation (and a fresh Blender scene).
+- **Reset.** Clears local state, asks the proxy to delete the foundry session (no-op in local mode), and rotates the conversation id so the next message starts a fresh conversation (and a fresh Blender scene).
 
 ## Troubleshooting
 
