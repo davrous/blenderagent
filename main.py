@@ -23,6 +23,7 @@ load_dotenv(override=True)
 from agent_framework import (
     AgentMiddleware,
     AgentContext,
+    AgentResponse,
     AgentResponseUpdate,
     Content,
     ResponseStream,
@@ -236,6 +237,111 @@ def upload_glb_to_blob(local_path: str, blob_name: str) -> str:
 
 MODEL_DEPLOYMENT_NAME = os.getenv("MODEL_DEPLOYMENT_NAME", "gpt-4.1")
 
+# ──────────────────────────────────────────────
+# Resilience knobs (overridable via env)
+# ──────────────────────────────────────────────
+# Time without any streaming chunk before we emit a "still working" heartbeat
+# to keep the client connection alive and reassure the user.
+HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("AGENT_HEARTBEAT_SECONDS", "30"))
+# Hard wall-clock cap for a single agent turn. Aborts cleanly with a friendly
+# message rather than letting the request hang indefinitely.
+TURN_TIMEOUT_SECONDS = float(os.getenv("AGENT_TURN_TIMEOUT_SECONDS", "180"))
+# User-facing message when the upstream model fails or the turn times out.
+_FRIENDLY_MODEL_ERROR_TEXT = (
+    "\n\n⚠️ The model service hit a transient error and could not finish this "
+    "response. Your scene has been saved — please retry your last message."
+)
+_FRIENDLY_TIMEOUT_TEXT = (
+    "\n\n⚠️ This turn took too long and was aborted to keep the session healthy. "
+    "Your scene has been saved — please retry, ideally with a simpler request."
+)
+
+
+# ──────────────────────────────────────────────
+# Crash detection & recovery helpers
+# ──────────────────────────────────────────────
+
+# Per-conversation crash counter — circuit breaker to avoid retry storms
+# when Blender keeps crashing on the same input (e.g. a problematic asset).
+_MAX_CRASHES_PER_CONVERSATION = 2
+_crash_counts: dict[str, int] = {}
+
+
+def _is_blender_crash_error(err: Exception) -> bool:
+    """Heuristic: True if the error indicates Blender is dead/restarted, not an app-level error."""
+    msg = str(err).lower()
+    return any(
+        marker in msg
+        for marker in (
+            "connection lost",
+            "connection refused",
+            "not connected to blender",
+            "process is not running",
+            "connection closed before receiving any data",
+            "broken pipe",
+        )
+    )
+
+
+def _recover_blender_scene(label: str) -> tuple[bool, str | None]:
+    """Wait for Blender to come back and reload the active conversation's scene.
+
+    Returns (recovered, conversation_id_or_None). If recovered is False, the
+    caller should surface a friendly error to the LLM/user.
+    """
+    logger.error("BLENDER_CRASH_DETECTED in %s — attempting recovery", label)
+
+    if _scene_manager is None:
+        logger.error("%s: scene manager not initialized — cannot recover", label)
+        return (False, None)
+
+    conversation_id = _scene_manager._active_conversation_id
+    if conversation_id is None:
+        logger.warning("%s: no active conversation id — cannot reload scene", label)
+        # Still wait for Blender so subsequent calls don't pile up failures.
+        recovered = _wait_for_blender(timeout=60)
+        return (recovered, None)
+
+    # Circuit breaker
+    count = _crash_counts.get(conversation_id, 0) + 1
+    _crash_counts[conversation_id] = count
+    if count > _MAX_CRASHES_PER_CONVERSATION:
+        logger.error(
+            "%s: conversation %s exceeded %d crashes — circuit breaker tripped",
+            label, conversation_id, _MAX_CRASHES_PER_CONVERSATION,
+        )
+        return (False, conversation_id)
+
+    if not _wait_for_blender(timeout=60):
+        return (False, conversation_id)
+
+    try:
+        _scene_manager.reload_scene_from_blob(conversation_id)
+        logger.info("%s: scene reloaded for conversation %s after crash", label, conversation_id)
+        return (True, conversation_id)
+    except Exception:
+        logger.error("%s: failed to reload scene after crash", label, exc_info=True)
+        return (False, conversation_id)
+
+
+def _crash_user_message(label: str, conversation_id: str | None, original: Exception) -> str:
+    """Build an actionable error string for the LLM when Blender crashed."""
+    count = _crash_counts.get(conversation_id, 0) if conversation_id else 0
+    if count > _MAX_CRASHES_PER_CONVERSATION:
+        return (
+            f"Blender has crashed {count} times in this conversation and the safety "
+            f"circuit breaker has been tripped. Please ask the user to start a new "
+            f"conversation. Last error from {label}: {original}"
+        )
+    return (
+        f"Blender crashed during '{label}' (likely caused by the operation just "
+        f"attempted — large/complex assets and certain glTF imports are common "
+        f"triggers). The previous scene has been restored from the saved state. "
+        f"Please apologize briefly to the user and try a different approach: "
+        f"smaller resolution (e.g. '1k'), a simpler asset, or build the missing "
+        f"geometry with primitives. Original error: {original}"
+    )
+
 
 # ──────────────────────────────────────────────
 # Agent tools - Scene inspection
@@ -249,21 +355,27 @@ def get_scene_info() -> str:
     Always call this first to understand the current state of the scene.
     """
     logger.info("Tool called: get_scene_info")
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("get_scene_info")
-        # Return a concise summary instead of raw JSON to save LLM tokens
-        obj_count = result.get("object_count", 0)
-        mat_count = result.get("materials_count", 0)
-        lines = [f"Scene '{result.get('name', '?')}': {obj_count} objects, {mat_count} materials."]
-        for obj in result.get("objects", []):
-            loc = obj.get("location", [0, 0, 0])
-            lines.append(f"  - {obj.get('name', '?')} ({obj.get('type', '?')}) at ({loc[0]}, {loc[1]}, {loc[2]})")
-        logger.info("get_scene_info succeeded: %d objects, %d materials", obj_count, mat_count)
-        return "\n".join(lines)
-    except Exception as e:
-        logger.error("get_scene_info failed", exc_info=True)
-        return f"Error getting scene info: {str(e)}"
+    for attempt in (1, 2):
+        try:
+            blender = get_blender_connection()
+            result = blender.send_command("get_scene_info")
+            # Return a concise summary instead of raw JSON to save LLM tokens
+            obj_count = result.get("object_count", 0)
+            mat_count = result.get("materials_count", 0)
+            lines = [f"Scene '{result.get('name', '?')}': {obj_count} objects, {mat_count} materials."]
+            for obj in result.get("objects", []):
+                loc = obj.get("location", [0, 0, 0])
+                lines.append(f"  - {obj.get('name', '?')} ({obj.get('type', '?')}) at ({loc[0]}, {loc[1]}, {loc[2]})")
+            logger.info("get_scene_info succeeded: %d objects, %d materials", obj_count, mat_count)
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error("get_scene_info failed (attempt %d/2)", attempt, exc_info=True)
+            if attempt == 1 and _is_blender_crash_error(e):
+                recovered, _ = _recover_blender_scene("get_scene_info")
+                if recovered:
+                    continue  # retry once on the restored scene
+            return f"Error getting scene info: {str(e)}"
+    return "Error getting scene info: exhausted retries"
 
 
 def get_object_info(
@@ -672,6 +784,15 @@ def execute_blender_code(
         logger.info("execute_blender_code succeeded")
         return f"Code executed successfully. {raw}".strip()
     except Exception as e:
+        if _is_blender_crash_error(e):
+            logger.error("execute_blender_code: Blender crashed", exc_info=True)
+            recovered, conv_id = _recover_blender_scene("execute_blender_code")
+            if recovered:
+                return _crash_user_message("execute_blender_code", conv_id, e)
+            return (
+                f"Blender crashed while executing code and could not recover. "
+                f"Please ask the user to retry. Original error: {e}"
+            )
         logger.warning("execute_blender_code failed (will enrich error for LLM): %s", e)
         return _enrich_error_context(str(e), code)
 
@@ -848,6 +969,18 @@ def download_polyhaven_asset(
             return f"Failed to download asset: {result.get('message', 'Unknown error')}"
     except Exception as e:
         logger.error("download_polyhaven_asset failed for %r", asset_id, exc_info=True)
+        if _is_blender_crash_error(e):
+            recovered, conv_id = _recover_blender_scene("download_polyhaven_asset")
+            if recovered:
+                return _crash_user_message(
+                    f"download_polyhaven_asset(id={asset_id!r}, res={resolution!r})",
+                    conv_id, e,
+                )
+            return (
+                f"Blender crashed while importing '{asset_id}' and could not recover. "
+                f"Please ask the user to retry; the saved scene was preserved. "
+                f"Original error: {e}"
+            )
         return f"Error downloading asset: {str(e)}"
 
 
@@ -1255,65 +1388,173 @@ class ToolStatusMiddleware(AgentMiddleware):
             # Track call_ids for link-producing tools → tool name
             link_call_ids: dict[str, str] = {}
 
-            async for update in original_stream:
-                for content in (update.contents or []):
-                    # ── Status messages before each tool call ──
-                    if content.type == "function_call":
-                        call_id = content.call_id or content.name
-                        if content.name in self._IMAGE_TOOLS and call_id:
-                            image_call_ids[call_id] = content.name
-                        if content.name in self._LINK_TOOLS and call_id:
-                            link_call_ids[call_id] = content.name
-                        if content.name and content.name not in announced_names:
-                            announced_names.add(content.name)
-                            status = _TOOL_STATUS_MESSAGES.get(
-                                content.name, "Working on it…"
-                            )
-                            yield AgentResponseUpdate(
-                                contents=[Content.from_text(f"\n\n*{status}*\n\n")],
-                                role="assistant",
-                                message_id=f"status-{content.name}",
-                            )
+            # Resilience state for this turn
+            turn_started = asyncio.get_running_loop().time()
+            chunks_seen = 0
+            heartbeat_idx = 0
+            session_id = (
+                getattr(context.session, "session_id", None)
+                if context.session is not None
+                else None
+            )
 
-                    # ── Stream images from tool results immediately ──
-                    if content.type == "function_result":
-                        cid = content.call_id or ""
-                        if cid in image_call_ids:
-                            match = self._IMAGE_RE.search(
-                                content.result or ""
-                            )
-                            if match:
-                                tool_name = image_call_ids[cid]
-                                label = self._IMAGE_LABELS.get(tool_name, "")
+            # Pump upstream chunks into a queue from a background task so we can
+            # interleave heartbeat messages without cancelling an in-flight HTTP
+            # read (which would leave the underlying stream in a broken state).
+            _SENTINEL_DONE = object()
+            queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+
+            async def _pump():
+                try:
+                    async for upd in original_stream:
+                        await queue.put(("update", upd))
+                except BaseException as ex:  # noqa: BLE001 — propagate to consumer
+                    await queue.put(("error", ex))
+                else:
+                    await queue.put(("done", _SENTINEL_DONE))
+
+            pump_task = asyncio.create_task(_pump())
+
+            async def _drain_pump():
+                if not pump_task.done():
+                    pump_task.cancel()
+                try:
+                    await pump_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            try:
+                while True:
+                    elapsed = asyncio.get_running_loop().time() - turn_started
+                    remaining = TURN_TIMEOUT_SECONDS - elapsed
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError("turn wall-clock cap exceeded")
+                    wait_for = min(HEARTBEAT_INTERVAL_SECONDS, remaining)
+                    try:
+                        kind, payload = await asyncio.wait_for(
+                            queue.get(), timeout=wait_for
+                        )
+                    except asyncio.TimeoutError:
+                        if (asyncio.get_running_loop().time() - turn_started) >= TURN_TIMEOUT_SECONDS:
+                            raise asyncio.TimeoutError("turn wall-clock cap exceeded")
+                        heartbeat_idx += 1
+                        yield AgentResponseUpdate(
+                            contents=[Content.from_text("\n\n*Still working…*\n\n")],
+                            role="assistant",
+                            message_id=f"heartbeat-{heartbeat_idx}",
+                        )
+                        continue
+
+                    if kind == "done":
+                        break
+                    if kind == "error":
+                        raise payload
+                    # kind == "update"
+                    update = payload
+                    chunks_seen += 1
+                    for content in (update.contents or []):
+                        # ── Status messages before each tool call ──
+                        if content.type == "function_call":
+                            call_id = content.call_id or content.name
+                            if content.name in self._IMAGE_TOOLS and call_id:
+                                image_call_ids[call_id] = content.name
+                            if content.name in self._LINK_TOOLS and call_id:
+                                link_call_ids[call_id] = content.name
+                            if content.name and content.name not in announced_names:
+                                announced_names.add(content.name)
+                                status = _TOOL_STATUS_MESSAGES.get(
+                                    content.name, "Working on it…"
+                                )
                                 yield AgentResponseUpdate(
-                                    contents=[
-                                        Content.from_text(
-                                            f"\n\n{label}\n\n{match.group(0)}\n\n"
-                                        )
-                                    ],
+                                    contents=[Content.from_text(f"\n\n*{status}*\n\n")],
                                     role="assistant",
-                                    message_id=f"tool-img-{cid}",
+                                    message_id=f"status-{content.name}",
                                 )
 
-                        # ── Stream download links from tool results immediately ──
-                        if cid in link_call_ids:
-                            match = self._LINK_RE.search(
-                                content.result or ""
-                            )
-                            if match:
-                                yield AgentResponseUpdate(
-                                    contents=[
-                                        Content.from_text(
-                                            f"\n\n{match.group(0)}\n\n"
-                                        )
-                                    ],
-                                    role="assistant",
-                                    message_id=f"tool-link-{cid}",
+                        # ── Stream images from tool results immediately ──
+                        if content.type == "function_result":
+                            cid = content.call_id or ""
+                            if cid in image_call_ids:
+                                match = self._IMAGE_RE.search(
+                                    content.result or ""
                                 )
+                                if match:
+                                    tool_name = image_call_ids[cid]
+                                    label = self._IMAGE_LABELS.get(tool_name, "")
+                                    yield AgentResponseUpdate(
+                                        contents=[
+                                            Content.from_text(
+                                                f"\n\n{label}\n\n{match.group(0)}\n\n"
+                                            )
+                                        ],
+                                        role="assistant",
+                                        message_id=f"tool-img-{cid}",
+                                    )
 
-                yield update
+                            # ── Stream download links from tool results immediately ──
+                            if cid in link_call_ids:
+                                match = self._LINK_RE.search(
+                                    content.result or ""
+                                )
+                                if match:
+                                    yield AgentResponseUpdate(
+                                        contents=[
+                                            Content.from_text(
+                                                f"\n\n{match.group(0)}\n\n"
+                                            )
+                                        ],
+                                        role="assistant",
+                                        message_id=f"tool-link-{cid}",
+                                    )
 
-        context.result = ResponseStream(_wrapped())
+                    yield update
+            except asyncio.TimeoutError:
+                elapsed_ms = int(
+                    (asyncio.get_running_loop().time() - turn_started) * 1000
+                )
+                logger.error(
+                    "Agent turn timed out: session_id=%s elapsed_ms=%d "
+                    "chunks_seen=%d cap_seconds=%.0f",
+                    session_id, elapsed_ms, chunks_seen, TURN_TIMEOUT_SECONDS,
+                )
+                yield AgentResponseUpdate(
+                    contents=[Content.from_text(_FRIENDLY_TIMEOUT_TEXT)],
+                    role="assistant",
+                    message_id="agent-turn-timeout",
+                )
+                # Re-raise so server-side telemetry records the failure.
+                raise
+            except Exception as exc:
+                elapsed_ms = int(
+                    (asyncio.get_running_loop().time() - turn_started) * 1000
+                )
+                # Try to extract an upstream request id / status code for
+                # actionable diagnostics.
+                request_id = getattr(exc, "request_id", None) or getattr(
+                    getattr(exc, "response", None), "headers", {}
+                ).get("x-request-id") if hasattr(exc, "response") else None
+                status_code = getattr(exc, "status_code", None) or getattr(
+                    getattr(exc, "response", None), "status_code", None
+                )
+                logger.error(
+                    "Agent stream failed: session_id=%s elapsed_ms=%d "
+                    "chunks_seen=%d status=%s request_id=%s exc_type=%s",
+                    session_id, elapsed_ms, chunks_seen,
+                    status_code, request_id, type(exc).__name__,
+                    exc_info=True,
+                )
+                yield AgentResponseUpdate(
+                    contents=[Content.from_text(_FRIENDLY_MODEL_ERROR_TEXT)],
+                    role="assistant",
+                    message_id="agent-stream-error",
+                )
+                # Re-raise so server-side telemetry records the failure and
+                # the framework's normal error path runs.
+                raise
+            finally:
+                await _drain_pump()
+
+        context.result = ResponseStream(_wrapped(), finalizer=AgentResponse.from_updates)
 
 
 class SceneIsolationMiddleware(AgentMiddleware):
@@ -1424,7 +1665,7 @@ class SceneIsolationMiddleware(AgentMiddleware):
                             "(first request for new conversation — scene stays in memory)."
                         )
 
-            context.result = ResponseStream(_save_after_stream())
+            context.result = ResponseStream(_save_after_stream(), finalizer=AgentResponse.from_updates)
         else:
             # Non-streaming: tools already ran, thread is updated.
             save_id = self._get_conversation_id(context)
@@ -1482,6 +1723,13 @@ async def main():
 - NEVER set `collection.name` — it is read-only in this Blender environment. To organize objects, create new collections with `bpy.data.collections.new("Name")` and link them to the scene with `bpy.context.scene.collection.children.link(new_collection)` instead of renaming existing ones.
 - The render engine enum for Eevee in Blender 4.x is `'BLENDER_EEVEE_NEXT'`, NOT `'BLENDER_EEVEE'`. Valid engines are: `'BLENDER_EEVEE_NEXT'`, `'BLENDER_WORKBENCH'`, `'CYCLES'`.
 - When a tool returns an image in markdown format (e.g. `![screenshot](url)` or `![render](url)`), you MUST include that exact markdown image link in your response so the chat client can display the image. Never omit, summarize, or rewrite the image URL.
+
+## Recovering from Blender crashes
+Some operations (especially importing large or complex Poly Haven models, or running heavy `execute_blender_code` scripts) can occasionally crash the Blender process. When this happens, a tool will return a message that begins with **"Blender crashed"**. The previous scene has already been automatically restored from the saved state — you do NOT need to rebuild it. When you see such a message:
+1. Acknowledge the crash to the user briefly (one short sentence).
+2. Try a different approach for that step: a smaller resolution (e.g. `'1k'` instead of `'2k'`), a simpler asset, or build the missing geometry with `create_object` primitives.
+3. Do NOT immediately retry the EXACT same operation — it is likely to crash again.
+4. If the message says the circuit breaker has tripped, stop attempting Blender operations and ask the user to start a new conversation.
 
 ## Collection Management Best Practices (IMPORTANT)
 `bpy.ops.mesh.primitive_*_add()` and similar operators add new objects to the **active collection**, which is NOT always `scene.collection` (the root "Scene Collection"). If you create a custom collection and link objects to it, the active collection may change — and calling `scene.collection.objects.unlink(obj)` will fail with `RuntimeError: Object 'X' not in collection 'Scene Collection'`.

@@ -264,6 +264,24 @@ def _is_socket_healthy(sock: socket.socket) -> bool:
 _blender_connection: Optional[BlenderConnection] = None
 _connection_lock = threading.Lock()
 
+# Monotonically-increasing counter incremented EVERY TIME a brand-new socket
+# is created (i.e. after Blender has restarted, or on first connect).
+# Reusing an existing healthy socket does NOT bump this. Used by SceneManager
+# to detect mid-conversation Blender crashes and refuse to overwrite a saved
+# blob with a post-crash empty scene.
+_connection_epoch: int = 0
+
+
+def current_epoch() -> int:
+    """Return the current connection epoch.
+
+    Bumped only when get_blender_connection() establishes a brand-new socket
+    (typically after a Blender process restart). Callers can capture the
+    epoch at one point and compare later to detect that Blender has been
+    restarted in between.
+    """
+    return _connection_epoch
+
 
 def get_blender_connection() -> BlenderConnection:
     """Get or create a persistent Blender connection (singleton).
@@ -271,7 +289,7 @@ def get_blender_connection() -> BlenderConnection:
     Thread-safe. Retries with exponential backoff up to CONNECT_MAX_RETRIES
     times if the initial connection attempt fails.
     """
-    global _blender_connection
+    global _blender_connection, _connection_epoch
 
     with _connection_lock:
         # Validate existing connection
@@ -295,9 +313,10 @@ def get_blender_connection() -> BlenderConnection:
             conn = BlenderConnection(host=host, port=port)
             if conn.connect():
                 _blender_connection = conn
+                _connection_epoch += 1
                 logger.info(
-                    "Connected to Blender at %s:%s (attempt %d/%d)",
-                    host, port, attempt, CONNECT_MAX_RETRIES,
+                    "Connected to Blender at %s:%s (attempt %d/%d) epoch=%d",
+                    host, port, attempt, CONNECT_MAX_RETRIES, _connection_epoch,
                 )
                 return _blender_connection
 
