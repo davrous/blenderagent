@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/api/stream.ts","./src/components/chatview.tsx","./src/components/composer.tsx","./src/components/downloadbutton.tsx","./src/components/imagelightbox.tsx","./src/components/messagebubble.tsx","./src/components/statuspill.tsx","./src/lib/parsemarkdown.ts","./src/state/chatstore.ts"],"version":"5.9.3"}
