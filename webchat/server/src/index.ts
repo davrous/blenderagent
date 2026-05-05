@@ -19,6 +19,104 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
+/**
+ * Streaming proxy for blob URLs that don't expose CORS headers (e.g. Azure
+ * Blob Storage SAS URLs). Used by the Babylon.js 3D viewer which loads GLBs
+ * via XHR and therefore needs same-origin / CORS-compliant responses.
+ *
+ * Hosts are validated against `config.blobProxyAllowedHostSuffixes` to avoid
+ * turning the server into an open proxy / SSRF vector.
+ */
+app.get("/api/blob", async (req, res) => {
+  const rawUrl = typeof req.query.url === "string" ? req.query.url : "";
+  if (!rawUrl) {
+    res.status(400).json({ error: "url query param is required" });
+    return;
+  }
+
+  let target: URL;
+  try {
+    target = new URL(rawUrl);
+  } catch {
+    res.status(400).json({ error: "invalid url" });
+    return;
+  }
+
+  if (target.protocol !== "https:" && target.protocol !== "http:") {
+    res.status(400).json({ error: "only http(s) urls allowed" });
+    return;
+  }
+
+  const host = target.hostname.toLowerCase();
+  const allowed = config.blobProxyAllowedHostSuffixes.some(
+    (suffix) => host === suffix || host.endsWith(suffix),
+  );
+  if (!allowed) {
+    res.status(403).json({ error: `host not allowed: ${host}` });
+    return;
+  }
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(target, {
+      method: "GET",
+      headers: {
+        // Forward Range for partial requests if the client uses them.
+        ...(req.headers.range ? { Range: String(req.headers.range) } : {}),
+      },
+    });
+  } catch (err) {
+    console.error("Blob proxy fetch failed:", err);
+    res.status(502).json({
+      error: "Failed to fetch blob",
+      detail: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+
+  if (!upstream.ok || !upstream.body) {
+    const text = await upstream.text().catch(() => "");
+    res.status(upstream.status || 502).json({
+      error: `Upstream returned ${upstream.status}`,
+      detail: text.slice(0, 500),
+    });
+    return;
+  }
+
+  res.status(upstream.status);
+  const passthroughHeaders = [
+    "content-type",
+    "content-length",
+    "content-range",
+    "accept-ranges",
+    "etag",
+    "last-modified",
+  ];
+  for (const name of passthroughHeaders) {
+    const v = upstream.headers.get(name);
+    if (v) res.setHeader(name, v);
+  }
+  // Allow long-term caching on the client.
+  res.setHeader("Cache-Control", "private, max-age=300");
+
+  const reader = upstream.body.getReader();
+  req.on("close", () => {
+    reader.cancel().catch(() => {});
+  });
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) res.write(Buffer.from(value));
+    }
+  } catch (err) {
+    console.error("Blob proxy stream error:", err);
+  } finally {
+    if (!res.writableEnded) res.end();
+  }
+});
+
 interface ChatRequestBody {
   input?: string;
   previous_response_id?: string | null;

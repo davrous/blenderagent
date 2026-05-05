@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import clsx from "clsx";
@@ -12,7 +12,7 @@ interface Props {
   message: Message;
 }
 
-export function MessageBubble({ message }: Props) {
+function MessageBubbleImpl({ message }: Props) {
   const [lightbox, setLightbox] = useState<{ src: string; alt?: string } | null>(null);
 
   if (message.role === "user") {
@@ -46,7 +46,7 @@ export function MessageBubble({ message }: Props) {
                     className="msg-image-btn"
                     onClick={() => setLightbox({ src, alt })}
                   >
-                    <img src={src} alt={alt ?? ""} className="msg-image" loading="lazy" />
+                    <img src={src} alt={alt ?? ""} className="msg-image" />
                   </button>
                 );
               },
@@ -91,3 +91,5 @@ export function MessageBubble({ message }: Props) {
     </div>
   );
 }
+
+export const MessageBubble = memo(MessageBubbleImpl);

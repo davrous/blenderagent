@@ -33,4 +33,11 @@ export const config = {
   port: Number(process.env.PORT ?? 5174),
   // Vite dev server origin allowed for CORS
   clientOrigin: process.env.CLIENT_ORIGIN ?? "http://localhost:5173",
+  // Hostname suffixes allowed for /api/blob proxy. Comma-separated.
+  blobProxyAllowedHostSuffixes: (
+    process.env.BLOB_PROXY_ALLOWED_HOSTS ?? ".blob.core.windows.net"
+  )
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean),
 };
