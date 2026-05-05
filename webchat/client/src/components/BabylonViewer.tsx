@@ -45,7 +45,15 @@ export function BabylonViewer({ src, filename, onClose }: Props) {
           SceneLoader,
         } = BABYLON;
 
+        // We render our own loading overlay; suppress Babylon's full-screen
+        // default loading screen which otherwise flashes briefly under React
+        // 18 StrictMode (effects run mount → cleanup → mount in dev, so the
+        // first engine is created then immediately disposed, adding and then
+        // removing the global loading overlay).
+        SceneLoader.ShowLoadingScreen = false;
+
         engine = new Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+        engine.hideLoadingUI();
         scene = new Scene(engine);
         scene.clearColor = new Color4(0.055, 0.063, 0.078, 1);
 
