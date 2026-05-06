@@ -94,6 +94,9 @@ export async function getOrCreateSession(
 ): Promise<{ agentSessionId: string; agentVersion: string }> {
   const cached = sessionCache.get(conversationId);
   if (cached) {
+    console.log(
+      `[sessions] cache hit: conversation=${conversationId} agent_session_id=${cached.agentSessionId}`,
+    );
     return {
       agentSessionId: cached.agentSessionId,
       agentVersion: cached.agentVersion,
@@ -139,6 +142,10 @@ export async function getOrCreateSession(
     agentVersion,
     createdAt: Date.now(),
   });
+
+  console.log(
+    `[sessions] created agent_session_id=${agentSessionId} for conversation=${conversationId} (agentVersion=${agentVersion})`,
+  );
 
   return { agentSessionId, agentVersion };
 }

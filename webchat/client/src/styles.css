@@ -280,6 +280,11 @@ html, body, #root {
   40% { opacity: 1; }
 }
 
+.msg-empty {
+  color: var(--text-dim);
+  font-size: 0.9em;
+}
+
 /* ── Download button ──────────────────────── */
 
 .download-btn-row {

@@ -24,7 +24,12 @@ interface ChatState {
   reset: () => void;
 }
 
-function newConversationId(): string {
+const CONVERSATION_ID_STORAGE_KEY = "webchat.conversationId";
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function generateConversationId(): string {
   const c = (globalThis as any).crypto as Crypto | undefined;
   if (c && typeof c.randomUUID === "function") {
     return c.randomUUID();
@@ -38,6 +43,37 @@ function newConversationId(): string {
   return `${h.slice(0, 4).join("")}-${h.slice(4, 6).join("")}-${h.slice(6, 8).join("")}-${h.slice(8, 10).join("")}-${h.slice(10, 16).join("")}`;
 }
 
+/**
+ * Read the conversation id from localStorage, or generate+persist a new one.
+ * Persisting across reloads is required so the saved Blender scene blob
+ * (keyed on this UUID) can be reloaded after a tab refresh.
+ */
+function loadOrCreateConversationId(): string {
+  try {
+    const stored = globalThis.localStorage?.getItem(CONVERSATION_ID_STORAGE_KEY);
+    if (stored && UUID_RE.test(stored)) return stored;
+  } catch {
+    // localStorage may be unavailable (private mode, SSR) — fall through.
+  }
+  const fresh = generateConversationId();
+  try {
+    globalThis.localStorage?.setItem(CONVERSATION_ID_STORAGE_KEY, fresh);
+  } catch {
+    // ignore — conversation will not survive reload, but turn-to-turn still works.
+  }
+  return fresh;
+}
+
+function rotateConversationId(): string {
+  const fresh = generateConversationId();
+  try {
+    globalThis.localStorage?.setItem(CONVERSATION_ID_STORAGE_KEY, fresh);
+  } catch {
+    // ignore
+  }
+  return fresh;
+}
+
 // Matches a complete italic status block surrounded by blank lines:
 // "\n\n*…some text…*\n\n" — used by ToolStatusMiddleware.
 // We require both delimiters so we never extract partial deltas.
@@ -49,7 +85,7 @@ const newId = () => `m${Date.now()}-${++idCounter}`;
 export const useChatStore = create<ChatState>((set, get) => ({
   messages: [],
   previousResponseId: null,
-  conversationId: newConversationId(),
+  conversationId: loadOrCreateConversationId(),
   isStreaming: false,
   abortController: null,
 
@@ -67,7 +103,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({
       messages: [],
       previousResponseId: null,
-      conversationId: newConversationId(),
+      conversationId: rotateConversationId(),
       isStreaming: false,
       abortController: null,
     });

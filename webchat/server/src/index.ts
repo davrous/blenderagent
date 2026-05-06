@@ -150,24 +150,36 @@ async function buildUpstreamRequest(
   const token = await getBearerToken();
   if (token) headers.Authorization = `Bearer ${token}`;
 
+  // The conversation id is the stable scene key on the agent side.
+  // It is REQUIRED in both modes so the agent can save/reload the per-
+  // conversation Blender scene blob across container recycling and tab
+  // refreshes.
+  const conversationId = body.conversation_id;
+  if (!isUuid(conversationId)) {
+    throw new Error("conversation_id (UUID) is required");
+  }
+
   if (config.mode === "local") {
     const payload: Record<string, unknown> = {
       model: config.modelName,
       input,
       stream: true,
+      // Bind every turn to the same agentdev session so
+      // `context.session.session_id` is populated for SceneIsolationMiddleware.
+      // Without this, the middleware logs `session=None` and the scene is
+      // never saved to blob storage, so it cannot survive container recycle.
+      agent_session_id: conversationId,
     };
     if (body.previous_response_id) {
       payload.previous_response_id = body.previous_response_id;
     }
-    return { url: `${config.agentUrl}/responses`, headers, payload };
+    console.log(
+      `[chat] local mode: conversation=${conversationId} previous_response_id=${body.previous_response_id ?? "none"}`,
+    );
+    return { url: `${config.agentUrl}/responses`, headers, payload, conversationId };
   }
 
   // Foundry mode
-  const conversationId = body.conversation_id;
-  if (!isUuid(conversationId)) {
-    throw new Error("conversation_id (UUID) is required in foundry mode");
-  }
-
   const { agentSessionId } = await getOrCreateSession(conversationId);
 
   headers["Foundry-Features"] = config.foundryFeaturesHeader;
@@ -181,7 +193,18 @@ async function buildUpstreamRequest(
     input,
     stream: true,
     agent_session_id: agentSessionId,
+    // The Foundry `agent_session_id` is a Foundry-internal session id that
+    // does NOT propagate to `context.session.session_id` in the agent_framework
+    // middleware. We therefore also pass the WebChat conversation UUID through
+    // the standard OpenAI `user` and `metadata` fields so SceneIsolationMiddleware
+    // can recover a stable scene key.
+    user: conversationId,
+    metadata: { conversation_id: conversationId },
   };
+
+  console.log(
+    `[chat] foundry mode: conversation=${conversationId} agent_session_id=${agentSessionId}`,
+  );
 
   return { url, headers, payload, conversationId };
 }

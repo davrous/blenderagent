@@ -79,6 +79,12 @@ function MessageBubbleImpl({ message }: Props) {
             <span className="dot" />
           </div>
         )}
+
+        {message.status === "done" && !message.text && !message.errorText && (
+          <div className="msg-empty">
+            <em>(no response)</em>
+          </div>
+        )}
       </div>
 
       {lightbox && (

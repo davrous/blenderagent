@@ -489,6 +489,29 @@ def modify_object(
     Rotation values are in degrees.
     """
     logger.info("Tool called: modify_object(object_name=%r)", object_name)
+
+    # Guardrail: refuse no-op calls. If the model passes only object_name with no
+    # transform parameters, the previous behaviour was to silently return success
+    # without changing anything — confusing to users (e.g. "reduce size by 5x"
+    # without the model first reading current scale via get_object_info).
+    if all(
+        v is None
+        for v in (
+            location_x, location_y, location_z,
+            rotation_x, rotation_y, rotation_z,
+            scale_x, scale_y, scale_z,
+        )
+    ):
+        logger.warning("modify_object called with no transform parameters for %r", object_name)
+        return (
+            f"Error: modify_object('{object_name}') was called without any transform "
+            "parameters — nothing was changed. modify_object takes ABSOLUTE values, "
+            "not relative ones. For a relative change (e.g. 'reduce size by 5x'), "
+            "first call get_object_info() to read the current scale/location/rotation, "
+            "compute the new absolute value, and pass it as scale_x/scale_y/scale_z "
+            "(or location_*/rotation_*) on the next call."
+        )
+
     lines = ["import bpy", "import math"]
     lines.append(f'obj = bpy.data.objects.get("{object_name}")')
     lines.append("if not obj:")
@@ -1041,6 +1064,50 @@ def setup_scene(
     """
     logger.info("Tool called: setup_scene(clear=%s, camera=%s, light=%s, ground=%s)",
                 clear_default, add_camera, add_light, add_ground_plane)
+
+    # Guardrail: refuse to wipe a populated scene on a continuation turn.
+    # The system prompt tells the model to call setup_scene as the first action
+    # on a new scene, but on follow-up turns the model sometimes re-issues
+    # setup_scene(clear_default=True) which previously deleted the user's work.
+    # If clear_default=True and there are user objects (anything that isn't a
+    # camera or light), refuse and ask the LLM to skip clearing.
+    if clear_default:
+        try:
+            blender = get_blender_connection()
+            probe = blender.send_command("execute_code", {
+                "code": (
+                    "import bpy\n"
+                    "user_objs = [o.name for o in bpy.data.objects "
+                    "if o.type not in {'CAMERA', 'LIGHT'}]\n"
+                    "print('USER_OBJECTS=' + ','.join(user_objs))\n"
+                ),
+            })
+            probe_out = (probe or {}).get("result", "") if isinstance(probe, dict) else str(probe)
+            marker = "USER_OBJECTS="
+            existing: list[str] = []
+            if marker in probe_out:
+                line = probe_out.split(marker, 1)[1].splitlines()[0].strip()
+                existing = [n for n in line.split(",") if n]
+            if existing:
+                logger.warning(
+                    "setup_scene(clear=True) blocked: scene has %d user object(s): %s",
+                    len(existing), existing,
+                )
+                preview = ", ".join(existing[:8]) + ("…" if len(existing) > 8 else "")
+                return (
+                    f"Refused: setup_scene(clear_default=True) would delete {len(existing)} "
+                    f"existing object(s) ({preview}) from this conversation's scene. "
+                    "Only call setup_scene at the START of a brand-new scene. On a "
+                    "continuation turn, call get_scene_info() to inspect what already "
+                    "exists, then add/modify objects directly without clearing. If you "
+                    "truly want to start over, call delete_object on each object first "
+                    "or call setup_scene(clear_default=False)."
+                )
+        except Exception:
+            # Probe failures shouldn't block the operation — fall through and let
+            # the actual setup_scene code path surface a clearer error.
+            logger.debug("setup_scene clear-guard probe failed; continuing", exc_info=True)
+
     cam_parts = [float(x.strip()) for x in camera_location.split(",")]
     cam_x, cam_y, cam_z = cam_parts[0], cam_parts[1], cam_parts[2]
 
@@ -1588,13 +1655,101 @@ class SceneIsolationMiddleware(AgentMiddleware):
 
     @staticmethod
     def _get_conversation_id(context: AgentContext) -> str | None:
-        """Read session_id from the context's session, if available."""
+        """Resolve a stable conversation/scene id for this turn.
+
+        Lookup order:
+          1. `context.session.session_id` — set when the agent runtime created
+             an AgentSession (e.g. local agentdev with `agent_session_id` in
+             the request body, or Agent Inspector mode).
+          2. `context.options["user"]` / `context.options["metadata"]` —
+             populated by the WebChat proxy in Foundry mode, where the
+             Foundry-internal `agent_session_id` does NOT propagate to
+             AgentSession.
+          3. `context.kwargs["user"]` / `context.kwargs["metadata"]` —
+             same fields if the runtime routed them differently.
+          4. None — caller will skip activation/save and emit a warning.
+        """
         session = context.session
         if session is not None:
             sid = getattr(session, "session_id", None)
             if sid:
                 return sid
+
+        # Fallback 1: WebChat proxy sends `user: <conversationId>` and
+        # `metadata: { conversation_id }`. These typically arrive on
+        # `context.options` (request body kwargs) but the Azure runtime has
+        # been observed to route them via `context.kwargs` as well, so check
+        # both. Use the first non-empty hit.
+        for source_name, source in (("options", context.options),
+                                    ("kwargs", context.kwargs),
+                                    ("metadata", context.metadata)):
+            if not source:
+                continue
+            try:
+                user_val = source.get("user")  # type: ignore[union-attr]
+                if isinstance(user_val, str) and user_val:
+                    logger.info(
+                        "Scene isolation: resolved conversation id from %s.user",
+                        source_name,
+                    )
+                    return user_val
+                meta = source.get("metadata")  # type: ignore[union-attr]
+                if isinstance(meta, dict):
+                    cid = meta.get("conversation_id")
+                    if isinstance(cid, str) and cid:
+                        logger.info(
+                            "Scene isolation: resolved conversation id from %s.metadata.conversation_id",
+                            source_name,
+                        )
+                        return cid
+            except AttributeError:
+                continue
+
+        # Fallback 2: Azure AI agentserver Foundry adapter copies the request
+        # body `metadata` dict onto `agent._request_headers` (see
+        # azure.ai.agentserver.agentframework._ai_agent_adapter.AgentFrameworkAIAgentAdapter.agent_run).
+        # The OpenAI Responses path does NOT propagate `user`/`metadata` to
+        # AgentContext.options or AgentContext.metadata, so this is the
+        # primary channel in Foundry mode.
+        agent = getattr(context, "agent", None)
+        request_headers = getattr(agent, "_request_headers", None)
+        if isinstance(request_headers, dict):
+            cid = request_headers.get("conversation_id")
+            if isinstance(cid, str) and cid:
+                logger.info(
+                    "Scene isolation: resolved conversation id from agent._request_headers.conversation_id"
+                )
+                return cid
+
         return None
+
+    @staticmethod
+    def _dump_context_keys_once(context: AgentContext) -> None:
+        """One-shot diagnostic: log available keys on options/kwargs/metadata.
+
+        Helps debug Foundry vs. local routing of `user`/`metadata`/etc. when
+        no session id is found. Only fires the first time it is called per
+        process.
+        """
+        if getattr(SceneIsolationMiddleware._dump_context_keys_once, "_done", False):
+            return
+        SceneIsolationMiddleware._dump_context_keys_once._done = True  # type: ignore[attr-defined]
+        try:
+            opts_keys = list(context.options.keys()) if context.options else []
+            kw_keys = list(context.kwargs.keys()) if context.kwargs else []
+            meta_keys = list(context.metadata.keys()) if context.metadata else []
+            agent = getattr(context, "agent", None)
+            req_headers = getattr(agent, "_request_headers", None)
+            req_headers_keys = (
+                list(req_headers.keys()) if isinstance(req_headers, dict) else f"<{type(req_headers).__name__}>"
+            )
+            logger.info(
+                "Scene isolation diagnostic (one-shot): options keys=%s, kwargs keys=%s, "
+                "metadata keys=%s, agent._request_headers=%s",
+                opts_keys, kw_keys, meta_keys, req_headers_keys,
+            )
+        except Exception as e:  # pragma: no cover - diagnostic best-effort
+            logger.warning("Scene isolation diagnostic failed: %s", e)
 
     async def process(self, context: AgentContext, call_next) -> None:
         session = context.session
@@ -1607,6 +1762,10 @@ class SceneIsolationMiddleware(AgentMiddleware):
 
         # ── ACTIVATE (before the agent runs) ──
         conversation_id = self._get_conversation_id(context)
+        if conversation_id is None:
+            # First time we fail to resolve a session id, dump what's available
+            # so we can diagnose how the Foundry runtime routes `user`/`metadata`.
+            self._dump_context_keys_once(context)
         if conversation_id:
             logger.info("Scene isolation: activating scene for conversation %s", conversation_id)
             await asyncio.to_thread(self._scene_manager.activate_scene, conversation_id)
@@ -1704,11 +1863,13 @@ async def main():
 
 ## Scene state
 - The Blender scene starts **empty** (no objects at all — no default cube, no camera, no light) but already has a **neutral studio HDRI environment** (studio_small_09) providing realistic hemisphere lighting.
-- Always call setup_scene() as your **first action** when creating a new scene to add a camera and optional sun light. Do NOT assume a default cube exists — there is none.
+- On the **very first turn of a brand-new conversation**, call setup_scene() as your first action to add a camera and optional sun light. Do NOT assume a default cube exists — there is none.
 - Do NOT add a cube unless the user explicitly asks for one.
+- **Continuation turns (CRITICAL):** Scenes are persisted per-conversation — when the user asks you to ADD to or MODIFY an existing scene ("add a sphere", "change the color", "resize…"), the previous objects are ALREADY loaded. **NEVER call setup_scene() on a continuation turn**, and NEVER call setup_scene(clear_default=True) when objects already exist — it will delete the user's work. If you are unsure whether the scene is empty, call get_scene_info() first; if it returns any non-camera/light objects, skip setup_scene entirely and just add or modify what the user asked for.
 
 ## Guidelines
-- Call get_scene_info() ONLY when you need to know what objects already exist (e.g. before modifying or deleting). Skip it for fresh scene creation.
+- Call get_scene_info() at the start of every continuation turn (any user message after the first one in a conversation) to see what objects already exist before adding or modifying. Skip it only on the very first turn of a fresh scene.
+- **Relative transforms (resize / move / rotate by a factor or offset):** `modify_object` takes ABSOLUTE values, not relative ones. When the user asks for a relative change (e.g. "reduce the size by 5x", "move it 2m to the right", "rotate 90° more"), you MUST first call `get_object_info(object_name=…)` to read the current scale/location/rotation, compute the new absolute value yourself, then pass that to `modify_object`. Calling `modify_object` with only `object_name` and no transform parameters will fail.
 - Take ONE viewport screenshot at the very end after ALL changes are complete, or when the user explicitly asks. NEVER take intermediate screenshots between steps.
 - For batch operations (multiple objects, materials, transforms), prefer a single execute_blender_code() call with one combined Python script instead of many sequential tool calls.
 - When creating an object that needs a color, call create_object() then apply_material() — but batch multiple such pairs into one execute_blender_code() call when possible.
