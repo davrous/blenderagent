@@ -7,6 +7,7 @@ export type SseEvent = { event: string; data: string };
 export async function streamChat(
   input: string,
   previousResponseId: string | null,
+  conversationId: string,
   onEvent: (e: SseEvent) => void,
   signal: AbortSignal,
 ): Promise<void> {
@@ -16,6 +17,7 @@ export async function streamChat(
     body: JSON.stringify({
       input,
       previous_response_id: previousResponseId ?? undefined,
+      conversation_id: conversationId,
     }),
     signal,
   });

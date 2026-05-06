@@ -25,9 +25,22 @@ const agentUrl =
     ? (process.env.AGENT_LOCAL_URL ?? "http://localhost:8088")
     : required("AGENT_FOUNDRY_URL", process.env.AGENT_FOUNDRY_URL);
 
+const agentName =
+  mode === "foundry"
+    ? required("AGENT_NAME", process.env.AGENT_NAME)
+    : (process.env.AGENT_NAME ?? "");
+
+const projectEndpoint = agentUrl.replace(/\/+$/, "");
+const apiVersion = process.env.AGENT_API_VERSION ?? "v1";
+
 export const config = {
   mode,
-  agentUrl: agentUrl.replace(/\/+$/, ""),
+  agentUrl: projectEndpoint,
+  // Hosted agent base path (foundry mode only).
+  foundryAgentBase:
+    mode === "foundry" ? `${projectEndpoint}/agents/${agentName}` : "",
+  agentName,
+  apiVersion,
   tokenScope: process.env.AGENT_TOKEN_SCOPE ?? "https://ai.azure.com/.default",
   modelName: process.env.MODEL_NAME ?? "BlenderSceneAgent",
   port: Number(process.env.PORT ?? 5174),
@@ -40,4 +53,6 @@ export const config = {
     .split(",")
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean),
+  // Foundry-Features header required by the hosted agent endpoint preview.
+  foundryFeaturesHeader: "HostedAgents=V1Preview,AgentEndpoints=V1Preview",
 };
