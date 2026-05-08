@@ -66,6 +66,49 @@ The conversation identifier comes from `context.thread.service_thread_id` in the
 - Reading the thread ID **after streaming completes** (by which point the framework has set it) for the save operation
 - On subsequent requests, the thread is loaded from the `InMemoryAgentThreadRepository` with the ID already set
 
+## Middleware
+
+The agent is wired with two custom middlewares that sit on top of the Microsoft Agent Framework:
+
+```python
+middleware=[SceneIsolationMiddleware(ToolStatusMiddleware(), scene_manager)],
+```
+
+The outer one runs first on the way in and last on the way out; the inner one sits closest to the LLM and tool execution. Together they add capabilities the framework does not provide on its own.
+
+### `SceneIsolationMiddleware` (outer)
+
+Provides **per-conversation Blender scene persistence** on top of a single shared Blender process:
+
+- **Conversation ID resolution** — tries `context.session.session_id`, then `context.options` / `context.kwargs` / `context.metadata` (`user`, `metadata.conversation_id`), then `agent._request_headers` (the only channel that propagates the conversation ID through Foundry's OpenAI Responses path). Includes a one-shot diagnostic dump to debug routing differences between local agentdev and Foundry.
+- **Activate before the run** — loads the conversation's previously-saved `.blend` from blob storage into Blender. If the ID isn't resolvable yet (first turn of a new conversation), it saves any other conversation's scene currently loaded and resets Blender to a clean state, so conversations cannot leak geometry into each other.
+- **Save after streaming completes** — wraps `context.result` in a generator with a `finally` block so the scene is uploaded to blob storage *after* the last chunk is yielded. This timing matters: the framework only mutates the thread with its real `service_thread_id` after the stream ends, so saving any earlier would miss the ID on the very first turn.
+
+### `ToolStatusMiddleware` (inner)
+
+Transforms the raw streaming response into a richer UX stream for the WebChat client:
+
+- **Human-readable status pills** — when a `FunctionCallContent` chunk is seen for a tool such as `render_final` or `download_polyhaven_asset`, an extra status message ("Rendering the final image…", "Downloading asset from Poly Haven…") is emitted via the `_TOOL_STATUS_MESSAGES` map. Without this the user just sees a long pause while a tool runs.
+- **Deduplication** — the framework can emit multiple `FunctionCallContent` chunks with different `call_id`s for one logical invocation; a per-turn `announced_names` set ensures only one pill per tool.
+- **Early image surfacing** — for image-producing tools (`get_viewport_screenshot`, `render_preview`, `render_final`) the markdown image is pulled out of the tool result and streamed immediately, instead of waiting for the model to echo it in its final answer.
+- **Early download-link surfacing** — same treatment for `save_scene_for_download` and `export_scene_as_glb_for_download`.
+- **Heartbeats and per-turn timeout** — a background pump task feeds chunks into a queue so heartbeat messages can be interleaved without cancelling an in-flight HTTP read; if the turn exceeds `TURN_TIMEOUT_SECONDS`, a friendly timeout message is yielded instead of a raw exception.
+- **Friendly error mapping** — on upstream stream failures, structured diagnostics (session id, elapsed ms, status code, request id, exception type) are logged and a friendly model-error message is yielded to the user before the exception is re-raised for telemetry.
+
+### Why this composition order
+
+`SceneIsolation` *outside* `ToolStatus` is deliberate: scene activation must happen *before* any tool runs, and scene save must happen *after* the entire streamed response (including status messages and surfaced images) has been delivered to the client.
+
+| Concern | Provided by |
+|---|---|
+| Per-conversation isolation of an external stateful process (Blender) | `SceneIsolationMiddleware` |
+| Loading/saving that state to blob storage at the right point in the request lifecycle | `SceneIsolationMiddleware` |
+| Resolving conversation IDs across local agentdev vs. Foundry routing quirks | `SceneIsolationMiddleware` |
+| Tool-call → user-facing status messages | `ToolStatusMiddleware` |
+| Streaming images / download links the moment the tool returns them | `ToolStatusMiddleware` |
+| Heartbeats and per-turn timeout with friendly fallback text | `ToolStatusMiddleware` |
+| Structured diagnostics on stream failure | `ToolStatusMiddleware` |
+
 ## Prerequisites
 
 - Docker
