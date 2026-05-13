@@ -33,17 +33,19 @@ export function BabylonViewer({ src, filename, onClose }: Props) {
         const BABYLON = await import("@babylonjs/core");
         // Side-effect import: registers the glTF/glb loader plugin.
         await import("@babylonjs/loaders/glTF");
+        // Side-effect import: registers sceneHelpers for createDefaultSkybox.
+        await import("@babylonjs/core/Helpers/sceneHelpers");
         if (disposed) return;
 
         const {
           Engine,
           Scene,
-          ArcRotateCamera,
-          HemisphericLight,
-          Vector3,
           Color4,
           SceneLoader,
+          HDRCubeTexture,
         } = BABYLON;
+        type ArcRotateCameraT = import("@babylonjs/core").ArcRotateCamera;
+        type FramingBehaviorT = import("@babylonjs/core").FramingBehavior;
 
         // We render our own loading overlay; suppress Babylon's full-screen
         // default loading screen which otherwise flashes briefly under React
@@ -52,33 +54,40 @@ export function BabylonViewer({ src, filename, onClose }: Props) {
         // removing the global loading overlay).
         SceneLoader.ShowLoadingScreen = false;
 
-        engine = new Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+        // Engine settings mirror the Babylon.js Sandbox
+        // (packages/tools/sandbox/src/components/renderingZone.tsx).
+        engine = new Engine(canvas, true, {
+          preserveDrawingBuffer: true,
+          stencil: true,
+          premultipliedAlpha: false,
+          useHighPrecisionMatrix: true,
+        });
         engine.hideLoadingUI();
         scene = new Scene(engine);
         scene.clearColor = new Color4(0.055, 0.063, 0.078, 1);
 
-        const camera = new ArcRotateCamera(
-          "camera",
-          Math.PI / 2.5,
-          Math.PI / 2.5,
-          5,
-          Vector3.Zero(),
+        // Same HDR file Blender loads via PolyHaven (see scene_manager.py).
+        // Served by the proxy under /api/assets so it works in dev (via the
+        // Vite /api proxy) and in production. Constructor args mirror the
+        // Sandbox's EnvironmentTools.LoadSkyboxPathTexture exactly:
+        //   (url, scene, size=256, noMipmap=false, generateHarmonics=true,
+        //    gammaSpace=false, prefilterOnLoad=true, onLoad, onError,
+        //    supersample, prefilterIrradianceOnLoad=true, prefilterUsingCdf=true)
+        const envTexture = new HDRCubeTexture(
+          "/api/assets/studio_small_09_1k.hdr",
           scene,
+          256,
+          false,
+          true,
+          false,
+          true,
+          undefined,
+          undefined,
+          undefined,
+          true,
+          true,
         );
-        camera.attachControl(canvas, true);
-        camera.wheelDeltaPercentage = 0.01;
-        camera.pinchDeltaPercentage = 0.01;
-        camera.minZ = 0.01;
-
-        const light = new HemisphericLight("light", new Vector3(0, 1, 0), scene);
-        light.intensity = 1.1;
-
-        engine.runRenderLoop(() => {
-          scene?.render();
-        });
-
-        onResize = () => engine?.resize();
-        window.addEventListener("resize", onResize);
+        scene.environmentTexture = envTexture;
 
         // Cross-origin URLs (e.g. Azure Blob SAS links) usually don't expose
         // CORS headers, so we route them through the same-origin /api/blob
@@ -104,26 +113,58 @@ export function BabylonViewer({ src, filename, onClose }: Props) {
         await SceneLoader.AppendAsync("", file as unknown as string, scene);
         if (disposed || !scene) return;
 
-        // Auto-frame the camera using world AABB of all meshes.
-        const meshes = scene.meshes.filter((m) => m.getTotalVertices && m.getTotalVertices() > 0);
-        if (meshes.length > 0) {
-          let min = meshes[0].getBoundingInfo().boundingBox.minimumWorld.clone();
-          let max = meshes[0].getBoundingInfo().boundingBox.maximumWorld.clone();
-          for (const m of meshes) {
-            const bb = m.getBoundingInfo().boundingBox;
-            min = Vector3.Minimize(min, bb.minimumWorld);
-            max = Vector3.Maximize(max, bb.maximumWorld);
-          }
-          const center = min.add(max).scale(0.5);
-          const extent = max.subtract(min);
-          const radius = Math.max(extent.x, extent.y, extent.z) * 1.6 || 5;
-          camera.setTarget(center);
-          camera.radius = radius;
-          camera.lowerRadiusLimit = radius * 0.05;
-          camera.upperRadiusLimit = radius * 10;
-          camera.minZ = Math.max(0.01, radius * 0.001);
-          camera.maxZ = radius * 100;
+        // ── Camera setup mirrors Sandbox.prepareCamera() ──
+        // createDefaultCamera(true) creates an ArcRotateCamera and frames it
+        // around the world bounds. Then we rotate by π for glTF's +Z forward
+        // convention and use FramingBehavior.zoomOnBoundingInfo for a tighter,
+        // sandbox-identical fit.
+        scene.createDefaultCamera(true, true, true);
+        const camera = scene.activeCamera as ArcRotateCameraT;
+        // glTF assets use a +Z forward convention while the default camera
+        // faces +Z; rotate so we look at the front of the asset.
+        camera.alpha += Math.PI;
+
+        camera.useFramingBehavior = true;
+        const framingBehavior = camera.getBehaviorByName("Framing") as FramingBehaviorT | null;
+        if (framingBehavior) {
+          framingBehavior.framingTime = 0;
+          framingBehavior.elevationReturnTime = -1;
         }
+
+        if (scene.meshes.length) {
+          camera.lowerRadiusLimit = null;
+          const worldExtends = scene.getWorldExtends((mesh) => mesh.isVisible && mesh.isEnabled());
+          framingBehavior?.zoomOnBoundingInfo(worldExtends.min, worldExtends.max);
+        }
+
+        camera.pinchPrecision = 200 / camera.radius;
+        camera.upperRadiusLimit = 5 * camera.radius;
+        camera.wheelDeltaPercentage = 0.01;
+        camera.pinchDeltaPercentage = 0.01;
+        camera.attachControl(canvas, true);
+
+        // Skybox after the camera so we can size it relative to the camera's
+        // active range — same formula as the Sandbox.
+        scene.createDefaultSkybox(
+          envTexture,
+          true,
+          (camera.maxZ - camera.minZ) / 2,
+          0.3,
+          false,
+        );
+
+        engine.runRenderLoop(() => {
+          if (!scene || !scene.activeCamera) return;
+          const cam = scene.activeCamera as ArcRotateCameraT;
+          // Adapt camera sensibility based on distance to the model
+          // (same logic as Sandbox.onSceneLoaded render loop).
+          cam.panningSensibility = 5000 / cam.radius;
+          cam.speed = cam.radius * 0.2;
+          scene.render();
+        });
+
+        onResize = () => engine?.resize();
+        window.addEventListener("resize", onResize);
 
         setLoading(false);
       } catch (err) {

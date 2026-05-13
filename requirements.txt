@@ -1,5 +1,11 @@
-azure-ai-agentserver-agentframework==1.0.0b17
-# azure-ai-projects pinned transitively by agent-framework-core==1.0.0rc3 to 2.0.0b4
+# Canonical hosted-agent stack (matches microsoft-foundry/foundry-samples
+# hosted-agents/agent-framework/responses/02-tools). We previously used
+# `azure-ai-agentserver-agentframework`, but its `AzureAIClient`
+# unconditionally registers a `kind: prompt` agent in the Foundry project,
+# which collides with the hosted agent declared in agent.yaml and crashes
+# every turn with HTTP 400 "Agent kind mismatch".
+agent-framework>=1.2.2
+agent-framework-foundry-hosting
 python-dotenv>=1.2.2
 azure-identity>=1.25.3
 azure-storage-blob>=12.28.0

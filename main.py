@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from agent_framework import (
+    Agent,
     AgentMiddleware,
     AgentContext,
     AgentResponse,
@@ -28,10 +29,9 @@ from agent_framework import (
     Content,
     ResponseStream,
 )
-from agent_framework.azure import AzureAIClient
-from azure.ai.agentserver.agentframework import from_agent_framework
-from azure.ai.agentserver.agentframework.persistence import InMemoryAgentSessionRepository
-from azure.identity.aio import DefaultAzureCredential
+from agent_framework.foundry import FoundryChatClient
+from agent_framework.observability import enable_instrumentation
+from agent_framework_foundry_hosting import ResponsesHostServer
 
 from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSettings, generate_blob_sas
@@ -387,7 +387,7 @@ def get_scene_info() -> str:
         except Exception as e:
             logger.error("get_scene_info failed (attempt %d/2)", attempt, exc_info=True)
             if attempt == 1 and _is_blender_crash_error(e):
-                recovered, _ = _recover_blender_scene("get_scene_info")
+                recovered = _recover_blender_scene("get_scene_info")
                 if recovered:
                     continue  # retry once on the restored scene
             return f"Error getting scene info: {str(e)}"
@@ -1243,6 +1243,16 @@ print("Render complete: {render_path}")
         except Exception as e:
             logger.error("%s failed (attempt %d/%d)", label, attempt, max_attempts, exc_info=True)
 
+            # Only treat connection-level failures as Blender crashes. Regular
+            # runtime errors raised by bpy (e.g. "Cannot render, no camera",
+            # missing material, bad filepath) must be returned to the model
+            # verbatim so it can self-correct — the previous behaviour reset
+            # the scene on every render error, wiping all in-progress work.
+            if not _is_blender_crash_error(e):
+                # Enrich the error so the model knows what to fix.
+                hint = _render_error_hint(e)
+                return f"Error rendering: {str(e)}{hint}"
+
             if attempt >= max_attempts:
                 return f"Error rendering: {str(e)}"
 
@@ -1264,6 +1274,38 @@ print("Render complete: {render_path}")
             logger.info("%s: recovery complete, retrying render…", label)
 
     return f"Error rendering: exhausted all {max_attempts} attempts"
+
+
+def _render_error_hint(err: Exception) -> str:
+    """Build a one-line diagnostic hint appended to render error messages.
+
+    Probes Blender for the current camera + object count so the model can
+    self-correct (e.g. add a camera or assign ``scene.camera``).
+    """
+    msg = str(err).lower()
+    try:
+        blender = get_blender_connection()
+        probe = blender.send_command("execute_code", {
+            "code": (
+                "import bpy\n"
+                "s = bpy.context.scene\n"
+                "cam = s.camera.name if s.camera else 'None'\n"
+                "print(f'scene={s.name!r} camera={cam} objects={len(bpy.data.objects)}')\n"
+            ),
+        })
+        state = (probe.get("result") or "").strip().splitlines()
+        state_line = state[-1] if state else "(unknown)"
+    except Exception:
+        state_line = "(scene probe failed)"
+
+    if "no camera" in msg:
+        return (
+            f"\nHint: bpy.ops.render.render() requires bpy.context.scene.camera to be set. "
+            f"Current state: {state_line}. Add a camera with bpy.ops.object.camera_add(...) "
+            f"and assign it via bpy.context.scene.camera = <camera_object>, then retry the render. "
+            f"Do NOT call setup_scene again — that would clear the scene."
+        )
+    return f"\nState at failure: {state_line}"
 
 
 def _wait_for_blender(timeout: int = 60) -> bool:
@@ -1484,6 +1526,27 @@ class ToolStatusMiddleware(AgentMiddleware):
                 try:
                     async for upd in original_stream:
                         await queue.put(("update", upd))
+                except ValueError as ex:
+                    # `agent_framework.observability._finalize_stream` registers a
+                    # cleanup hook that does `ContextVar.set(...)` → `Token.reset()`
+                    # on the wrapped stream. `Token.reset()` checks Context
+                    # *identity* (not equality), and `asyncio.create_task` ALWAYS
+                    # gives the child task a brand-new Context object — even when
+                    # we pass `context=copy_context()`. So whenever the upstream
+                    # stream is iterated from a background task, the cleanup hook
+                    # raises `ValueError: <Token …> was created in a different
+                    # Context` *after* `StopAsyncIteration` (i.e. after all stream
+                    # data has already been delivered). It is purely a telemetry-
+                    # cleanup artefact and must NOT be surfaced as a stream error
+                    # (which the user would otherwise see as the "transient error"
+                    # banner at end of every turn). Treat as a clean end-of-stream.
+                    if "different Context" in str(ex):
+                        logger.debug(
+                            "Ignoring observability cleanup error after stream end: %s", ex
+                        )
+                        await queue.put(("done", _SENTINEL_DONE))
+                    else:
+                        await queue.put(("error", ex))
                 except BaseException as ex:  # noqa: BLE001 — propagate to consumer
                     await queue.put(("error", ex))
                 else:
@@ -2031,22 +2094,72 @@ class SceneIsolationMiddleware(AgentMiddleware):
 
 async def main():
     """Main function to run the Blender Scene Agent as a web server."""
+    # Enable Agent Framework's native GenAI span instrumentation
+    # (invoke_agent / chat / execute_tool). When using
+    # `ResponsesHostServer` from `agent_framework_foundry_hosting`, the
+    # host configures the Azure Monitor *exporter* (you'll see
+    # "Application Insights trace exporter configured." in the logs)
+    # but does NOT auto-enable the framework's tracer/meter — unlike the
+    # older `azure.ai.agentserver.agentframework.from_agent_framework`
+    # host that we previously used on `main`. Without this call, the
+    # framework's GenAI spans never emit and App Insights only sees
+    # host-level inbound spans.
+    #
+    # `enable_instrumentation()` honours ENABLE_SENSITIVE_DATA from
+    # env (set in agent.yaml). The exporter side is handled by Foundry,
+    # which injects APPLICATIONINSIGHTS_CONNECTION_STRING and wires
+    # Azure Monitor. Best-effort: a failure here must not crash the
+    # agent.
+    try:
+        _enable_sensitive = os.getenv("ENABLE_SENSITIVE_DATA", "").strip().lower() in ("1", "true", "yes")
+        enable_instrumentation(enable_sensitive_data=_enable_sensitive or None)
+        logger.info("Agent Framework instrumentation enabled (enable_sensitive_data=%s).", _enable_sensitive)
+    except Exception as obs_exc:  # noqa: BLE001 — observability is non-fatal
+        logger.warning("enable_instrumentation() failed; GenAI spans may be missing: %s", obs_exc)
+
     scene_manager = SceneManager()
 
     global _scene_manager
     _scene_manager = scene_manager
 
-    async with (
-        DefaultAzureCredential() as credential,
-        AzureAIClient(
-            project_endpoint=PROJECT_ENDPOINT,
-            model_deployment_name=MODEL_DEPLOYMENT_NAME,
-            credential=credential,
-        ).as_agent(
-            name="BlenderSceneAgent",
-            middleware=[SceneIsolationMiddleware(ToolStatusMiddleware(), scene_manager)],
-
-            instructions="""You are an expert 3D scene creation assistant powered by Blender.
+    # Per the canonical 08-observability sample, `FoundryChatClient` is
+    # constructed plainly (it is NOT an async context manager) and uses
+    # the sync `DefaultAzureCredential`. The credential lives for the
+    # lifetime of the process; explicit cleanup is unnecessary here.
+    credential = SyncDefaultAzureCredential()
+    chat_client = FoundryChatClient(
+        project_endpoint=PROJECT_ENDPOINT,
+        model=MODEL_DEPLOYMENT_NAME,
+        credential=credential,
+    )
+    # Canonical hosted-agent stack (matches
+    # microsoft-foundry/foundry-samples/.../hosted-agents/agent-framework/
+    # responses/02-tools/main.py and 08-observability/main.py):
+    #
+    #   FoundryChatClient + ResponsesHostServer + Agent (no name)
+    #
+    # We previously used `AzureAIClient` + `azure.ai.agentserver`, but
+    # `AzureAIClient._prepare_options` unconditionally calls
+    # `project_client.agents.create_version(...)` to register a
+    # `kind: prompt` agent in the Foundry project. That is the
+    # prompt-agent SDK pattern — it's incompatible with the hosted
+    # agent declared in agent.yaml and causes HTTP 400
+    # "Agent kind mismatch" no matter what name (or no name) is
+    # passed.
+    #
+    # `FoundryChatClient` never calls `create_version`. The agent
+    # identity lives ENTIRELY in agent.yaml (`name: fantasy-worlds-
+    # agent`, `kind: hosted`), so the local `Agent(...)` wrapper has
+    # NO `name=` argument — there's a single source of truth.
+    #
+    # `default_options={"store": False}` tells the model the service
+    # manages history (per the sample). Our scene-isolation
+    # middleware persists scene state out-of-band, so this is fine.
+    agent = Agent(
+        client=chat_client,
+        middleware=[SceneIsolationMiddleware(ToolStatusMiddleware(), scene_manager)],
+        default_options={"store": False},
+        instructions="""You are an expert 3D scene creation assistant powered by Blender.
 
 **CRITICAL: This environment runs Blender 4.4. All generated Python code MUST use the Blender 4.x Python API. Many Blender 3.x APIs were removed or renamed in 4.0. NEVER use deprecated Blender 3.x node types, input names, or enums — they will cause runtime errors. When uncertain about an API, prefer the Blender 4.x naming conventions listed in the "Blender 4.x API Compatibility" section below.**
 
@@ -2133,29 +2246,28 @@ This environment runs **Blender 4.4**. The following Blender 3.x APIs were remov
 - `ShaderNodeValToRGB` (ColorRamp): Cannot remove all elements (minimum 1 required). Modify existing elements' position and color instead of deleting and recreating.
 - Never set `collection.name` (read-only). Use `bpy.data.collections.new("Name")` instead.
 """,
-            tools=[
-                get_scene_info,
-                get_object_info,
-                create_object,
-                modify_object,
-                delete_object,
-                apply_material,
-                execute_blender_code,
-                get_viewport_screenshot,
-                search_polyhaven_assets,
-                download_polyhaven_asset,
-                apply_polyhaven_texture,
-                setup_scene,
-                render_preview,
-                render_final,
-                save_scene_for_download,
-                export_scene_as_glb_for_download,
-            ],
-        ) as agent,
-    ):
-        print("Blender Scene Agent running on http://localhost:8088")
-        server = from_agent_framework(agent, session_repository=InMemoryAgentSessionRepository())
-        await server.run_async()
+        tools=[
+            get_scene_info,
+            get_object_info,
+            create_object,
+            modify_object,
+            delete_object,
+            apply_material,
+            execute_blender_code,
+            get_viewport_screenshot,
+            search_polyhaven_assets,
+            download_polyhaven_asset,
+            apply_polyhaven_texture,
+            setup_scene,
+            render_preview,
+            render_final,
+            save_scene_for_download,
+            export_scene_as_glb_for_download,
+        ],
+    )
+    print("Blender Scene Agent running on http://localhost:8088")
+    server = ResponsesHostServer(agent)
+    await server.run_async()
 
 
 if __name__ == "__main__":

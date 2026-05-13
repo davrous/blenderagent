@@ -29,6 +29,10 @@ environment_variables:
     value: "9876"
   - name: AZURE_STORAGE_ACCOUNT_NAME
     value: "{{AZURE_STORAGE_ACCOUNT_NAME}}"
+  - name: ENABLE_INSTRUMENTATION
+    value: "true"
+  - name: ENABLE_SENSITIVE_DATA
+    value: "true"
 dockerfile_path: Dockerfile
 resources:
   cpu: '2.0'
