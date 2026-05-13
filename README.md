@@ -33,7 +33,7 @@ An AI agent that creates and manipulates 3D scenes in a headless Blender instanc
 - **Viewport screenshots**: Capture and return the current viewport as base64 PNG
 - **Full render**: Render scenes with EEVEE or Cycles engines
 - **Arbitrary code execution**: Run custom Blender Python code for advanced operations
-- **Per-conversation scene isolation**: Each conversation gets its own Blender scene, saved/restored from Azure Blob Storage
+- **Per-VM Blender scene persistence**: Each Foundry micro-VM owns a single Blender scene, saved/restored from `$HOME` across idle resumes
 
 ## Files
 
@@ -42,72 +42,10 @@ An AI agent that creates and manipulates 3D scenes in a headless Blender instanc
 | `main.py` | Agent server with 13 tool functions, Azure AI Foundry client |
 | `blender_startup.py` | Blender addon (runs inside Blender) - TCP socket server on port 9876 |
 | `blender_connection.py` | TCP client module used by the agent to talk to Blender |
-| `scene_manager.py` | Per-conversation Blender scene isolation with Azure Blob Storage persistence |
+| `scene_manager.py` | Single-scene-per-VM Blender persistence on `$HOME` |
 | `entrypoint.sh` | Docker entrypoint: starts Xvfb, Blender, then Agent server |
 | `agent.yaml` | Agent metadata and environment variable declarations |
 | `Dockerfile` | Ubuntu 22.04 + Blender 4.2 + Python deps |
-
-## Per-Conversation Scene Isolation
-
-The agent supports **multiple concurrent conversations**, each with its own isolated Blender scene. This is handled by the `SceneIsolationMiddleware` (in `main.py`) and `SceneManager` (in `scene_manager.py`).
-
-### How it works
-
-1. **User A** starts a conversation and builds a scene. At the end of each request, the Blender scene is saved as a `.blend` file and uploaded to Azure Blob Storage, keyed by the conversation's thread ID.
-2. **User B** starts a separate conversation. User A's scene is automatically saved, Blender is reset to a clean state, and User B gets a fresh scene.
-3. **User A returns** in the same conversation. User B's scene is saved, and User A's scene is restored from Blob Storage — exactly as they left it.
-
-Scenes are stored in the `blender-scenes` container in Azure Blob Storage under `scenes/<thread-id>.blend`. **Both the `screenshots` and `blender-scenes` containers must be pre-created** — the agent no longer creates them at runtime (least-privilege RBAC on the Foundry agent identity does not include management-plane permissions).
-
-### Thread ID lifecycle
-
-The conversation identifier comes from `context.thread.service_thread_id` in the Microsoft Agent Framework. On the **first request** of a new conversation, this ID is `None` (the Azure AI service assigns it during the streaming run). The middleware handles this by:
-- Skipping scene activation on first request (Blender starts clean)
-- Reading the thread ID **after streaming completes** (by which point the framework has set it) for the save operation
-- On subsequent requests, the thread is loaded from the `InMemoryAgentThreadRepository` with the ID already set
-
-## Middleware
-
-The agent is wired with two custom middlewares that sit on top of the Microsoft Agent Framework:
-
-```python
-middleware=[SceneIsolationMiddleware(ToolStatusMiddleware(), scene_manager)],
-```
-
-The outer one runs first on the way in and last on the way out; the inner one sits closest to the LLM and tool execution. Together they add capabilities the framework does not provide on its own.
-
-### `SceneIsolationMiddleware` (outer)
-
-Provides **per-conversation Blender scene persistence** on top of a single shared Blender process:
-
-- **Conversation ID resolution** — tries `context.session.session_id`, then `context.options` / `context.kwargs` / `context.metadata` (`user`, `metadata.conversation_id`), then `agent._request_headers` (the only channel that propagates the conversation ID through Foundry's OpenAI Responses path). Includes a one-shot diagnostic dump to debug routing differences between local agentdev and Foundry.
-- **Activate before the run** — loads the conversation's previously-saved `.blend` from blob storage into Blender. If the ID isn't resolvable yet (first turn of a new conversation), it saves any other conversation's scene currently loaded and resets Blender to a clean state, so conversations cannot leak geometry into each other.
-- **Save after streaming completes** — wraps `context.result` in a generator with a `finally` block so the scene is uploaded to blob storage *after* the last chunk is yielded. This timing matters: the framework only mutates the thread with its real `service_thread_id` after the stream ends, so saving any earlier would miss the ID on the very first turn.
-
-### `ToolStatusMiddleware` (inner)
-
-Transforms the raw streaming response into a richer UX stream for the WebChat client:
-
-- **Human-readable status pills** — when a `FunctionCallContent` chunk is seen for a tool such as `render_final` or `download_polyhaven_asset`, an extra status message ("Rendering the final image…", "Downloading asset from Poly Haven…") is emitted via the `_TOOL_STATUS_MESSAGES` map. Without this the user just sees a long pause while a tool runs.
-- **Deduplication** — the framework can emit multiple `FunctionCallContent` chunks with different `call_id`s for one logical invocation; a per-turn `announced_names` set ensures only one pill per tool.
-- **Early image surfacing** — for image-producing tools (`get_viewport_screenshot`, `render_preview`, `render_final`) the markdown image is pulled out of the tool result and streamed immediately, instead of waiting for the model to echo it in its final answer.
-- **Early download-link surfacing** — same treatment for `save_scene_for_download` and `export_scene_as_glb_for_download`.
-- **Heartbeats and per-turn timeout** — a background pump task feeds chunks into a queue so heartbeat messages can be interleaved without cancelling an in-flight HTTP read; if the turn exceeds `TURN_TIMEOUT_SECONDS`, a friendly timeout message is yielded instead of a raw exception.
-- **Friendly error mapping** — on upstream stream failures, structured diagnostics (session id, elapsed ms, status code, request id, exception type) are logged and a friendly model-error message is yielded to the user before the exception is re-raised for telemetry.
-
-### Why this composition order
-
-`SceneIsolation` *outside* `ToolStatus` is deliberate: scene activation must happen *before* any tool runs, and scene save must happen *after* the entire streamed response (including status messages and surfaced images) has been delivered to the client.
-
-| Concern | Provided by |
-|---|---|
-| Per-conversation isolation of an external stateful process (Blender) | `SceneIsolationMiddleware` |
-| Loading/saving that state to blob storage at the right point in the request lifecycle | `SceneIsolationMiddleware` |
-| Resolving conversation IDs across local agentdev vs. Foundry routing quirks | `SceneIsolationMiddleware` |
-| Tool-call → user-facing status messages | `ToolStatusMiddleware` |
-| Streaming images / download links the moment the tool returns them | `ToolStatusMiddleware` |
-| Heartbeats and per-turn timeout with friendly fallback text | `ToolStatusMiddleware` |
-| Structured diagnostics on stream failure | `ToolStatusMiddleware` |
 
 ## Prerequisites
 
@@ -362,6 +300,144 @@ docker run -it --rm \
 Then, drag'n'drop the GLB file in https://sandbox.babylonjs.com for instance
 
 ![Screenshot of a glTF export of the Blender Hosted Agent running in Babylon.js](ScreenshotFoundryHAGLB.png)
+
+## Scene Persistence
+
+The agent persists a single Blender scene per Foundry micro-VM, restored across idle/resume cycles. This is handled by `SceneIsolationMiddleware` (in `main.py`) and `SceneManager` (in `scene_manager.py`).
+
+### How it works
+
+On Azure AI Foundry's ADC platform each agent runs inside its own micro-VM, bound 1:1 to a logical conversation. The VM is paused after ~15 minutes of inactivity and resumed on the next request, preserving `$HOME` on disk but wiping process memory (including the Blender process itself and the Agent Framework's in-memory session repository).
+
+Given that 1:1 binding, the agent does **not** try to multiplex multiple conversations onto one container. It keeps exactly one scene file at `$HOME/blender_scenes/scene.blend`:
+
+1. **First turn of a fresh VM.** No `scene.blend` on disk → middleware resets Blender to a clean scene.
+2. **Subsequent turns in the same VM (active).** Blender is still running and holds the scene in memory. The middleware re-saves to `scene.blend` after each streaming response so an idle pause from this turn onwards is recoverable.
+3. **Resume after idle.** Blender process is gone; `scene.blend` is on disk. The middleware waits for the supervisor to bring Blender back up, then loads `scene.blend` into the fresh Blender instance.
+
+Azure Blob Storage is **not** used for the `.blend` scene file (that data is local to the VM, persisted by the platform). Blob storage is only used for two distinct flows: (a) screenshots/renders the agent surfaces back to the chat client, and (b) one-off `.blend` / `.glb` download links the user can save off-platform. **Both the `screenshots` and `blender-scenes` containers must be pre-created** — the agent no longer creates them at runtime (least-privilege RBAC on the Foundry agent identity does not include management-plane permissions).
+
+### Conversation ID — telemetry only
+
+The middleware still resolves a conversation id (`SceneIsolationMiddleware._get_conversation_id`, preferring a stable Foundry `conv_xxx`, then client-supplied `conversation_id`, then headers, then `context.session.session_id`) but it is used **only for logging and the persisted state file's `last_conversation_id` field**. Because the scene file is no longer keyed by it, a volatile/regenerated id across an idle/resume cycle is harmless — the scene is found by its fixed filename either way.
+
+## Idle vs Active: why this agent needs a special lifecycle
+
+Most AI agents hosted on Azure AI Foundry are stateless: each turn talks to a model and returns text. Our agent is different — it **owns a long-running, stateful Blender process** that holds the user's 3D scene entirely in memory. That single fact makes the Foundry hosting model's idle/active behavior load-bearing for us in a way that doesn't matter to a typical agent.
+
+### The Foundry micro-VM hosting model in one paragraph
+
+Foundry's Hosting Agent platform runs each agent inside an isolated micro-VM, scaled to zero between active uses. After ~15 minutes without traffic, the micro-VM is **paused** ("idle"). When the next request arrives, it is **resumed** ("active") in a few seconds. From the operating system's point of view this is closer to a laptop suspend/resume than to a fresh container start: most files on disk are preserved, but anything in-memory (or in non-persistent filesystem regions) is **not** guaranteed across the boundary.
+
+For a stateless agent this is invisible. For us it would be catastrophic — a paused Blender process does not resume cleanly when the VM thaws, and any conversational state that lived only in Python memory is gone.
+
+### What persists, what doesn't
+
+| Storage region | Persisted across idle? | Used for |
+|---|---|---|
+| `$HOME` (`/root`) — files | ✅ Yes | `.blend` scene snapshots, `.blender_session_state` JSON marker |
+| `/tmp` — files | ⚠️ Sometimes (observed to survive on ADC; **do not rely on it for state, but DO clean stale locks on every boot**) | Xvfb display lock (`/tmp/.X99-lock`), socket file (`/tmp/.X11-unix/X99`) — stale copies are deadly if reused |
+| Process memory (Blender, agent server) | ❌ No | Live Blender scene, Python globals, supervisor PIDs |
+| TCP sockets (port 9876 to Blender) | ❌ No | The agent must reconnect on resume |
+| `InMemoryAgentSessionRepository` | ❌ No | Agent Framework session state (including `session_id`) — wiped on every resume |
+
+That last row is mostly diagnostic now: because the scene file is stored under a fixed filename (`$HOME/blender_scenes/scene.blend`) rather than keyed by `session_id`, a regenerated `AgentSession` after resume no longer threatens scene continuity. It used to — see the playbook at the end of this section.
+
+### Two failure modes we explicitly defend against
+
+1. **Stale Xvfb lock files in `/tmp`.** When the VM resumes, `Xvfb :99` is no longer running but `/tmp/.X99-lock` and `/tmp/.X11-unix/X99` may still exist. Every restart attempt then fails with `Server is already active for display 99`, Blender exits with `GHOST: failed to initialize display`, and the supervisor retries forever. **Fix:** `entrypoint.sh::start_xvfb` always runs `pkill -9 -f "Xvfb :99"` and `rm -f` on both lock files *before* starting Xvfb.
+2. **Premature scene activation while Blender is still booting.** On resume the supervisor needs ~2–3 seconds to bring Xvfb and Blender back up. If the first request lands inside that window, `activate_scene` will try to load the persisted `.blend` while the socket is still refused, fall back to a clean scene, and silently destroy the user's work. **Fix:** before activation, the middleware runs `is_blender_socket_ready(timeout=1.0)`. If false, it `await`s `_wait_for_blender(120)` *before* touching the scene — the user is informed via streamed status messages while they wait.
+
+### The persisted state file `$HOME/.blender_session_state`
+
+To distinguish a **cold start** (fresh container, no previous work) from an **idle resume** (state to recover), `entrypoint.sh` reads and rewrites a small JSON marker at boot:
+
+```json
+{
+  "blender_ready": false,
+  "needs_scene_reload": true,
+  "session_started_at": "2026-05-13T10:36:58Z",
+  "last_conversation_id": "8f8bf402-1ec2-422a-8e05-b9b1dac40aa4",
+  "last_saved_at": "2026-05-13T10:15:18Z"
+}
+```
+
+- **First boot ever** (file does not exist): `needs_scene_reload=false` — there's nothing to restore. `entrypoint.sh` also exports `BLENDER_COLD_START=1` so the middleware can suppress the misleading "🔄 restarting after being paused" message during the natural ~3s startup delay.
+- **Resume from idle** (file already exists): `needs_scene_reload=true` is preserved; `blender_ready=false` is rewritten to signal the boot is in progress; `BLENDER_COLD_START=0`.
+- The agent flips `blender_ready=true` once it has reconnected to Blender (`SceneManager.set_blender_ready`), and writes `last_conversation_id` + `last_saved_at` after every successful `save_scene` (telemetry/diagnostics only — they are no longer used to locate the scene file).
+
+The file is the *only* signal we have at process start to tell us whether the container has run before. We update it atomically (write to a temp file then `os.replace`) and tolerate missing/corrupt JSON by treating it as "no state".
+
+### What the user actually sees on resume
+
+The middleware builds a `recovery_messages` list during the ACTIVATE phase and yields each entry as a streamed `AgentResponseUpdate` *before* the model starts emitting tokens, so the chat client shows something like:
+
+```
+🔄 The Blender engine is restarting after being paused. Please hold on while
+   the supervisor brings it back up…
+
+📂 Loaded your most recent scene (created in a previous session) — restoring it now.
+
+✅ Blender is ready — loading your scene…
+
+<model answer follows>
+```
+
+(Each line corresponds to one decision in the middleware. The 🔄 line is suppressed on `BLENDER_COLD_START=1`; the 📂 line is yielded whenever `scene.blend` is present on disk, which is every turn after the first one in a given micro-VM.)
+
+### Why this is unusual
+
+A typical Foundry agent doesn't need any of this. It's only required because we are doing something the platform isn't optimised for out of the box: **co-hosting a long-lived native process (Blender) inside the agent container**, owning its scene state in memory, and exposing it through a TCP socket that the agent process talks to. The combination of (a) external stateful process and (b) micro-VM suspend/resume that doesn't preserve that process is what forces the persisted-state-file + cold-start-flag + socket-probe design above.
+
+If you are building a new agent that wraps any similarly stateful native dependency on Foundry — a database engine, a game engine, a long-running compute kernel — this section is the playbook. The four invariants worth copying are:
+
+1. **Clean every transient resource on boot, don't trust the OS to have done it for you.** (Xvfb locks, named pipes, PID files.)
+2. **Treat `$HOME` as the canonical state store and write a JSON marker that distinguishes cold start from resume.**
+3. **Lean on the platform's 1:1 binding between micro-VM and conversation — don't multiplex.** Earlier iterations of this agent keyed the scene file by `conversation_id` and had to invent an orphan-adoption rescue for the case where the in-memory `session_id` was regenerated across resume. On Foundry's ADC platform that complexity is unnecessary: one VM = one logical conversation, so one fixed-name scene file per VM is both simpler and more robust. Reserve client-supplied/Foundry stable ids for telemetry, not as state keys.
+4. **Probe your external dependency before touching it on the first request after resume, and stream a user-visible status message while you wait** — the alternative is a silently corrupted user experience.
+
+## Middleware
+
+The agent is wired with two custom middlewares that sit on top of the Microsoft Agent Framework:
+
+```python
+middleware=[SceneIsolationMiddleware(ToolStatusMiddleware(), scene_manager)],
+```
+
+The outer one runs first on the way in and last on the way out; the inner one sits closest to the LLM and tool execution. Together they add capabilities the framework does not provide on its own.
+
+### `SceneIsolationMiddleware` (outer)
+
+Provides **per-VM Blender scene persistence** on top of a single shared Blender process. On Foundry's ADC platform each agent runs in a micro-VM bound 1:1 to a conversation, so the middleware keeps exactly one scene file (`$HOME/blender_scenes/scene.blend`) per container lifetime:
+
+- **Conversation ID resolution (telemetry only)** — prefers a stable Foundry `conv_xxx` id discovered on `context.session` / `context.agent`, then the client-supplied `conversation_id` from `context.options` / `context.kwargs` / `context.metadata`, then `agent._request_headers["conversation_id"]`, then `context.session.session_id`. The resolved value is logged and written to the persisted state file's `last_conversation_id` field, but **the scene file is not keyed by it** — a regenerated session id across an idle/resume cycle is harmless.
+- **Activate before the run** — first runs a non-retrying socket probe against Blender. If the socket is refused, waits for the supervisor to bring Blender back up (cold start vs. idle resume distinguished via the `BLENDER_COLD_START` env var written by `entrypoint.sh`) and streams `🔄`/`✅` status messages to the user. Then loads `scene.blend` if it exists, else resets Blender to a clean scene.
+- **Save after streaming completes** — wraps `context.result` in a generator with a `finally` block so the scene is saved to `$HOME/blender_scenes/scene.blend` *after* the last chunk is yielded. The wrapper also yields any pending `recovery_messages` from the ACTIVATE phase before the model's first token.
+
+### `ToolStatusMiddleware` (inner)
+
+Transforms the raw streaming response into a richer UX stream for the WebChat client:
+
+- **Human-readable status pills** — when a `FunctionCallContent` chunk is seen for a tool such as `render_final` or `download_polyhaven_asset`, an extra status message ("Rendering the final image…", "Downloading asset from Poly Haven…") is emitted via the `_TOOL_STATUS_MESSAGES` map. Without this the user just sees a long pause while a tool runs.
+- **Deduplication** — the framework can emit multiple `FunctionCallContent` chunks with different `call_id`s for one logical invocation; a per-turn `announced_names` set ensures only one pill per tool.
+- **Early image surfacing** — for image-producing tools (`get_viewport_screenshot`, `render_preview`, `render_final`) the markdown image is pulled out of the tool result and streamed immediately, instead of waiting for the model to echo it in its final answer.
+- **Early download-link surfacing** — same treatment for `save_scene_for_download` and `export_scene_as_glb_for_download`.
+- **Heartbeats and per-turn timeout** — a background pump task feeds chunks into a queue so heartbeat messages can be interleaved without cancelling an in-flight HTTP read; if the turn exceeds `TURN_TIMEOUT_SECONDS`, a friendly timeout message is yielded instead of a raw exception.
+- **Friendly error mapping** — on upstream stream failures, structured diagnostics (session id, elapsed ms, status code, request id, exception type) are logged and a friendly model-error message is yielded to the user before the exception is re-raised for telemetry.
+
+### Why this composition order
+
+`SceneIsolation` *outside* `ToolStatus` is deliberate: scene activation must happen *before* any tool runs, and scene save must happen *after* the entire streamed response (including status messages and surfaced images) has been delivered to the client.
+
+| Concern | Provided by |
+|---|---|
+| Per-VM persistence of an external stateful process (Blender) | `SceneIsolationMiddleware` |
+| Loading/saving that state on disk at the right point in the request lifecycle | `SceneIsolationMiddleware` |
+| Resolving conversation IDs (for telemetry) across local agentdev vs. Foundry routing quirks | `SceneIsolationMiddleware` |
+| Tool-call → user-facing status messages | `ToolStatusMiddleware` |
+| Streaming images / download links the moment the tool returns them | `ToolStatusMiddleware` |
+| Heartbeats and per-turn timeout with friendly fallback text | `ToolStatusMiddleware` |
+| Structured diagnostics on stream failure | `ToolStatusMiddleware` |
 
 ## Credits
 

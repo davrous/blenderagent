@@ -1,244 +1,286 @@
 """
-Scene Manager - Per-conversation Blender scene isolation.
+Scene Manager — single-scene persistence for a Foundry-hosted Blender agent.
 
-Each conversation gets its own isolated Blender scene state. Scenes are saved
-as .blend files to Azure Blob Storage so conversations can be resumed, even
-after a container restart.
+## Why a single scene file?
+
+On Azure AI Foundry's ADC platform each agent runs inside an isolated
+micro-VM that is bound 1:1 to a logical conversation. The platform pauses
+the VM after ~60s of inactivity ("idle") and resumes it on the next
+request ("active"). Resume preserves the filesystem but wipes process
+memory (including the in-memory ``InMemoryAgentSessionRepository``, which
+means ``AgentSession.session_id`` is regenerated even though the user
+sees the same conversation).
+
+Because one VM = one conversation, we do NOT need to disambiguate scenes
+by conversation id — there is only ever ONE scene to care about per
+container lifetime. The previous design used ``<conversation-id>.blend``
+keys and a brittle "rename orphan after id changes" recovery path, which
+is no longer required.
+
+This module therefore stores the scene at a single fixed path:
+``$HOME/blender_scenes/scene.blend``. It survives idle/resume because
+``$HOME`` is persisted by the platform; it does not survive a fresh
+container (intended — a fresh container is a brand-new conversation).
+
+A small JSON state file ``$HOME/.blender_session_state`` records whether
+a scene exists to be reloaded and timestamps useful for diagnostics; it
+is written initially by ``entrypoint.sh`` and updated after each save.
 
 Usage:
     manager = SceneManager()
-    manager.activate_scene("conv-abc")   # load or reset
+    manager.activate_scene()   # load $HOME scene or reset to clean
     # ... agent tools modify the scene ...
-    manager.save_scene("conv-abc")       # persist to blob
+    manager.save_scene()       # persist to $HOME
 """
 
+import json
 import logging
 import os
-import re
 import tempfile
-
-from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
-from azure.storage.blob import BlobServiceClient, ContentSettings
+from datetime import datetime, timezone
 
 from blender_connection import current_epoch, get_blender_connection
 
 logger = logging.getLogger("blender_agent.scene_manager")
 
-# No default value on purpose: see note in main.py. Failing loud beats
-# silently writing to a foreign storage account when the deployment
-# pipeline forgets to substitute the env var.
-AZURE_STORAGE_ACCOUNT_NAME = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME")
-SCENE_CONTAINER_NAME = "blender-scenes"
+# Scene directory: $HOME/blender_scenes/ — persisted by the platform across
+# idle/resume cycles. Falls back to /tmp only when $HOME is not writable
+# (some local Docker setups).
+_HOME_SCENE_DIR = os.path.join(os.path.expanduser("~"), "blender_scenes")
+try:
+    os.makedirs(_HOME_SCENE_DIR, exist_ok=True)
+    _SCENE_DIR = _HOME_SCENE_DIR
+    logger.info("Scene directory (primary, persisted): %s", _SCENE_DIR)
+except OSError:
+    _SCENE_DIR = os.path.join(tempfile.gettempdir(), "blender_scenes")
+    os.makedirs(_SCENE_DIR, exist_ok=True)
+    logger.warning("Could not create %s, falling back to %s", _HOME_SCENE_DIR, _SCENE_DIR)
 
-logger.info(
-    "Scene storage config: AZURE_STORAGE_ACCOUNT_NAME=%r (env_set=%s)",
-    AZURE_STORAGE_ACCOUNT_NAME,
-    "AZURE_STORAGE_ACCOUNT_NAME" in os.environ,
-)
+# Fixed scene filename — one Blender scene per micro-VM/conversation.
+_SCENE_FILE = os.path.join(_SCENE_DIR, "scene.blend")
 
-# Temp directory for .blend files during save/load
-_SCENE_DIR = os.path.join(tempfile.gettempdir(), "blender_scenes")
-os.makedirs(_SCENE_DIR, exist_ok=True)
-
-# Regex to validate conversation IDs (alphanumeric, hyphens, underscores)
-_SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
-
-
-def _safe_blob_name(conversation_id: str) -> str:
-    """Return a safe blob name for a conversation ID."""
-    if not _SAFE_ID_RE.match(conversation_id):
-        # Fall back to a hash for unusual IDs
-        import hashlib
-        conversation_id = hashlib.sha256(conversation_id.encode()).hexdigest()[:32]
-    return f"scenes/{conversation_id}.blend"
+# Persisted session state file (JSON). Lives in $HOME so it survives idle.
+# ``entrypoint.sh`` writes the initial file (with blender_ready=false) on
+# every container start; the agent updates it as Blender becomes ready and
+# after every successful scene save.
+_SESSION_STATE_FILE = os.path.join(os.path.expanduser("~"), ".blender_session_state")
 
 
-def _local_blend_path(conversation_id: str) -> str:
-    """Return a local temp path for a conversation's .blend file."""
-    if not _SAFE_ID_RE.match(conversation_id):
-        import hashlib
-        conversation_id = hashlib.sha256(conversation_id.encode()).hexdigest()[:32]
-    return os.path.join(_SCENE_DIR, f"{conversation_id}.blend")
+def _read_session_state() -> dict:
+    """Best-effort read of the persisted session state. Returns {} on any error."""
+    try:
+        with open(_SESSION_STATE_FILE) as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except FileNotFoundError:
+        pass
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Could not read session state file %s", _SESSION_STATE_FILE, exc_info=True)
+    return {}
 
 
-def _get_blob_container():
-    """Get the blob container client for scene storage.
+def _write_session_state(updates: dict) -> None:
+    """Atomically merge `updates` into the session state file. Best-effort, never raises."""
+    try:
+        state = _read_session_state()
+        state.update(updates)
+        tmp = _SESSION_STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, _SESSION_STATE_FILE)
+    except OSError:
+        logger.warning("Could not write session state file %s", _SESSION_STATE_FILE, exc_info=True)
 
-    The container is expected to be pre-created. We deliberately do NOT call
-    create_container() here: under least-privilege RBAC ('Storage Blob Data
-    Contributor') a 403 on get_container_properties masks the real upload
-    error and pollutes the logs.
-    """
-    account_url = f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
-    credential = SyncDefaultAzureCredential()
-    blob_service_client = BlobServiceClient(account_url, credential=credential)
-    return blob_service_client.get_container_client(SCENE_CONTAINER_NAME)
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class SceneManager:
-    """Manages per-conversation Blender scene isolation with blob persistence."""
+    """Manages the single per-VM Blender scene with ``$HOME`` persistence."""
 
     def __init__(self):
-        self._active_conversation_id: str | None = None
-        # Connection epoch captured the last time we successfully activated
-        # (loaded or reset) the scene. If the live epoch differs at save time,
-        # Blender was restarted in between and the in-memory scene is NOT the
-        # one the user/agent built — refuse to overwrite the saved blob.
+        # Connection epoch captured the last time we activated (loaded or
+        # reset) the scene. If the live epoch differs at save time, Blender
+        # was restarted in between and the in-memory scene is NOT the one
+        # the user/agent built — refuse to overwrite the saved file.
         self._active_epoch: int | None = None
 
-    def activate_scene(self, conversation_id: str) -> None:
-        """Load the scene for the given conversation, or reset to a clean scene.
-
-        If the same conversation is already active, this is a no-op.
-        If a different conversation was active, its scene is saved first.
-        """
-        if conversation_id == self._active_conversation_id:
-            logger.debug("Scene already active for conversation %s, skipping", conversation_id)
-            return
-
-        prev = self._active_conversation_id
-        logger.info("Activating scene for conversation %s (previous: %s)",
-                     conversation_id, prev)
-
-        # Save the *previous* conversation's scene before switching
-        if prev:
-            logger.info("Saving previous conversation %s scene before switching", prev)
-            self.save_scene(prev)
-
-        # Try to download the saved .blend from blob storage
-        local_path = _local_blend_path(conversation_id)
-        blob_name = _safe_blob_name(conversation_id)
-        loaded = False
-
-        logger.info("Attempting to download scene blob: %s -> %s", blob_name, local_path)
-        try:
-            container = _get_blob_container()
-            blob_client = container.get_blob_client(blob_name)
-            with open(local_path, "wb") as f:
-                stream = blob_client.download_blob()
-                stream.readinto(f)
-            file_size = os.path.getsize(local_path)
-            logger.info("Downloaded saved scene from blob: %s (%d bytes)",
-                        blob_name, file_size)
-            loaded = True
-        except Exception as e:
-            # Blob not found or download failed — will reset to clean scene
-            logger.info("No saved scene found for %s (blob=%s, error=%s), will reset to clean scene",
-                        conversation_id, blob_name, e)
-
-        if loaded:
-            logger.info("Loading .blend file into Blender for conversation %s", conversation_id)
-            self._load_blend_file(local_path)
+        # ── newScene flag ──
+        # True  → brand-new container, Blender scene should be reset to
+        #         clean. The on-disk file (if any) is stale and ignored.
+        # False → resumed container, prior scene exists in $HOME, load it.
+        # Source: the ``needs_scene_reload`` field of the persisted state
+        # file, written by ``entrypoint.sh`` based on whether the file
+        # existed before this boot.
+        state = _read_session_state()
+        if "needs_scene_reload" in state:
+            self._new_scene = not bool(state.get("needs_scene_reload"))
         else:
-            logger.info("Resetting Blender to clean scene for conversation %s", conversation_id)
+            # No state file → treat as brand-new container.
+            self._new_scene = True
+        logger.info(
+            "SceneManager init: new_scene=%s (state=%r, scene_file_exists=%s)",
+            self._new_scene, state, os.path.exists(_SCENE_FILE),
+        )
+
+    # ── Public read-only accessors ──
+
+    @property
+    def new_scene(self) -> bool:
+        """True if this is the very first boot of the container (no scene to restore)."""
+        return self._new_scene
+
+    def has_saved_scene(self) -> bool:
+        """True if ``$HOME/blender_scenes/scene.blend`` exists."""
+        return os.path.exists(_SCENE_FILE)
+
+    # ── State-file updates ──
+
+    def set_blender_ready(self, ready: bool) -> None:
+        """Update the ``blender_ready`` flag in the persisted session state file."""
+        _write_session_state({"blender_ready": bool(ready)})
+
+    def _mark_scene_used(self) -> None:
+        """After the first successful save, mark that a scene exists to be reloaded."""
+        if self._new_scene:
+            self._new_scene = False
+        _write_session_state({"needs_scene_reload": True})
+
+    # ── Scene lifecycle ──
+
+    def activate_scene(self, conversation_id: str | None = None) -> None:
+        """Load the persisted scene, or reset to a clean scene.
+
+        With the single-scene/micro-VM model this is straightforward:
+
+          * If ``new_scene`` is True (fresh container), reset to clean.
+          * Else if ``$HOME/blender_scenes/scene.blend`` exists, load it.
+          * Else (state says we should have one but the file is missing),
+            log a warning and reset to clean.
+
+        ``conversation_id`` is accepted for logging/diagnostics only.
+        """
+        if self._new_scene:
+            logger.info(
+                "activate_scene: fresh container (conversation=%s) — resetting to clean scene",
+                conversation_id,
+            )
+            self._reset_scene()
+        elif os.path.exists(_SCENE_FILE):
+            file_size = os.path.getsize(_SCENE_FILE)
+            logger.info(
+                "activate_scene: loading persisted scene (conversation=%s, file=%s, %d bytes)",
+                conversation_id, _SCENE_FILE, file_size,
+            )
+            self._load_blend_file(_SCENE_FILE)
+        else:
+            logger.warning(
+                "activate_scene: state says scene should reload but %s is missing "
+                "(conversation=%s) — resetting to clean scene",
+                _SCENE_FILE, conversation_id,
+            )
             self._reset_scene()
 
-        self._active_conversation_id = conversation_id
         self._active_epoch = current_epoch()
-        logger.info("Scene activation complete for conversation %s (loaded_from_blob=%s, epoch=%d)",
-                    conversation_id, loaded, self._active_epoch)
+        # Defense-in-depth: once we have activated the scene at least once
+        # in this process, subsequent turns within the same active VM must
+        # not be treated as "brand new" — even if a save somehow gets
+        # skipped, we want the next activation to fall through to the
+        # load-or-keep path rather than reset to clean.
+        was_new = self._new_scene
+        self._new_scene = False
+        logger.info(
+            "activate_scene complete (conversation=%s, was_new=%s, epoch=%d)",
+            conversation_id, was_new, self._active_epoch,
+        )
 
-    def save_scene(self, conversation_id: str) -> None:
-        """Save the current Blender scene to blob storage for the given conversation."""
-        local_path = _local_blend_path(conversation_id)
-        blob_name = _safe_blob_name(conversation_id)
-        logger.info("save_scene called for conversation %s (blob=%s, local=%s)",
-                    conversation_id, blob_name, local_path)
+    def save_scene(self, conversation_id: str | None = None) -> None:
+        """Save the current Blender scene to ``$HOME/blender_scenes/scene.blend``.
+
+        ``conversation_id`` is recorded in the state file for diagnostics
+        only — the scene file itself is not keyed by it.
+        """
+        logger.info(
+            "save_scene called (conversation=%s, target=%s)",
+            conversation_id, _SCENE_FILE,
+        )
 
         # ── Crash-corruption guard ──
-        # If Blender's connection epoch has bumped since we activated this
-        # conversation's scene, Blender was restarted by the supervisor mid-
-        # conversation. The current in-memory scene is therefore the empty
-        # default scene, NOT the user's work. Refuse to overwrite the blob.
+        # If Blender's connection epoch has bumped since we activated the
+        # scene, Blender was restarted by the supervisor mid-conversation.
+        # The current in-memory scene is therefore the empty default scene,
+        # NOT the user's work. Refuse to overwrite the saved file.
         live_epoch = current_epoch()
-        if (
-            self._active_conversation_id == conversation_id
-            and self._active_epoch is not None
-            and live_epoch != self._active_epoch
-        ):
+        if self._active_epoch is not None and live_epoch != self._active_epoch:
             logger.error(
-                "BLENDER_CRASH_DETECTED save_scene for %s aborted: connection epoch "
-                "changed (%s -> %s) since scene activation. Saved blob NOT overwritten "
+                "BLENDER_CRASH_DETECTED save_scene aborted: connection epoch changed "
+                "(%s -> %s) since scene activation. Saved file NOT overwritten "
                 "to preserve previous scene.",
-                conversation_id, self._active_epoch, live_epoch,
+                self._active_epoch, live_epoch,
             )
             return
 
         try:
-            logger.info("Saving Blender scene to local .blend file: %s", local_path)
-            self._save_blend_file(local_path)
-            file_size = os.path.getsize(local_path)
-            logger.info("Local .blend file saved: %s (%d bytes)", local_path, file_size)
+            self._save_blend_file(_SCENE_FILE)
+            file_size = os.path.getsize(_SCENE_FILE)
+            logger.info("Scene saved: %s (%d bytes)", _SCENE_FILE, file_size)
 
-            logger.info("Uploading .blend file to blob storage: %s", blob_name)
-            container = _get_blob_container()
-            blob_client = container.get_blob_client(blob_name)
-            with open(local_path, "rb") as f:
-                blob_client.upload_blob(
-                    f,
-                    overwrite=True,
-                    content_settings=ContentSettings(
-                        content_type="application/x-blender"
-                    ),
-                )
-            logger.info("Scene uploaded to blob successfully: %s (%d bytes)", blob_name, file_size)
-            # Track which conversation owns the current Blender state
-            self._active_conversation_id = conversation_id
+            self._mark_scene_used()
             self._active_epoch = current_epoch()
+
+            _write_session_state({
+                "needs_scene_reload": True,
+                "last_conversation_id": conversation_id,
+                "last_saved_at": _utc_now_iso(),
+            })
         except Exception:
-            logger.error("Failed to save scene for conversation %s (blob=%s)",
-                         conversation_id, blob_name, exc_info=True)
+            logger.error("Failed to save scene (conversation=%s)", conversation_id, exc_info=True)
 
     def reset_to_clean(self) -> None:
-        """Reset Blender to a clean scene and clear the active conversation."""
-        logger.info("reset_to_clean: clearing active conversation %s", self._active_conversation_id)
+        """Reset Blender to a clean scene. Used by crash-recovery paths."""
+        logger.info("reset_to_clean: resetting Blender scene")
         self._reset_scene()
-        self._active_conversation_id = None
         self._active_epoch = None
 
-    def reload_scene_from_blob(self, conversation_id: str) -> bool:
-        """Force-reload the conversation's scene from blob storage.
+    def reload_scene(self, conversation_id: str | None = None) -> bool:
+        """Force-reload the persisted scene from $HOME.
 
-        Used to recover from a Blender process crash mid-conversation. Unlike
-        activate_scene(), this:
-          - bypasses the "already active, skip" early-return,
-          - does NOT save any previous in-memory scene (it is presumed lost),
-          - falls back to a clean reset if no blob exists.
+        Used to recover from a Blender process crash mid-conversation.
+        Unlike ``activate_scene()`` this bypasses the ``new_scene`` flag and
+        always tries the on-disk file first. Falls back to a clean reset if
+        the file is missing.
 
-        Returns True if a saved blob was successfully loaded, False otherwise.
+        Returns True if a saved scene was loaded, False otherwise.
         """
-        local_path = _local_blend_path(conversation_id)
-        blob_name = _safe_blob_name(conversation_id)
-        logger.info("reload_scene_from_blob: conversation=%s blob=%s", conversation_id, blob_name)
-
         loaded = False
-        try:
-            container = _get_blob_container()
-            blob_client = container.get_blob_client(blob_name)
-            with open(local_path, "wb") as f:
-                stream = blob_client.download_blob()
-                stream.readinto(f)
-            logger.info("reload_scene_from_blob: downloaded %s (%d bytes)",
-                        blob_name, os.path.getsize(local_path))
+        if os.path.exists(_SCENE_FILE):
+            file_size = os.path.getsize(_SCENE_FILE)
+            logger.info(
+                "reload_scene: loading %s (%d bytes, conversation=%s)",
+                _SCENE_FILE, file_size, conversation_id,
+            )
+            self._load_blend_file(_SCENE_FILE)
             loaded = True
-        except Exception as e:
-            logger.warning("reload_scene_from_blob: no saved scene for %s (%s); resetting",
-                           conversation_id, e)
-
-        if loaded:
-            self._load_blend_file(local_path)
         else:
+            logger.warning(
+                "reload_scene: no saved scene at %s (conversation=%s) — resetting",
+                _SCENE_FILE, conversation_id,
+            )
             self._reset_scene()
 
-        self._active_conversation_id = conversation_id
         self._active_epoch = current_epoch()
-        logger.info("reload_scene_from_blob complete for %s (loaded=%s, epoch=%d)",
-                    conversation_id, loaded, self._active_epoch)
+        logger.info(
+            "reload_scene complete (conversation=%s, loaded=%s, epoch=%d)",
+            conversation_id, loaded, self._active_epoch,
+        )
         return loaded
+
+    # ── Blender-side operations ──
 
     def _load_blend_file(self, filepath: str) -> None:
         """Load a .blend file into Blender, replacing the current scene."""
-        # Use forward slashes and escape backslashes for the Python string
         safe_path = filepath.replace("\\", "/")
         code = f"""
 import bpy
@@ -252,8 +294,10 @@ print("Loaded scene from {safe_path}")
             blender.send_command("execute_code", {"code": code})
             logger.info("Loaded .blend file: %s", filepath)
         except Exception:
-            logger.error("Failed to load .blend file %s, falling back to scene reset",
-                         filepath, exc_info=True)
+            logger.error(
+                "Failed to load .blend file %s, falling back to scene reset",
+                filepath, exc_info=True,
+            )
             self._reset_scene()
 
     def _save_blend_file(self, filepath: str) -> None:

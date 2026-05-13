@@ -25,9 +25,10 @@ DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9876
 
 # Retry configuration (overridable via environment variables)
-CONNECT_MAX_RETRIES = int(os.getenv("BLENDER_CONNECT_RETRIES", "5"))
+CONNECT_MAX_RETRIES = int(os.getenv("BLENDER_CONNECT_RETRIES", "10"))
 COMMAND_MAX_RETRIES = int(os.getenv("BLENDER_COMMAND_RETRIES", "3"))
 RETRY_BACKOFF_BASE = float(os.getenv("BLENDER_RETRY_BACKOFF", "1.0"))
+RETRY_BACKOFF_MAX = float(os.getenv("BLENDER_RETRY_BACKOFF_MAX", "10.0"))
 
 # Transient errors that warrant a retry
 _TRANSIENT_ERRORS = (ConnectionError, BrokenPipeError, ConnectionResetError, socket.timeout, OSError)
@@ -320,15 +321,18 @@ def get_blender_connection() -> BlenderConnection:
                 )
                 return _blender_connection
 
-            # Connection failed — check if Blender is even running
+            # Connection failed — check if Blender is even running.
+            # During startup (agent server starts before Blender), the process
+            # may not exist yet. Log a warning but DON'T abort — the supervisor
+            # background loop will start Blender shortly.
             if not _is_blender_alive():
-                logger.error("Blender process is not running — aborting connection attempts")
-                raise Exception(
-                    "Blender process is not running. Cannot establish connection."
+                logger.warning(
+                    "Blender process not found (attempt %d/%d) — supervisor may still be starting it",
+                    attempt, CONNECT_MAX_RETRIES,
                 )
 
             if attempt < CONNECT_MAX_RETRIES:
-                delay = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                delay = min(RETRY_BACKOFF_BASE * (2 ** (attempt - 1)), RETRY_BACKOFF_MAX)
                 logger.warning(
                     "Connection attempt %d/%d failed, retrying in %.1fs…",
                     attempt, CONNECT_MAX_RETRIES, delay,
@@ -348,3 +352,26 @@ def close_blender_connection():
         _blender_connection.disconnect()
         _blender_connection = None
         logger.debug("Blender connection closed")
+
+
+def is_blender_socket_ready(timeout: float = 1.0) -> bool:
+    """Quick non-retrying probe to check whether Blender's socket is reachable.
+
+    Used by the middleware to distinguish "active mode" (Blender already running,
+    proceed normally) from "recovering from idle" (Blender not yet up, must wait
+    and tell the user). Does NOT touch the singleton connection.
+    """
+    host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
+    port = int(os.getenv("BLENDER_PORT", str(DEFAULT_PORT)))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((host, port))
+        return True
+    except (OSError, socket.timeout):
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass

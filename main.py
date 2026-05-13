@@ -36,7 +36,7 @@ from azure.identity.aio import DefaultAzureCredential
 from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSettings, generate_blob_sas
 
-from blender_connection import get_blender_connection, close_blender_connection
+from blender_connection import get_blender_connection, close_blender_connection, is_blender_socket_ready
 from scene_manager import SceneManager
 
 # Module-level reference so _do_render can recover the scene after a Blender crash.
@@ -59,6 +59,22 @@ if not logger.handlers:
     logger.addHandler(_stdout_handler)
     logger.addHandler(_stderr_handler)
 
+    # Persistent file log to $HOME/logs/ — survives idle deprovision/reprovision
+    # so we can troubleshoot session-restore failures after the fact.
+    _persistent_log_dir = os.path.join(os.path.expanduser("~"), "logs")
+    os.makedirs(_persistent_log_dir, exist_ok=True)
+    _persistent_log_path = os.path.join(_persistent_log_dir, "agent.log")
+    from logging.handlers import RotatingFileHandler
+    _file_handler = RotatingFileHandler(
+        _persistent_log_path, maxBytes=5 * 1024 * 1024, backupCount=3
+    )
+    _file_handler.setLevel(logging.DEBUG)
+    _file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%dT%H:%M:%S"
+    ))
+    logger.addHandler(_file_handler)
+    logger.info("Persistent log file: %s", _persistent_log_path)
+
 # Suppress harmless "Failed to detach context" errors from the framework's
 # internal OpenTelemetry instrumentation (async generator context mismatch).
 logging.getLogger("opentelemetry.context").setLevel(logging.CRITICAL)
@@ -72,6 +88,12 @@ PROJECT_ENDPOINT = os.getenv("PROJECT_ENDPOINT")
 # to fail loudly rather than silently target somebody else's storage account.
 AZURE_STORAGE_ACCOUNT_NAME = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME")
 BLOB_CONTAINER_NAME = "screenshots"
+
+# Persistent temp directory under $HOME — survives idle deprovision/reprovision.
+# Used for screenshots, renders, and other transient files. Useful for
+# post-mortem debugging (the most recent render is still on disk after restore).
+_PERSISTENT_TMP = os.path.join(os.path.expanduser("~"), "tmp")
+os.makedirs(_PERSISTENT_TMP, exist_ok=True)
 
 logger.info(
     "Storage config: AZURE_STORAGE_ACCOUNT_NAME=%r (env_set=%s)",
@@ -261,10 +283,12 @@ _FRIENDLY_TIMEOUT_TEXT = (
 # Crash detection & recovery helpers
 # ──────────────────────────────────────────────
 
-# Per-conversation crash counter — circuit breaker to avoid retry storms
-# when Blender keeps crashing on the same input (e.g. a problematic asset).
-_MAX_CRASHES_PER_CONVERSATION = 2
-_crash_counts: dict[str, int] = {}
+# Crash counter — circuit breaker to avoid retry storms when Blender keeps
+# crashing on the same input (e.g. a problematic asset). On Foundry's ADC
+# platform each agent runs in its own micro-VM bound 1:1 to a conversation,
+# so a single counter is sufficient.
+_MAX_CRASHES = 2
+_crash_count: int = 0
 
 
 def _is_blender_crash_error(err: Exception) -> bool:
@@ -283,53 +307,45 @@ def _is_blender_crash_error(err: Exception) -> bool:
     )
 
 
-def _recover_blender_scene(label: str) -> tuple[bool, str | None]:
-    """Wait for Blender to come back and reload the active conversation's scene.
+def _recover_blender_scene(label: str) -> bool:
+    """Wait for Blender to come back and reload the persisted scene.
 
-    Returns (recovered, conversation_id_or_None). If recovered is False, the
-    caller should surface a friendly error to the LLM/user.
+    Returns True on successful recovery. Caller should surface a friendly
+    error to the LLM/user on False.
     """
+    global _crash_count
     logger.error("BLENDER_CRASH_DETECTED in %s — attempting recovery", label)
 
     if _scene_manager is None:
         logger.error("%s: scene manager not initialized — cannot recover", label)
-        return (False, None)
-
-    conversation_id = _scene_manager._active_conversation_id
-    if conversation_id is None:
-        logger.warning("%s: no active conversation id — cannot reload scene", label)
-        # Still wait for Blender so subsequent calls don't pile up failures.
-        recovered = _wait_for_blender(timeout=60)
-        return (recovered, None)
+        return False
 
     # Circuit breaker
-    count = _crash_counts.get(conversation_id, 0) + 1
-    _crash_counts[conversation_id] = count
-    if count > _MAX_CRASHES_PER_CONVERSATION:
+    _crash_count += 1
+    if _crash_count > _MAX_CRASHES:
         logger.error(
-            "%s: conversation %s exceeded %d crashes — circuit breaker tripped",
-            label, conversation_id, _MAX_CRASHES_PER_CONVERSATION,
+            "%s: exceeded %d crashes — circuit breaker tripped",
+            label, _MAX_CRASHES,
         )
-        return (False, conversation_id)
+        return False
 
     if not _wait_for_blender(timeout=60):
-        return (False, conversation_id)
+        return False
 
     try:
-        _scene_manager.reload_scene_from_blob(conversation_id)
-        logger.info("%s: scene reloaded for conversation %s after crash", label, conversation_id)
-        return (True, conversation_id)
+        _scene_manager.reload_scene()
+        logger.info("%s: scene reloaded after crash", label)
+        return True
     except Exception:
         logger.error("%s: failed to reload scene after crash", label, exc_info=True)
-        return (False, conversation_id)
+        return False
 
 
-def _crash_user_message(label: str, conversation_id: str | None, original: Exception) -> str:
+def _crash_user_message(label: str, original: Exception) -> str:
     """Build an actionable error string for the LLM when Blender crashed."""
-    count = _crash_counts.get(conversation_id, 0) if conversation_id else 0
-    if count > _MAX_CRASHES_PER_CONVERSATION:
+    if _crash_count > _MAX_CRASHES:
         return (
-            f"Blender has crashed {count} times in this conversation and the safety "
+            f"Blender has crashed {_crash_count} times in this conversation and the safety "
             f"circuit breaker has been tripped. Please ask the user to start a new "
             f"conversation. Last error from {label}: {original}"
         )
@@ -809,9 +825,9 @@ def execute_blender_code(
     except Exception as e:
         if _is_blender_crash_error(e):
             logger.error("execute_blender_code: Blender crashed", exc_info=True)
-            recovered, conv_id = _recover_blender_scene("execute_blender_code")
+            recovered = _recover_blender_scene("execute_blender_code")
             if recovered:
-                return _crash_user_message("execute_blender_code", conv_id, e)
+                return _crash_user_message("execute_blender_code", e)
             return (
                 f"Blender crashed while executing code and could not recover. "
                 f"Please ask the user to retry. Original error: {e}"
@@ -839,34 +855,31 @@ def get_viewport_screenshot(
     logger.info("Tool called: get_viewport_screenshot(max_size=%d)", max_size)
     try:
         blender = get_blender_connection()
-        temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(
-            temp_dir, f"blender_screenshot_{os.getpid()}.png"
-        )
+        # Unique timestamped filename — kept in $HOME/tmp AND uploaded to blob
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        unique_name = f"screenshot_{timestamp}_{uuid.uuid4().hex[:8]}.png"
+        local_path = os.path.join(_PERSISTENT_TMP, unique_name)
 
         result = blender.send_command(
             "get_viewport_screenshot",
-            {"max_size": max_size, "filepath": temp_path, "format": "png"},
+            {"max_size": max_size, "filepath": local_path, "format": "png"},
         )
 
         if "error" in result:
             return f"Screenshot error: {result['error']}"
 
-        if not os.path.exists(temp_path):
+        if not os.path.exists(local_path):
             return "Error: Screenshot file was not created"
 
-        with open(temp_path, "rb") as f:
+        with open(local_path, "rb") as f:
             image_bytes = f.read()
 
-        os.remove(temp_path)
-
-        # Upload to Azure Blob Storage and return URL
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        blob_name = f"screenshot_{timestamp}_{uuid.uuid4().hex[:8]}.png"
-        blob_url = upload_image_to_blob(image_bytes, blob_name)
+        # Upload to Azure Blob Storage and return URL (local copy stays in $HOME/tmp)
+        blob_url = upload_image_to_blob(image_bytes, unique_name)
         width = result.get('width', '?')
         height = result.get('height', '?')
-        logger.info("get_viewport_screenshot succeeded: %sx%s, uploaded to blob", width, height)
+        logger.info("get_viewport_screenshot succeeded: %sx%s, saved to %s and uploaded to blob",
+                    width, height, local_path)
         return f"Screenshot captured ({width}x{height} pixels).\nInclude the following image link in your response exactly as-is:\n\n![screenshot]({blob_url})"
     except Exception as e:
         logger.error("get_viewport_screenshot failed", exc_info=True)
@@ -993,11 +1006,11 @@ def download_polyhaven_asset(
     except Exception as e:
         logger.error("download_polyhaven_asset failed for %r", asset_id, exc_info=True)
         if _is_blender_crash_error(e):
-            recovered, conv_id = _recover_blender_scene("download_polyhaven_asset")
+            recovered = _recover_blender_scene("download_polyhaven_asset")
             if recovered:
                 return _crash_user_message(
                     f"download_polyhaven_asset(id={asset_id!r}, res={resolution!r})",
-                    conv_id, e,
+                    e,
                 )
             return (
                 f"Blender crashed while importing '{asset_id}' and could not recover. "
@@ -1174,7 +1187,6 @@ print("Added ground plane")
 
 def _do_render(
     label: str,
-    output_path: str,
     resolution_x: int,
     resolution_y: int,
     samples: int,
@@ -1182,19 +1194,25 @@ def _do_render(
 ) -> str:
     """Shared render helper used by render_preview and render_final.
 
-    Includes a recovery mechanism: if the Blender connection drops (e.g.
-    Blender crashes mid-render), waits for the supervisor to restart it,
-    reloads the conversation's scene from blob storage, and retries once.
+    Generates a unique timestamped output path in $HOME/tmp, keeps the local
+    file after upload. Includes a recovery mechanism: if the Blender connection
+    drops (e.g. Blender crashes mid-render), waits for the supervisor to restart
+    it, reloads the conversation's scene, and retries once.
     """
-    logger.info("%s: rendering %dx%d, samples=%d, engine=%r",
-                label, resolution_x, resolution_y, samples, engine)
+    # Generate unique timestamped output path — kept in $HOME/tmp AND uploaded to blob
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    unique_name = f"{label}_{timestamp}_{uuid.uuid4().hex[:8]}.png"
+    render_path = os.path.join(_PERSISTENT_TMP, unique_name)
+
+    logger.info("%s: rendering %dx%d, samples=%d, engine=%r, output=%s",
+                label, resolution_x, resolution_y, samples, engine, render_path)
     code = f"""
 import bpy
 
 bpy.context.scene.render.engine = '{engine}'
 bpy.context.scene.render.resolution_x = {resolution_x}
 bpy.context.scene.render.resolution_y = {resolution_y}
-bpy.context.scene.render.filepath = '{output_path}'
+bpy.context.scene.render.filepath = '{render_path}'
 bpy.context.scene.render.image_settings.file_format = 'PNG'
 
 if '{engine}' == 'CYCLES':
@@ -1202,7 +1220,7 @@ if '{engine}' == 'CYCLES':
     bpy.context.scene.cycles.device = 'CPU'
 
 bpy.ops.render.render(write_still=True)
-print("Render complete: {output_path}")
+print("Render complete: {render_path}")
 """
     max_attempts = 2  # first try + one recovery retry
     for attempt in range(1, max_attempts + 1):
@@ -1210,16 +1228,16 @@ print("Render complete: {output_path}")
             blender = get_blender_connection()
             result = blender.send_command("execute_code", {"code": code})
 
-            if os.path.exists(output_path):
-                with open(output_path, "rb") as f:
+            if os.path.exists(render_path):
+                with open(render_path, "rb") as f:
                     image_bytes = f.read()
-                timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-                blob_name = f"{label}_{timestamp}_{uuid.uuid4().hex[:8]}.png"
-                blob_url = upload_image_to_blob(image_bytes, blob_name)
-                logger.info("%s succeeded: %dx%d, uploaded to blob", label, resolution_x, resolution_y)
+                # Upload to blob (local copy stays in $HOME/tmp)
+                blob_url = upload_image_to_blob(image_bytes, unique_name)
+                logger.info("%s succeeded: %dx%d, saved to %s and uploaded to blob",
+                            label, resolution_x, resolution_y, render_path)
                 return f"Render complete ({resolution_x}x{resolution_y}).\nInclude the following image link in your response exactly as-is:\n\n![{label}]({blob_url})"
             else:
-                logger.warning("%s: output file not found at %r", label, output_path)
+                logger.warning("%s: output file not found at %r", label, render_path)
                 return f"Render command executed but output file not found. {result.get('result', '')}"
 
         except Exception as e:
@@ -1234,17 +1252,14 @@ print("Render complete: {output_path}")
             if not recovered:
                 return f"Error rendering: Blender did not recover after crash. {e}"
 
-            # Reload the conversation scene into the fresh Blender instance
-            conversation_id = _scene_manager._active_conversation_id if _scene_manager else None
-            if conversation_id and _scene_manager:
+            # Reload the scene into the fresh Blender instance
+            if _scene_manager:
                 try:
-                    logger.info("%s: reloading scene for conversation %s", label, conversation_id)
-                    _scene_manager.activate_scene(conversation_id)
+                    logger.info("%s: reloading scene after Blender restart", label)
+                    _scene_manager.activate_scene()
                 except Exception as restore_err:
                     logger.error("%s: failed to restore scene after recovery: %s", label, restore_err)
                     return f"Error rendering: Blender recovered but scene restore failed. {restore_err}"
-            else:
-                logger.warning("%s: no active conversation id — rendering on clean scene", label)
 
             logger.info("%s: recovery complete, retrying render…", label)
 
@@ -1267,9 +1282,6 @@ def _wait_for_blender(timeout: int = 60) -> bool:
 
 
 def render_preview(
-    output_path: Annotated[
-        str, "Output file path for the preview render"
-    ] = "/tmp/preview.png",
     resolution_x: Annotated[int, "Preview width in pixels"] = 960,
     resolution_y: Annotated[int, "Preview height in pixels"] = 540,
     samples: Annotated[int, "Number of preview samples (keep low for speed)"] = 16,
@@ -1279,13 +1291,10 @@ def render_preview(
     Fast low-resolution preview render. Use this FIRST so the user can see a
     quick result before committing to a full-quality render.
     """
-    return _do_render("preview", output_path, resolution_x, resolution_y, samples, engine)
+    return _do_render("preview", resolution_x, resolution_y, samples, engine)
 
 
 def render_final(
-    output_path: Annotated[
-        str, "Output file path for the final render"
-    ] = "/tmp/render.png",
     resolution_x: Annotated[int, "Render width in pixels"] = 640,
     resolution_y: Annotated[int, "Render height in pixels"] = 480,
     samples: Annotated[int, "Number of render samples (higher = better quality)"] = 32,
@@ -1297,7 +1306,7 @@ def render_final(
     640x480 preview, return it, and ask the user to confirm before
     proceeding with the full resolution at 256 samples.
     """
-    return _do_render("render", output_path, resolution_x, resolution_y, samples, engine)
+    return _do_render("render", resolution_x, resolution_y, samples, engine)
 
 
 # ──────────────────────────────────────────────
@@ -1657,23 +1666,31 @@ class SceneIsolationMiddleware(AgentMiddleware):
     def _get_conversation_id(context: AgentContext) -> str | None:
         """Resolve a stable conversation/scene id for this turn.
 
-        Lookup order:
-          1. `context.session.session_id` — set when the agent runtime created
-             an AgentSession (e.g. local agentdev with `agent_session_id` in
-             the request body, or Agent Inspector mode).
-          2. `context.options["user"]` / `context.options["metadata"]` —
-             populated by the WebChat proxy in Foundry mode, where the
-             Foundry-internal `agent_session_id` does NOT propagate to
-             AgentSession.
-          3. `context.kwargs["user"]` / `context.kwargs["metadata"]` —
-             same fields if the runtime routed them differently.
-          4. None — caller will skip activation/save and emit a warning.
+        Lookup order (most-stable first — IMPORTANT for idle/restore
+        survival; ``context.session.session_id`` is REGENERATED on every
+        container restart because ``InMemoryAgentSessionRepository`` is
+        wiped, so it must NOT be the primary key):
+
+          1. Stable Foundry ``conv_xxx`` id discovered on
+             ``context.session`` / ``context.agent`` (see
+             ``_scan_for_stable_conv_id``). Survives idle/restore.
+          2. ``context.options["user"]`` / ``context.options["metadata"]``
+             — populated by the WebChat proxy from the client's
+             localStorage-persisted ``conversationId``. Also stable.
+          3. ``context.kwargs["user"]`` / ``context.kwargs["metadata"]``
+             — same fields routed via kwargs in some runtime modes.
+          4. ``agent._request_headers["conversation_id"]`` — Foundry
+             adapter mirror of the body metadata.
+          5. ``context.session.session_id`` — LAST resort; volatile.
+          6. None — caller skips activation/save and emits a warning.
         """
-        session = context.session
-        if session is not None:
-            sid = getattr(session, "session_id", None)
-            if sid:
-                return sid
+        stable_val, stable_src = SceneIsolationMiddleware._scan_for_stable_conv_id(context)
+        if stable_val:
+            logger.info(
+                "Scene isolation: resolved conversation id from %s (stable=True): %s",
+                stable_src, stable_val,
+            )
+            return stable_val
 
         # Fallback 1: WebChat proxy sends `user: <conversationId>` and
         # `metadata: { conversation_id }`. These typically arrive on
@@ -1721,6 +1738,21 @@ class SceneIsolationMiddleware(AgentMiddleware):
                 )
                 return cid
 
+        # LAST RESORT: volatile in-memory AgentSession id. This is wiped on
+        # container restart, so scenes keyed by this id are orphaned on
+        # idle/restore. The orphan-adoption logic in the ACTIVATE block
+        # rescues them when possible.
+        session = context.session
+        if session is not None:
+            sid = getattr(session, "session_id", None)
+            if isinstance(sid, str) and sid:
+                logger.warning(
+                    "Scene isolation: falling back to volatile session.session_id=%s "
+                    "(no stable id found — scene may be lost on idle/restore)",
+                    sid,
+                )
+                return sid
+
         return None
 
     @staticmethod
@@ -1751,6 +1783,94 @@ class SceneIsolationMiddleware(AgentMiddleware):
         except Exception as e:  # pragma: no cover - diagnostic best-effort
             logger.warning("Scene isolation diagnostic failed: %s", e)
 
+    @staticmethod
+    def _scan_for_stable_conv_id(context: AgentContext) -> tuple[str | None, str | None]:
+        """Look for a stable Foundry conversation id on context.
+
+        The Foundry agentserver logs ``Saved agent session for conversation:
+        conv_<...>`` after each turn — that id is stable across container
+        restarts (it's the OpenAI-style Responses conversation id), unlike
+        ``AgentSession.session_id`` which is wiped along with the
+        ``InMemoryAgentSessionRepository`` on idle.
+
+        Since the Foundry adapter is not in our codebase we don't know
+        exactly which attribute holds it, so this method probes a list of
+        likely locations on ``context.session`` and ``context.agent``,
+        returning ``(value, source_description)`` on first hit.
+        """
+        # Candidate attribute names, in priority order. Anything starting
+        # with ``conv_`` is by far the strongest signal.
+        candidate_attrs = (
+            "conversation_id",
+            "conv_id",
+            "service_thread_id",
+            "thread_id",
+            "agent_session_id",
+            "external_conversation_id",
+        )
+
+        def _scan_obj(obj: object, label: str) -> tuple[str | None, str | None]:
+            if obj is None:
+                return (None, None)
+            # 1) explicit attribute lookups
+            for name in candidate_attrs:
+                try:
+                    val = getattr(obj, name, None)
+                except Exception:
+                    val = None
+                if isinstance(val, str) and val:
+                    return (val, f"{label}.{name}")
+            # 2) scan vars()/__dict__ for any string starting with 'conv_'
+            try:
+                d = vars(obj)
+            except TypeError:
+                d = {}
+            for k, v in d.items():
+                if isinstance(v, str) and v.startswith("conv_"):
+                    return (v, f"{label}.{k}")
+            return (None, None)
+
+        for label, target in (
+            ("session", context.session),
+            ("session.thread", getattr(context.session, "thread", None) if context.session else None),
+            ("agent", getattr(context, "agent", None)),
+        ):
+            val, src = _scan_obj(target, label)
+            if val:
+                return (val, src)
+        return (None, None)
+
+    @staticmethod
+    def _dump_stable_id_search_once(context: AgentContext) -> None:
+        """Log every attribute on session/agent — used to discover where
+        Foundry exposes the stable conv_xxx id when we still can't find it."""
+        if getattr(SceneIsolationMiddleware._dump_stable_id_search_once, "_done", False):
+            return
+        SceneIsolationMiddleware._dump_stable_id_search_once._done = True  # type: ignore[attr-defined]
+        try:
+            for label, target in (
+                ("session", context.session),
+                ("agent", getattr(context, "agent", None)),
+            ):
+                if target is None:
+                    continue
+                try:
+                    d = vars(target)
+                except TypeError:
+                    d = {}
+                # Truncate values to keep log readable.
+                preview = {
+                    k: (repr(v)[:120] if not callable(v) else "<callable>")
+                    for k, v in d.items()
+                }
+                logger.info(
+                    "Scene isolation stable-id search: %s vars=%s, dir=%s",
+                    label, preview,
+                    [a for a in dir(target) if not a.startswith("_")][:40],
+                )
+        except Exception as e:  # pragma: no cover
+            logger.warning("Scene isolation stable-id search failed: %s", e)
+
     async def process(self, context: AgentContext, call_next) -> None:
         session = context.session
         logger.info(
@@ -1766,25 +1886,91 @@ class SceneIsolationMiddleware(AgentMiddleware):
             # First time we fail to resolve a session id, dump what's available
             # so we can diagnose how the Foundry runtime routes `user`/`metadata`.
             self._dump_context_keys_once(context)
-        if conversation_id:
-            logger.info("Scene isolation: activating scene for conversation %s", conversation_id)
-            await asyncio.to_thread(self._scene_manager.activate_scene, conversation_id)
-        else:
-            # First request for this conversation — no saved scene exists yet.
-            # Blender already has a clean scene or the previous scene for another
-            # conversation. We must save the OTHER conversation's scene (if any)
-            # and reset to a clean state.
-            prev = self._scene_manager._active_conversation_id
-            if prev:
+            # Also dump full session/agent attrs to discover where Foundry
+            # exposes a stable conv_xxx id (one-shot).
+            self._dump_stable_id_search_once(context)
+
+        # ── Active-vs-idle detection ──
+        # A quick non-retrying socket probe tells us whether Blender is already
+        # running (active mode → proceed transparently) or we are recovering
+        # from idle (Blender not yet up → must wait for the supervisor and
+        # inform the user via streamed status messages).
+        recovery_messages: list[str] = []
+        # Cold start = this is the very first boot of a fresh container.
+        # Blender naturally takes ~3s to come up; we shouldn't tell the user
+        # we're "recovering from idle" in that case.
+        is_cold_start = os.environ.get("BLENDER_COLD_START") == "1"
+        blender_ready_now = is_blender_socket_ready(timeout=1.0)
+        if not blender_ready_now:
+            if is_cold_start:
                 logger.info(
-                    "Scene isolation: new conversation (no thread id yet). "
-                    "Saving previous conversation %s and resetting scene.",
-                    prev,
+                    "Scene isolation: Blender socket not yet reachable on cold "
+                    "start — waiting for initial boot (no user-facing recovery message)"
                 )
-                await asyncio.to_thread(self._scene_manager.save_scene, prev)
-                await asyncio.to_thread(self._scene_manager.reset_to_clean)
             else:
-                logger.info("Scene isolation: no thread id yet, keeping current scene.")
+                logger.info(
+                    "Scene isolation: Blender socket not reachable — recovering from idle"
+                )
+                recovery_messages.append(
+                    "🔄 The Blender engine is restarting after being paused. "
+                    "Please hold on while the supervisor brings it back up…"
+                )
+        else:
+            logger.info("Scene isolation: Blender socket reachable — active mode")
+
+        # ── Build user-facing status message describing what we will do with
+        # the scene, BEFORE we touch it.
+        # On Foundry's ADC platform each agent runs in a micro-VM bound 1:1
+        # to a conversation. There is therefore at most one persisted scene
+        # per container lifetime; either it exists (resume) or it doesn't
+        # (fresh container).
+        is_brand_new = self._scene_manager.new_scene
+        has_local = self._scene_manager.has_saved_scene()
+        if is_brand_new:
+            recovery_messages.append(
+                "🆕 First time using the agent in this session — setting up a fresh Blender scene for you."
+            )
+        elif has_local:
+            recovery_messages.append(
+                "📂 Found your previous Blender scene — restoring it now."
+            )
+        else:
+            # Resumed container marker says we should reload, but no .blend
+            # is on disk (unexpected — log already emitted by SceneManager).
+            recovery_messages.append(
+                "🆕 No previous scene found — starting from a clean scene."
+            )
+
+        # If we were recovering from idle, wait for Blender BEFORE attempting
+        # to activate the scene (otherwise activate_scene → _load_blend_file
+        # will fail and we will fall back to a clean scene, losing the user's
+        # work).
+        if not blender_ready_now:
+            recovered = await asyncio.to_thread(_wait_for_blender, 120)
+            if recovered:
+                if not is_cold_start:
+                    recovery_messages.append("✅ Blender is ready — loading your scene…")
+                await asyncio.to_thread(self._scene_manager.set_blender_ready, True)
+            else:
+                recovery_messages.append(
+                    "⚠️ Blender did not come back online in time. I'll try to continue, "
+                    "but some tools may fail — please retry shortly if you see errors."
+                )
+
+        # Activate the scene (load persisted .blend or reset to clean).
+        # conversation_id is passed for logging/diagnostics only — the
+        # scene file is not keyed by it (single scene per micro-VM).
+        logger.info(
+            "Scene isolation: activating scene (conversation=%s)", conversation_id,
+        )
+        await asyncio.to_thread(self._scene_manager.activate_scene, conversation_id)
+
+        # If Blender was already up at the start of this turn, ensure the
+        # session-state file reflects that (entrypoint.sh writes blender_ready
+        # =false on startup, but by the time the first request lands Blender
+        # may already be up).
+        if blender_ready_now:
+            await asyncio.to_thread(self._scene_manager.set_blender_ready, True)
 
         # ── RUN the agent (inner middleware → actual LLM + tools) ──
         await self._inner.process(context, call_next)
@@ -1797,42 +1983,45 @@ class SceneIsolationMiddleware(AgentMiddleware):
             original_stream = context.result
 
             async def _save_after_stream():
+                # ── Stream recovery / status messages FIRST ──
+                # Surface idle-recovery and scene-restoration status to the
+                # user before any model output, so they understand the wait
+                # and know what the agent is doing.
+                for idx, msg in enumerate(recovery_messages):
+                    yield AgentResponseUpdate(
+                        contents=[Content.from_text(f"\n\n*{msg}*\n\n")],
+                        role="assistant",
+                        message_id=f"scene-status-{idx}",
+                    )
                 try:
                     async for update in original_stream:
                         yield update
                 finally:
-                    # By now the framework has finished streaming and has called
-                    # _update_thread_with_type_and_conversation_id, so the thread
-                    # object has service_thread_id set (even on the first request).
+                    # Resolve the conversation id (for telemetry / state-file
+                    # diagnostics only — the scene file itself is no longer
+                    # keyed by it). Save unconditionally: under the single-
+                    # scene-per-VM model, every turn's result IS the state
+                    # we need to recover from on the next idle resume.
                     save_id = self._get_conversation_id(context)
                     logger.info(
-                        "Scene isolation: stream ended. session_id=%r",
+                        "Scene isolation: stream ended (conversation=%r) — saving scene",
                         save_id,
                     )
-                    if save_id:
-                        try:
-                            await asyncio.to_thread(self._scene_manager.save_scene, save_id)
-                            logger.info("Scene isolation: scene saved for conversation %s", save_id)
-                        except Exception:
-                            logger.error(
-                                "Scene isolation: failed to save scene for conversation %s",
-                                save_id, exc_info=True,
-                            )
-                    else:
-                        logger.warning(
-                            "Scene isolation: stream ended but no session_id "
-                            "(first request for new conversation — scene stays in memory)."
+                    try:
+                        await asyncio.to_thread(self._scene_manager.save_scene, save_id)
+                        logger.info("Scene isolation: scene saved (conversation=%r)", save_id)
+                    except Exception:
+                        logger.error(
+                            "Scene isolation: failed to save scene (conversation=%r)",
+                            save_id, exc_info=True,
                         )
 
             context.result = ResponseStream(_save_after_stream(), finalizer=AgentResponse.from_updates)
         else:
             # Non-streaming: tools already ran, thread is updated.
             save_id = self._get_conversation_id(context)
-            if save_id:
-                logger.info("Scene isolation: saving scene (non-streaming) for conversation %s", save_id)
-                await asyncio.to_thread(self._scene_manager.save_scene, save_id)
-            else:
-                logger.warning("Scene isolation: non-streaming run ended but no session_id (first request).")
+            logger.info("Scene isolation: saving scene (non-streaming, conversation=%r)", save_id)
+            await asyncio.to_thread(self._scene_manager.save_scene, save_id)
 
 
 # ──────────────────────────────────────────────
