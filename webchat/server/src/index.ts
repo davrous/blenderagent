@@ -1,5 +1,7 @@
 import express from "express";
 import cors from "cors";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { config } from "./config.js";
 import { getBearerToken } from "./auth.js";
 import {
@@ -8,11 +10,29 @@ import {
   deleteSession,
 } from "./sessions.js";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(
   cors({
     origin: config.clientOrigin,
+  }),
+);
+
+/**
+ * Static assets shipped with the server (e.g. the HDR environment map used by
+ * the Babylon.js viewer to match Blender's PolyHaven world lighting).
+ *
+ * Mounted under `/api/assets` so the existing Vite dev proxy (`/api` →
+ * server) handles it transparently without extra config. Both `tsx src/index.ts`
+ * and the compiled `dist/index.js` resolve `../assets` to `webchat/server/assets`.
+ */
+app.use(
+  "/api/assets",
+  express.static(path.join(__dirname, "../assets"), {
+    maxAge: "1h",
+    fallthrough: false,
   }),
 );
 

@@ -1,9 +1,7 @@
 {
   "hostedAgentDeployOptions": {
     "dockerContextPath": "d:\\Code\\blenderagent",
-    "dockerfilePath": "d:\\Code\\blenderagent\\Dockerfile",
-    "cpu": "3.0",
-    "memory": "6.0Gi"
+    "dockerfilePath": "d:\\Code\\blenderagent\\Dockerfile"
   },
   "containerRegistry": "480af19projdefault343cacr.azurecr.io",
   "projectId": "ae1b9533-0623-40c6-b390-f4a8487bf8a0"
