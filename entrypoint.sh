@@ -7,10 +7,20 @@ echo "=== Blender Scene Agent - Starting up ==="
 # When ~/.azure is mounted as :ro, Azure CLI can't write logs/tokens.
 # Copy to a writable location and point AZURE_CONFIG_DIR there.
 if [ -d /root/.azure ] && ! touch /root/.azure/.writetest 2>/dev/null; then
-    echo "Detected read-only Azure config mount, copying to writable location..."
-    cp -r /root/.azure /tmp/.azure-writable
+    echo "Detected read-only Azure config mount, copying auth state to writable location..."
+    mkdir -p /tmp/.azure-writable
+    # Selective copy: only the files Azure CLI / azure-identity actually need
+    # for token reuse. Avoids the multi-minute `cp -r` over Docker Desktop's
+    # Windows↔Linux bind-mount bridge, which is very slow for the thousands of
+    # small files in ~/.azure/logs, ~/.azure/telemetry, ~/.azure/commands, etc.
+    for f in azureProfile.json clouds.config config \
+             msal_token_cache.bin msal_token_cache.json \
+             service_principal_entries.bin service_principal_entries.json \
+             AzureRmContext.json TokenCache.dat versionCheck.json; do
+        [ -e "/root/.azure/$f" ] && cp -p "/root/.azure/$f" "/tmp/.azure-writable/" 2>/dev/null || true
+    done
     export AZURE_CONFIG_DIR=/tmp/.azure-writable
-    echo "AZURE_CONFIG_DIR set to /tmp/.azure-writable"
+    echo "AZURE_CONFIG_DIR set to /tmp/.azure-writable (selective copy done)"
 else
     rm -f /root/.azure/.writetest 2>/dev/null
 fi

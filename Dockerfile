@@ -47,7 +47,9 @@ RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# `--pre` is required because agent-framework-foundry-hosting only ships
+# pre-release (alpha) versions today.
+RUN pip install --no-cache-dir --pre -r requirements.txt
 
 # ── 4. Copy application code ──
 COPY main.py .
