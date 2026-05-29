@@ -4,6 +4,6 @@
     "dockerfilePath": "d:\\Code\\blenderagent\\Dockerfile",
     "deploymentMethod": "container"
   },
-  "projectId": "ae1b9533-0623-40c6-b390-f4a8487bf8a0",
-  "containerRegistry": "480af19projdav343cacr.azurecr.io"
+  "containerRegistry": "480af19projdav343cacr.azurecr.io",
+  "projectId": "ae1b9533-0623-40c6-b390-f4a8487bf8a0"
 }
