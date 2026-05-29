@@ -28,9 +28,9 @@ from agent_framework import (
     AgentResponseUpdate,
     Content,
     ResponseStream,
+    tool,
 )
 from agent_framework.foundry import FoundryChatClient
-from agent_framework.observability import enable_instrumentation
 from agent_framework_foundry_hosting import ResponsesHostServer
 
 from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
@@ -364,6 +364,7 @@ def _crash_user_message(label: str, original: Exception) -> str:
 # ──────────────────────────────────────────────
 
 
+@tool(approval_mode="never_require")
 def get_scene_info() -> str:
     """
     Get detailed information about the current Blender scene including
@@ -394,6 +395,7 @@ def get_scene_info() -> str:
     return "Error getting scene info: exhausted retries"
 
 
+@tool(approval_mode="never_require")
 def get_object_info(
     object_name: Annotated[str, "The exact name of the Blender object to inspect"],
 ) -> str:
@@ -435,6 +437,7 @@ def get_object_info(
 # ──────────────────────────────────────────────
 
 
+@tool(approval_mode="never_require")
 def create_object(
     object_type: Annotated[
         str,
@@ -487,6 +490,7 @@ print(f"Created {{obj.name}} at ({{obj.location.x}}, {{obj.location.y}}, {{obj.l
         return f"Error creating object: {str(e)}"
 
 
+@tool(approval_mode="never_require")
 def modify_object(
     object_name: Annotated[str, "Name of the object to modify"],
     location_x: Annotated[float, "New X position (or current if unchanged)"] = None,
@@ -568,6 +572,7 @@ def modify_object(
         return f"Error modifying object: {str(e)}"
 
 
+@tool(approval_mode="never_require")
 def delete_object(
     object_name: Annotated[str, "Name of the object to delete"],
 ) -> str:
@@ -596,6 +601,7 @@ print("Deleted {object_name}")
 # ──────────────────────────────────────────────
 
 
+@tool(approval_mode="never_require")
 def apply_material(
     object_name: Annotated[str, "Name of the object to apply material to"],
     color_hex: Annotated[
@@ -745,6 +751,7 @@ def _enrich_error_context(error_msg: str, code: str) -> str:
     return "\n".join(parts)
 
 
+@tool(approval_mode="never_require")
 def execute_blender_code(
     code: Annotated[
         str,
@@ -841,6 +848,7 @@ def execute_blender_code(
 # ──────────────────────────────────────────────
 
 
+@tool(approval_mode="never_require")
 def get_viewport_screenshot(
     max_size: Annotated[
         int,
@@ -891,6 +899,7 @@ def get_viewport_screenshot(
 # ──────────────────────────────────────────────
 
 
+@tool(approval_mode="never_require")
 def search_polyhaven_assets(
     asset_type: Annotated[
         str,
@@ -952,6 +961,7 @@ def search_polyhaven_assets(
         return f"Error searching Poly Haven: {str(e)}"
 
 
+@tool(approval_mode="never_require")
 def download_polyhaven_asset(
     asset_id: Annotated[str, "The ID of the Poly Haven asset to download"],
     asset_type: Annotated[
@@ -1020,6 +1030,7 @@ def download_polyhaven_asset(
         return f"Error downloading asset: {str(e)}"
 
 
+@tool(approval_mode="never_require")
 def apply_polyhaven_texture(
     object_name: Annotated[str, "Name of the object to apply the texture to"],
     texture_id: Annotated[
@@ -1058,6 +1069,7 @@ def apply_polyhaven_texture(
 # ──────────────────────────────────────────────
 
 
+@tool(approval_mode="never_require")
 def setup_scene(
     clear_default: Annotated[
         bool,
@@ -1323,6 +1335,7 @@ def _wait_for_blender(timeout: int = 60) -> bool:
     return False
 
 
+@tool(approval_mode="never_require")
 def render_preview(
     resolution_x: Annotated[int, "Preview width in pixels"] = 960,
     resolution_y: Annotated[int, "Preview height in pixels"] = 540,
@@ -1336,6 +1349,7 @@ def render_preview(
     return _do_render("preview", resolution_x, resolution_y, samples, engine)
 
 
+@tool(approval_mode="never_require")
 def render_final(
     resolution_x: Annotated[int, "Render width in pixels"] = 640,
     resolution_y: Annotated[int, "Render height in pixels"] = 480,
@@ -1356,6 +1370,7 @@ def render_final(
 # ──────────────────────────────────────────────
 
 
+@tool(approval_mode="never_require")
 def save_scene_for_download() -> str:
     """
     Save the current Blender scene as a .blend file and upload it to cloud storage.
@@ -1396,6 +1411,7 @@ print("Saved scene to {safe_path}")
         return f"Error saving scene for download: {str(e)}"
 
 
+@tool(approval_mode="never_require")
 def export_scene_as_glb_for_download() -> str:
     """
     Export the current Blender scene as a binary glTF (.glb) file using Blender's
@@ -1509,87 +1525,51 @@ class ToolStatusMiddleware(AgentMiddleware):
             # Resilience state for this turn
             turn_started = asyncio.get_running_loop().time()
             chunks_seen = 0
-            heartbeat_idx = 0
             session_id = (
                 getattr(context.session, "session_id", None)
                 if context.session is not None
                 else None
             )
 
-            # Pump upstream chunks into a queue from a background task so we can
-            # interleave heartbeat messages without cancelling an in-flight HTTP
-            # read (which would leave the underlying stream in a broken state).
-            _SENTINEL_DONE = object()
-            queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+            # IMPORTANT — telemetry correctness:
+            # The upstream `original_stream` is the instrumented ResponseStream
+            # produced by `agent_framework.observability.AgentTelemetryLayer`. It
+            # owns the `invoke_agent` span and ends it from a cleanup hook
+            # (`_finalize_stream`) whose `finally` calls `ContextVar.reset(token)`
+            # on tokens that were `.set()` in *this* (the request handler's)
+            # context. `ContextVar.reset()` is context-identity-bound, so the
+            # stream MUST be iterated in this same context — NOT from a child
+            # `asyncio.create_task` (which always gets a fresh Context copy). If
+            # it were iterated from a background task, the reset would raise
+            # `ValueError: <Token …> was created in a different Context` *before*
+            # the span is ended, so the span would never be exported and the
+            # App Insights "Agents (preview)" pane (which filters on
+            # gen_ai.operation.name == invoke_agent) would stay empty. We
+            # therefore iterate it directly here.
+            #
+            # Because a directly-awaited `__anext__` cannot be raced against a
+            # timer without wrapping it in a task (which would re-break the
+            # context), the hard turn cap is enforced by a background watchdog
+            # that cancels this consumer only on a true hang. Per-tool status
+            # messages (emitted inline below on each function_call) provide the
+            # user-facing keep-alive during normal tool-execution gaps.
+            consumer_task = asyncio.current_task()
+            timed_out = False
 
-            async def _pump():
+            async def _watchdog():
+                nonlocal timed_out
                 try:
-                    async for upd in original_stream:
-                        await queue.put(("update", upd))
-                except ValueError as ex:
-                    # `agent_framework.observability._finalize_stream` registers a
-                    # cleanup hook that does `ContextVar.set(...)` → `Token.reset()`
-                    # on the wrapped stream. `Token.reset()` checks Context
-                    # *identity* (not equality), and `asyncio.create_task` ALWAYS
-                    # gives the child task a brand-new Context object — even when
-                    # we pass `context=copy_context()`. So whenever the upstream
-                    # stream is iterated from a background task, the cleanup hook
-                    # raises `ValueError: <Token …> was created in a different
-                    # Context` *after* `StopAsyncIteration` (i.e. after all stream
-                    # data has already been delivered). It is purely a telemetry-
-                    # cleanup artefact and must NOT be surfaced as a stream error
-                    # (which the user would otherwise see as the "transient error"
-                    # banner at end of every turn). Treat as a clean end-of-stream.
-                    if "different Context" in str(ex):
-                        logger.debug(
-                            "Ignoring observability cleanup error after stream end: %s", ex
-                        )
-                        await queue.put(("done", _SENTINEL_DONE))
-                    else:
-                        await queue.put(("error", ex))
-                except BaseException as ex:  # noqa: BLE001 — propagate to consumer
-                    await queue.put(("error", ex))
-                else:
-                    await queue.put(("done", _SENTINEL_DONE))
-
-            pump_task = asyncio.create_task(_pump())
-
-            async def _drain_pump():
-                if not pump_task.done():
-                    pump_task.cancel()
-                try:
-                    await pump_task
-                except (asyncio.CancelledError, Exception):
+                    await asyncio.sleep(TURN_TIMEOUT_SECONDS)
+                    timed_out = True
+                    if consumer_task is not None:
+                        consumer_task.cancel()
+                except asyncio.CancelledError:
                     pass
 
-            try:
-                while True:
-                    elapsed = asyncio.get_running_loop().time() - turn_started
-                    remaining = TURN_TIMEOUT_SECONDS - elapsed
-                    if remaining <= 0:
-                        raise asyncio.TimeoutError("turn wall-clock cap exceeded")
-                    wait_for = min(HEARTBEAT_INTERVAL_SECONDS, remaining)
-                    try:
-                        kind, payload = await asyncio.wait_for(
-                            queue.get(), timeout=wait_for
-                        )
-                    except asyncio.TimeoutError:
-                        if (asyncio.get_running_loop().time() - turn_started) >= TURN_TIMEOUT_SECONDS:
-                            raise asyncio.TimeoutError("turn wall-clock cap exceeded")
-                        heartbeat_idx += 1
-                        yield AgentResponseUpdate(
-                            contents=[Content.from_text("\n\n*Still working…*\n\n")],
-                            role="assistant",
-                            message_id=f"heartbeat-{heartbeat_idx}",
-                        )
-                        continue
+            watchdog_task = asyncio.create_task(_watchdog())
 
-                    if kind == "done":
-                        break
-                    if kind == "error":
-                        raise payload
-                    # kind == "update"
-                    update = payload
+            try:
+                async for update in original_stream:
                     chunks_seen += 1
                     for content in (update.contents or []):
                         # ── Status messages before each tool call ──
@@ -1647,7 +1627,10 @@ class ToolStatusMiddleware(AgentMiddleware):
                                     )
 
                     yield update
-            except asyncio.TimeoutError:
+            except asyncio.CancelledError:
+                if not timed_out:
+                    # Genuine external cancellation — propagate untouched.
+                    raise
                 elapsed_ms = int(
                     (asyncio.get_running_loop().time() - turn_started) * 1000
                 )
@@ -1661,8 +1644,9 @@ class ToolStatusMiddleware(AgentMiddleware):
                     role="assistant",
                     message_id="agent-turn-timeout",
                 )
-                # Re-raise so server-side telemetry records the failure.
-                raise
+                # Surface as a turn timeout so server-side telemetry records the
+                # failure and the framework's normal error path runs.
+                raise asyncio.TimeoutError("turn wall-clock cap exceeded")
             except Exception as exc:
                 elapsed_ms = int(
                     (asyncio.get_running_loop().time() - turn_started) * 1000
@@ -1691,7 +1675,12 @@ class ToolStatusMiddleware(AgentMiddleware):
                 # the framework's normal error path runs.
                 raise
             finally:
-                await _drain_pump()
+                if not watchdog_task.done():
+                    watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         context.result = ResponseStream(_wrapped(), finalizer=AgentResponse.from_updates)
 
@@ -2094,47 +2083,34 @@ class SceneIsolationMiddleware(AgentMiddleware):
 
 async def main():
     """Main function to run the Blender Scene Agent as a web server."""
-    # Enable Agent Framework's native GenAI span instrumentation
-    # (invoke_agent / chat / execute_tool). When using
-    # `ResponsesHostServer` from `agent_framework_foundry_hosting`, the
-    # host configures the Azure Monitor *exporter* (you'll see
-    # "Application Insights trace exporter configured." in the logs)
-    # but does NOT auto-enable the framework's tracer/meter — unlike the
-    # older `azure.ai.agentserver.agentframework.from_agent_framework`
-    # host that we previously used on `main`. Without this call, the
-    # framework's GenAI spans never emit and App Insights only sees
-    # host-level inbound spans.
-    #
-    # `enable_instrumentation()` honours ENABLE_SENSITIVE_DATA from
-    # env (set in agent.yaml). The exporter side is handled by Foundry,
-    # which injects APPLICATIONINSIGHTS_CONNECTION_STRING and wires
-    # Azure Monitor. Best-effort: a failure here must not crash the
-    # agent.
-    try:
-        _enable_sensitive = os.getenv("ENABLE_SENSITIVE_DATA", "").strip().lower() in ("1", "true", "yes")
-        enable_instrumentation(enable_sensitive_data=_enable_sensitive or None)
-        logger.info("Agent Framework instrumentation enabled (enable_sensitive_data=%s).", _enable_sensitive)
-    except Exception as obs_exc:  # noqa: BLE001 — observability is non-fatal
-        logger.warning("enable_instrumentation() failed; GenAI spans may be missing: %s", obs_exc)
-
     scene_manager = SceneManager()
 
     global _scene_manager
     _scene_manager = scene_manager
 
-    # Per the canonical 08-observability sample, `FoundryChatClient` is
+    # Per the canonical 02_tools sample, `FoundryChatClient` is
     # constructed plainly (it is NOT an async context manager) and uses
     # the sync `DefaultAzureCredential`. The credential lives for the
     # lifetime of the process; explicit cleanup is unnecessary here.
+    #
+    # NOTE on telemetry: we add NO provider-replacing observability code here.
+    # Agent Framework instrumentation is on by default and the Foundry
+    # hosting layer owns the global OpenTelemetry tracer/meter providers
+    # and exporters, which feed the Foundry Monitor tab AND the project-linked
+    # Application Insights resource. Any manual
+    # configure_azure_monitor()/set_tracer_provider() call here would
+    # pre-empt the host's provider (OTel honors only the FIRST
+    # set_tracer_provider call) and break that pipeline.
     credential = SyncDefaultAzureCredential()
     chat_client = FoundryChatClient(
         project_endpoint=PROJECT_ENDPOINT,
         model=MODEL_DEPLOYMENT_NAME,
         credential=credential,
     )
+
     # Canonical hosted-agent stack (matches
     # microsoft-foundry/foundry-samples/.../hosted-agents/agent-framework/
-    # responses/02-tools/main.py and 08-observability/main.py):
+    # responses/02_tools/main.py):
     #
     #   FoundryChatClient + ResponsesHostServer + Agent (no name)
     #

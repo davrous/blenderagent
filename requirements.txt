@@ -5,27 +5,11 @@
 # which collides with the hosted agent declared in agent.yaml and crashes
 # every turn with HTTP 400 "Agent kind mismatch".
 #
-# Versions below target the May 2026 release line:
-#   - agent-framework 1.6.0 (stable)
-#   - agent-framework-foundry-hosting 1.0.0a260521 → pulls
-#     azure-ai-agentserver-core>=2.0.0b3 which requires opentelemetry-sdk>=1.40.0,
-#     aligning with azure-monitor-opentelemetry 1.8.x (which pins sdk==1.40).
-# Older foundry-hosting alphas depended on agentserver-core 1.0.0b17 whose
-# `opentelemetry-sdk~=1.36.0` constraint clashed with azure-monitor-opentelemetry
-# 1.8.x and broke the pip resolver (InconsistentCandidate on opentelemetry-sdk).
 # foundry-hosting still ships only pre-releases, so the Dockerfile must pass
 # `--pre` to pip (or this floor pins an alpha explicitly to opt in).
-agent-framework>=1.6.0
-agent-framework-foundry-hosting>=1.0.0a260521
+agent-framework>=1.7.0
+agent-framework-foundry-hosting
 python-dotenv>=1.2.2
 azure-identity>=1.25.3
 azure-storage-blob>=12.28.0
 debugpy>=1.8.20
-# Azure Monitor OpenTelemetry. Floor pinned to 1.8.5 because earlier 1.8.x
-# releases (1.8.0–1.8.4) still pinned `opentelemetry-sdk~=1.36.0`, which clashes
-# with `microsoft-opentelemetry 1.2.0` (pulled in via agentserver-core 2.x) that
-# hard-pins `opentelemetry-sdk==1.40`. 1.8.5+ realigned on sdk 1.40 and ships an
-# exporter (>=1.0.0b49) that no longer imports the removed `LogData` symbol from
-# `opentelemetry.sdk._logs`. No upper cap — let pip pick the newest matching the
-# sdk==1.40 constraint imposed by microsoft-opentelemetry.
-azure-monitor-opentelemetry>=1.8.5
