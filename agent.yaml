@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/microsoft/AgentSchema/refs/heads/main/schemas/v1.0/ContainerAgent.yaml
 
 kind: hosted
-name: fantasy-worlds-agent
+name: new-fantasy-worlds-agent
 description: >
   An AI agent that creates and manipulates 3D scenes in Blender.
   Communicates with a headless Blender instance via TCP socket to create
@@ -29,19 +29,6 @@ environment_variables:
     value: "9876"
   - name: AZURE_STORAGE_ACCOUNT_NAME
     value: "{{AZURE_STORAGE_ACCOUNT_NAME}}"
-  # Enable Agent Framework OpenTelemetry instrumentation so the runtime emits
-  # `invoke_agent` / `chat` / `execute_tool` spans to the Application Insights
-  # instance auto-wired by Foundry (APPLICATIONINSIGHTS_CONNECTION_STRING is
-  # injected at deploy time). Both default to false in agent-framework, so
-  # without these env vars the Azure Monitor "Agent Runs" / "Gen AI" dashboards
-  # stay empty. See:
-  # https://learn.microsoft.com/en-us/agent-framework/agents/observability
-  - name: ENABLE_INSTRUMENTATION
-    value: "true"
-  # Capture prompts, responses, and tool args/results on spans. Safe for this
-  # single-tenant dev agent; reconsider before exposing to end users.
-  - name: ENABLE_SENSITIVE_DATA
-    value: "true"
 dockerfile_path: Dockerfile
 resources:
   cpu: '2.0'
