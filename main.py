@@ -888,7 +888,12 @@ def get_viewport_screenshot(
         height = result.get('height', '?')
         logger.info("get_viewport_screenshot succeeded: %sx%s, saved to %s and uploaded to blob",
                     width, height, local_path)
-        return f"Screenshot captured ({width}x{height} pixels).\nInclude the following image link in your response exactly as-is:\n\n![screenshot]({blob_url})"
+        return (
+            f"Screenshot captured ({width}x{height} pixels). "
+            f"The image has ALREADY been displayed to the user automatically. "
+            f"Do NOT include, repeat, or reproduce the image markdown in your reply — "
+            f"just confirm briefly in one short sentence.\n\n![screenshot]({blob_url})"
+        )
     except Exception as e:
         logger.error("get_viewport_screenshot failed", exc_info=True)
         return f"Error capturing screenshot: {str(e)}"
@@ -1247,7 +1252,12 @@ print("Render complete: {render_path}")
                 blob_url = upload_image_to_blob(image_bytes, unique_name)
                 logger.info("%s succeeded: %dx%d, saved to %s and uploaded to blob",
                             label, resolution_x, resolution_y, render_path)
-                return f"Render complete ({resolution_x}x{resolution_y}).\nInclude the following image link in your response exactly as-is:\n\n![{label}]({blob_url})"
+                return (
+                    f"Render complete ({resolution_x}x{resolution_y}). "
+                    f"The image has ALREADY been displayed to the user automatically. "
+                    f"Do NOT include, repeat, or reproduce the image markdown in your reply — "
+                    f"just confirm briefly in one short sentence.\n\n![{label}]({blob_url})"
+                )
             else:
                 logger.warning("%s: output file not found at %r", label, render_path)
                 return f"Render command executed but output file not found. {result.get('result', '')}"
@@ -1402,8 +1412,10 @@ print("Saved scene to {safe_path}")
 
         logger.info("save_scene_for_download succeeded: %d bytes, uploaded to blob", file_size)
         return (
-            f"Scene saved ({file_size / 1024:.0f} KB).\n"
-            f"Include the following download link in your response exactly as-is:\n\n"
+            f"Scene saved ({file_size / 1024:.0f} KB). "
+            f"The download link has ALREADY been displayed to the user automatically. "
+            f"Do NOT include, repeat, or reproduce the download link markdown in your reply — "
+            f"just confirm briefly in one short sentence.\n\n"
             f"[Download your Blender scene (.blend)]({blob_url})"
         )
     except Exception as e:
@@ -1449,8 +1461,10 @@ print("Exported scene to {safe_path}")
 
         logger.info("export_scene_as_glb_for_download succeeded: %d bytes, uploaded to blob", file_size)
         return (
-            f"Scene exported as GLB ({file_size / 1024:.0f} KB).\n"
-            f"Include the following download link in your response exactly as-is:\n\n"
+            f"Scene exported as GLB ({file_size / 1024:.0f} KB). "
+            f"The download link has ALREADY been displayed to the user automatically. "
+            f"Do NOT include, repeat, or reproduce the download link markdown in your reply — "
+            f"just confirm briefly in one short sentence.\n\n"
             f"[Download your Blender scene (.glb)]({blob_url})"
         )
     except Exception as e:
@@ -1521,6 +1535,10 @@ class ToolStatusMiddleware(AgentMiddleware):
             image_call_ids: dict[str, str] = {}
             # Track call_ids for link-producing tools → tool name
             link_call_ids: dict[str, str] = {}
+            # call_ids already surfaced early, so a re-emitted function_result
+            # (the framework can send the same result in multiple chunks) is
+            # never surfaced twice.
+            surfaced_call_ids: set[str] = set()
 
             # Resilience state for this turn
             turn_started = asyncio.get_running_loop().time()
@@ -1593,11 +1611,12 @@ class ToolStatusMiddleware(AgentMiddleware):
                         # ── Stream images from tool results immediately ──
                         if content.type == "function_result":
                             cid = content.call_id or ""
-                            if cid in image_call_ids:
+                            if cid in image_call_ids and cid not in surfaced_call_ids:
                                 match = self._IMAGE_RE.search(
                                     content.result or ""
                                 )
                                 if match:
+                                    surfaced_call_ids.add(cid)
                                     tool_name = image_call_ids[cid]
                                     label = self._IMAGE_LABELS.get(tool_name, "")
                                     yield AgentResponseUpdate(
@@ -1611,11 +1630,12 @@ class ToolStatusMiddleware(AgentMiddleware):
                                     )
 
                             # ── Stream download links from tool results immediately ──
-                            if cid in link_call_ids:
+                            if cid in link_call_ids and cid not in surfaced_call_ids:
                                 match = self._LINK_RE.search(
                                     content.result or ""
                                 )
                                 if match:
+                                    surfaced_call_ids.add(cid)
                                     yield AgentResponseUpdate(
                                         contents=[
                                             Content.from_text(

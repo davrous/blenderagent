@@ -6,7 +6,7 @@ import type { Message } from "../state/chatStore";
 import { StatusPill } from "./StatusPill";
 import { ImageLightbox } from "./ImageLightbox";
 import { DownloadButton } from "./DownloadButton";
-import { isDownloadLink } from "../lib/parseMarkdown";
+import { isDownloadLink, dedupeMarkdownMedia } from "../lib/parseMarkdown";
 
 interface Props {
   message: Message;
@@ -68,7 +68,7 @@ function MessageBubbleImpl({ message }: Props) {
               },
             }}
           >
-            {message.text}
+            {dedupeMarkdownMedia(message.text)}
           </ReactMarkdown>
         )}
 
