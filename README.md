@@ -294,6 +294,38 @@ docker run -it --rm \
   blender-scene-agent
 ```
 
+#### Harmless startup noise: `169.254.169.254` timeout / telemetry spans
+
+When you run the image **locally** you may see a scary-looking `ConnectTimeout` (or an
+exported OpenTelemetry span with `status_code: ERROR`) for a `GET` to
+`http://169.254.169.254/metadata/instance/compute…`:
+
+```
+ConnectTimeout: HTTPConnectionPool(host='169.254.169.254', port=80): … Connection to
+169.254.169.254 timed out. (connect timeout=0.2)
+```
+
+This is **expected and safe to ignore**. `169.254.169.254` is the [Azure Instance
+Metadata Service](https://learn.microsoft.com/azure/virtual-machines/instance-metadata-service),
+which only exists on Azure compute. The Foundry hosting layer's OpenTelemetry setup
+runs an *Azure VM resource detector* that probes IMDS to tag telemetry with VM metadata;
+off-Azure that address is unreachable, so the probe times out in 0.2 s. Because there is
+no `APPLICATIONINSIGHTS_CONNECTION_STRING` locally, spans are exported to the console, so
+the failed probe is printed as JSON. The agent still works — `DefaultAzureCredential`
+independently falls back to your mounted `~/.azure` CLI login. In Foundry, IMDS is
+reachable and App Insights is configured, so neither the error nor the console dump appears.
+
+To silence it for local runs, disable the OpenTelemetry SDK (telemetry only — **do not**
+put this in `agent.yaml`, since you want traces in Foundry):
+
+```bash
+docker run -it --rm -p 8088:8088 -p 8089:8089 \
+  --env-file .env \
+  -v ~/.azure:/root/.azure:ro \
+  -e OTEL_SDK_DISABLED=true \
+  blender-scene-agent
+```
+
 ### Local development (without Docker)
 
 1. Install dependencies: `pip install -r requirements.txt`

@@ -294,6 +294,31 @@ _FRIENDLY_TIMEOUT_TEXT = (
     "\n\n⚠️ This turn took too long and was aborted to keep the session healthy. "
     "Your scene has been saved — please retry, ideally with a simpler request."
 )
+# User-facing message for a corrupted conversation history: a previous turn was
+# interrupted (idle recycle, timeout, or a dropped connection) after the model
+# asked for a tool but before the tool's output was recorded, leaving an
+# orphaned function call in the server-side session. Retrying replays the same
+# orphan, so the ONLY fix is to start a fresh session — the web client detects
+# this message's underlying error and resets the session automatically.
+_FRIENDLY_STATE_ERROR_TEXT = (
+    "\n\n⚠️ This conversation's history got out of sync (a tool call was "
+    "interrupted before it finished), so the model rejected it. Your scene has "
+    "been saved. Starting a fresh session — please resend your last message. "
+    "(If it keeps happening, click Reset.)"
+)
+
+
+def _is_orphaned_tool_call_error(exc: Exception) -> bool:
+    """True when the upstream 400 means the history has a function call with no output.
+
+    The Responses API validates that every function call in the replayed history
+    has a matching tool output. If a prior turn was cut off mid-tool-call, the
+    orphaned call poisons the session and every subsequent turn fails with
+    ``No tool output found for function call …``. This is unrecoverable by retry.
+    """
+    msg = str(exc).lower()
+    return "no tool output found for function call" in msg
+
 
 
 # ──────────────────────────────────────────────
@@ -1823,8 +1848,20 @@ class ToolStatusMiddleware(AgentMiddleware):
                     status_code, request_id, type(exc).__name__,
                     exc_info=True,
                 )
+                # An orphaned tool call poisons the whole session — tell the user
+                # (and the web client) to start fresh instead of retrying, which
+                # would just replay the same broken history.
+                if _is_orphaned_tool_call_error(exc):
+                    logger.error(
+                        "Orphaned tool call detected in session %s — history is "
+                        "corrupted; client should reset the session.",
+                        session_id,
+                    )
+                    error_text = _FRIENDLY_STATE_ERROR_TEXT
+                else:
+                    error_text = _FRIENDLY_MODEL_ERROR_TEXT
                 yield AgentResponseUpdate(
-                    contents=[Content.from_text(_FRIENDLY_MODEL_ERROR_TEXT)],
+                    contents=[Content.from_text(error_text)],
                     role="assistant",
                     message_id="agent-stream-error",
                 )

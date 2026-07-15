@@ -120,7 +120,46 @@ const newId = () => `m${Date.now()}-${++idCounter}`;
 // Id of the assistant message currently being filled by a voice turn.
 let voiceAssistantId: string | null = null;
 
+// Detects the "orphaned tool call" failure: a prior turn was interrupted after
+// the model asked for a tool but before the tool output was recorded, so the
+// server-side history is corrupted and every replay fails with a 400. Retrying
+// can NEVER succeed — the session must be reset. Matches both the raw upstream
+// error and the agent's friendly wording.
+const CORRUPT_HISTORY_RE =
+  /no tool output found for function call|got out of sync/i;
+
+function isCorruptedHistoryError(payload: any): boolean {
+  const candidates = [
+    payload?.error?.message,
+    payload?.response?.error?.message,
+    payload?.message,
+    typeof payload === "string" ? payload : undefined,
+  ].filter((s): s is string => typeof s === "string");
+  const haystack = candidates.length ? candidates.join(" ") : JSON.stringify(payload ?? "");
+  return CORRUPT_HISTORY_RE.test(haystack);
+}
+
 export const useChatStore = create<ChatState>((set, get) => {
+  // Recover from a corrupted server-side conversation history (orphaned tool
+  // call). We DROP the poisoned response chain (`previousResponseId`) but KEEP
+  // the conversation id so the per-conversation Blender scene is preserved. In
+  // foundry mode `/api/reset` deletes the broken session; the next turn lazily
+  // creates a fresh one bound to the same conversation id.
+  const recoverCorruptedSession = async (): Promise<void> => {
+    const convId = get().conversationId;
+    set({ previousResponseId: null });
+    try {
+      await fetch("/api/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ conversation_id: convId }),
+        keepalive: true,
+      });
+    } catch {
+      // Best-effort: clearing previousResponseId already breaks the retry loop.
+    }
+  };
+
   // Shared implementation for a normal agent turn — used by typed input and by
   // silent gallery-selection notes. `userBubbleText` is what shows in the user
   // bubble (null hides it entirely); `agentInput` is what is sent to the agent.
@@ -170,7 +209,12 @@ export const useChatStore = create<ChatState>((set, get) => {
       }));
     };
 
+    let finalized = false;
     const finalize = (status: Status, errorText?: string) => {
+      // Guard against a trailing `finalize("done")` overwriting a terminal
+      // error/state that an in-band SSE `error` frame already set.
+      if (finalized) return;
+      finalized = true;
       set((state) => ({
         messages: state.messages.map((m) =>
           m.id === assistantId
@@ -207,8 +251,21 @@ export const useChatStore = create<ChatState>((set, get) => {
           } else if (eventType === "response.completed") {
             const id = payload?.response?.id;
             if (id) set({ previousResponseId: id });
-          } else if (eventType === "error") {
-            finalize("error", payload?.message || JSON.stringify(payload));
+          } else if (eventType === "error" || eventType === "response.failed") {
+            if (isCorruptedHistoryError(payload)) {
+              // Poisoned session: an orphaned tool call in the server-side
+              // history. Retrying replays it forever, so abandon the response
+              // chain and reset the session while keeping the scene.
+              finalize(
+                "error",
+                "This conversation got out of sync (a tool call was interrupted " +
+                  "before it finished), so the model rejected it. I've started a " +
+                  "fresh session — please resend your last message. Your scene is preserved.",
+              );
+              void recoverCorruptedSession();
+            } else {
+              finalize("error", payload?.error?.message || payload?.message || JSON.stringify(payload));
+            }
           }
         },
         ac.signal,
