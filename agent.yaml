@@ -18,6 +18,10 @@ metadata:
 protocols:
   - protocol: responses
     version: 1.0.0
+  # Voice path: speech-in / speech-out over a WebSocket. The platform relays
+  # browser frames to the container's voice WebSocket (port VOICE_WS_PORT).
+  - protocol: invocations_ws
+    version: 1.0.0
 environment_variables:
   - name: PROJECT_ENDPOINT
     value: "{{PROJECT_ENDPOINT}}"
@@ -29,6 +33,22 @@ environment_variables:
     value: "9876"
   - name: AZURE_STORAGE_ACCOUNT_NAME
     value: "{{AZURE_STORAGE_ACCOUNT_NAME}}"
+  # ── Voice (speech-in / speech-out) ──
+  # Keyless Speech auth: grant this agent's Entra identity the
+  # "Cognitive Services User" (or "Cognitive Services Speech User") role on the
+  # Speech/AI Services resource. Deploy in the same region (e.g. northcentralus).
+  - name: ENABLE_VOICE
+    value: "true"
+  - name: SPEECH_REGION
+    value: "{{SPEECH_REGION}}"
+  - name: SPEECH_RESOURCE_ID
+    value: "{{SPEECH_RESOURCE_ID}}"
+  - name: SPEECH_VOICE_NAME
+    value: "en-US-NovaMultilingualNeuralHD"
+  - name: SPEECH_VOICE_FALLBACK
+    value: "en-US-AvaMultilingualNeural"
+  - name: VOICE_WS_PORT
+    value: "8089"
 dockerfile_path: Dockerfile
 resources:
   cpu: '2.0'

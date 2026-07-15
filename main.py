@@ -2263,7 +2263,32 @@ This environment runs **Blender 4.4**. The following Blender 3.x APIs were remov
     )
     print("Blender Scene Agent running on http://localhost:8088")
     server = ResponsesHostServer(agent)
-    await server.run_async()
+
+    # Serve the text Responses API. Optionally also serve the voice WebSocket
+    # (speech-in / speech-out) alongside it when Speech is configured. The voice
+    # path is fully optional and isolated: if it is disabled or fails to start,
+    # the text agent keeps running unaffected.
+    tasks = [asyncio.ensure_future(server.run_async())]
+    try:
+        import voice_pipeline
+
+        if voice_pipeline.voice_available():
+            logger.info(
+                "Voice path ENABLED — serving voice WebSocket on port %d.",
+                voice_pipeline.VOICE_WS_PORT,
+            )
+            tasks.append(asyncio.ensure_future(voice_pipeline.run_ws_server(agent)))
+        else:
+            logger.info(
+                "Voice path DISABLED (ENABLE_VOICE off or Speech not configured)."
+            )
+    except Exception:
+        logger.warning(
+            "Voice path failed to initialise; continuing with text only.",
+            exc_info=True,
+        )
+
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

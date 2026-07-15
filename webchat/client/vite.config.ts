@@ -9,6 +9,8 @@ export default defineConfig({
       "/api": {
         target: "http://localhost:5174",
         changeOrigin: true,
+        // Proxy WebSocket upgrades too (used by the /api/voice relay).
+        ws: true,
       },
     },
   },

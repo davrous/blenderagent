@@ -158,9 +158,20 @@ az role assignment create \
 
 If blob calls return HTTP 403 `AuthorizationPermissionMismatch` (different from `AuthorizationFailure`), it means the principal **has a token but the wrong role**. Check the logs for the `Storage MSI principal: oid=...` line and confirm that exact OID has both roles on the storage account scope. RBAC propagation can take 1–2 minutes.
 
-### 3. Update the `.env` file
+### 3. Create your `.env` file
 
-Copy or edit the `.env` file at the root of this project to match your environment:
+The repository ships a template, [`.env.example`](.env.example), that lists every
+supported variable with placeholder values. **Never commit a real `.env`** — it is
+git-ignored because it holds resource IDs (and optionally secrets) specific to your
+subscription.
+
+Copy the template and fill in your values:
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env`. At minimum, set the three required variables:
 
 ```env
 PROJECT_ENDPOINT=https://<your-foundry-resource>.services.ai.azure.com/api/projects/<your-project-name>
@@ -168,11 +179,16 @@ MODEL_DEPLOYMENT_NAME=gpt-4.1-mini
 AZURE_STORAGE_ACCOUNT_NAME=<your-storage-account-name>
 ```
 
-| Variable | Description |
-|----------|-------------|
-| `PROJECT_ENDPOINT` | The full endpoint URL of your Azure AI Foundry project |
-| `MODEL_DEPLOYMENT_NAME` | The name of the model deployment to use (e.g., `gpt-4.1-mini`) |
-| `AZURE_STORAGE_ACCOUNT_NAME` | The name of the Azure Storage account created in step 1 |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `PROJECT_ENDPOINT` | Yes | The full endpoint URL of your Azure AI Foundry project |
+| `MODEL_DEPLOYMENT_NAME` | Yes | The name of the model deployment to use (e.g., `gpt-4.1-mini`) |
+| `AZURE_STORAGE_ACCOUNT_NAME` | Yes | The name of the Azure Storage account created in step 1 |
+
+To enable voice, also fill in `SPEECH_REGION` and `SPEECH_RESOURCE_ID` (see
+[Environment Variables](#environment-variables) and
+[Voice (speech-in / speech-out)](#voice-speech-in--speech-out) below). All other
+variables are optional and documented inline in [`.env.example`](.env.example).
 
 ## Deploying to Azure AI Foundry
 
@@ -204,9 +220,17 @@ docker build --platform linux/amd64 --no-cache -t blender-scene-agent .
 
 ### Run the container
 
+The container exposes **two** ports, so publish both when running locally:
+
+- **`8088`** — the agent's HTTP endpoint (`/responses`, health, etc.).
+- **`8089`** — the voice WebSocket endpoint (`/invocations_ws`) used for speech-in / speech-out. If you omit `-p 8089:8089`, text chat still works but voice will fail to connect.
+
+> If you run with `ENABLE_VOICE=false` (or without Speech configured), the voice server doesn't start and publishing `8089` is optional.
+
 ```bash
 docker run -it --rm \
   -p 8088:8088 \
+  -p 8089:8089 \
   -e PROJECT_ENDPOINT="https://your-project.services.ai.azure.com/api/projects/your-project-id" \
   -e MODEL_DEPLOYMENT_NAME="gpt-4.1-mini" \
   -e AZURE_CLIENT_ID="..." \
@@ -218,7 +242,7 @@ docker run -it --rm \
 #### macOS / Linux
 
 ```bash
-docker run -it --rm -p 8088:8088 \
+docker run -it --rm -p 8088:8088 -p 8089:8089 \
   --env-file .env \
   -v ~/.azure:/root/.azure:ro \
   blender-scene-agent
@@ -227,7 +251,7 @@ docker run -it --rm -p 8088:8088 \
 #### Windows (PowerShell)
 
 ```powershell
-docker run -it --rm -p 8088:8088 --env-file .env -v ~/.azure:/root/.azure:ro blender-scene-agent
+docker run -it --rm -p 8088:8088 -p 8089:8089 --env-file .env -v ~/.azure:/root/.azure:ro blender-scene-agent
 ```
 
 If the container can't read your Azure credentials (you'll see a `DefaultAzureCredential` error at startup), it's because the Azure CLI on Windows encrypts the token cache with DPAPI by default and a Linux container can't decrypt it. Run this once on your host to switch to a plaintext cache (same behaviour as macOS/Linux), then retry:
@@ -243,7 +267,7 @@ az login
 **Fallback** (no host changes): omit the `-v` mount and the container will fall back to `az login --use-device-code`:
 
 ```powershell
-docker run -it --rm -p 8088:8088 --env-file .env blender-scene-agent
+docker run -it --rm -p 8088:8088 -p 8089:8089 --env-file .env blender-scene-agent
 ```
 
 Or mount Azure CLI credentials for local development (macOS/Linux):
@@ -251,6 +275,7 @@ Or mount Azure CLI credentials for local development (macOS/Linux):
 ```bash
 docker run -it --rm \
   -p 8088:8088 \
+  -p 8089:8089 \
   -e PROJECT_ENDPOINT="..." \
   -e MODEL_DEPLOYMENT_NAME="gpt-4.1-mini" \
   -v ~/.azure:/root/.azure:ro \
@@ -277,6 +302,46 @@ docker run -it --rm \
 | `MODEL_DEPLOYMENT_NAME` | No | `gpt-4.1-mini` | Deployed model name |
 | `BLENDER_HOST` | No | `localhost` | Blender socket server host |
 | `BLENDER_PORT` | No | `9876` | Blender socket server port |
+| `ENABLE_VOICE` | No | `true` | Enable the voice path (speech-in / speech-out). Voice only activates when Speech is also configured below. |
+| `SPEECH_REGION` | For voice | - | Azure Speech / AI Services region (e.g. `northcentralus`). |
+| `SPEECH_RESOURCE_ID` | For voice (keyless) | - | Resource ID of the Speech / AI Services resource, used for keyless (AAD) auth. |
+| `SPEECH_KEY` | Alt. to keyless | - | Speech resource key (only if not using keyless AAD auth). |
+| `SPEECH_VOICE_NAME` | No | `en-US-NovaMultilingualNeuralHD` | Primary neural voice for TTS. |
+| `SPEECH_VOICE_FALLBACK` | No | `en-US-AvaMultilingualNeural` | Fallback voice if the primary is throttled/unavailable. |
+| `VOICE_WS_PORT` | No | `8089` | Port for the voice WebSocket (`invocations_ws`). |
+
+### Voice (speech-in / speech-out)
+
+The agent optionally exposes a **voice WebSocket** (`invocations_ws` protocol,
+port `8089`) alongside the text Responses API. Microphone audio is transcribed
+with Azure Speech STT, sent through the *same* agent turn (so voice and text
+share one server-side Blender scene keyed by `conversation_id`), and the spoken
+reply is streamed back as 24 kHz PCM. Screenshots, renders, and download links
+are never read aloud — instead a short spoken cue announces them while the image
+or download button still renders in the web chat.
+
+The voice path is **fully optional**: if `ENABLE_VOICE` is off or Speech is not
+configured, the agent runs text-only and the voice server never starts.
+
+**Keyless auth (recommended):** grant the agent's Entra identity the
+`Cognitive Services User` (or `Cognitive Services Speech User`) role on the
+Speech / AI Services resource, and deploy the agent in the same region
+(e.g. `northcentralus`). Set `SPEECH_REGION` and `SPEECH_RESOURCE_ID`.
+
+**Run locally with voice:**
+
+```bash
+az login
+export ENABLE_VOICE=true
+export SPEECH_REGION=northcentralus
+export SPEECH_RESOURCE_ID="/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/<name>"
+python main.py --port 8088
+# → "Voice WebSocket listening on ws://0.0.0.0:8089/invocations_ws"
+```
+
+Then start the web chat (`webchat/`) with `VOICE_ENABLED=true` and hold the 🎙️
+mic button to talk.
+
 
 ## Agent Tools
 

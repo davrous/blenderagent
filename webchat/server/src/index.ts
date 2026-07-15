@@ -9,6 +9,7 @@ import {
   evictSession,
   deleteSession,
 } from "./sessions.js";
+import { attachVoiceRelay } from "./voice.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -43,6 +44,7 @@ app.get("/api/health", (_req, res) => {
     agentName: config.mode === "foundry" ? config.agentName : undefined,
     apiVersion: config.mode === "foundry" ? config.apiVersion : undefined,
     model: config.modelName,
+    voiceEnabled: config.voiceEnabled,
   });
 });
 
@@ -369,8 +371,12 @@ app.post("/api/reset", async (req, res) => {
   }
 });
 
-app.listen(config.port, () => {
+const server = app.listen(config.port, () => {
   console.log(
     `[webchat-proxy] mode=${config.mode} agentUrl=${config.agentUrl} model=${config.modelName} listening on :${config.port}`,
   );
 });
+
+// Attach the voice WebSocket relay (`/api/voice`) to the same HTTP server so it
+// shares the Vite dev proxy and production origin. No-op when voice disabled.
+attachVoiceRelay(server);

@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { streamChat } from "../api/stream";
+import type { VoiceStatus } from "../api/voice";
 
 export type Role = "user" | "assistant";
 export type Status = "streaming" | "done" | "error";
@@ -20,8 +21,17 @@ interface ChatState {
   conversationId: string;
   isStreaming: boolean;
   abortController: AbortController | null;
+  // Voice turn state (shares the same message list / scene as typed turns).
+  voiceStatus: VoiceStatus;
+  voiceActive: boolean;
+  voiceHint: string | null;
   send: (input: string) => Promise<void>;
   reset: () => void;
+  setVoiceStatus: (s: VoiceStatus) => void;
+  voiceBeginTurn: (transcript: string) => void;
+  voiceAppendDelta: (delta: string) => void;
+  voiceFinalizeTurn: (responseId: string | null) => void;
+  voiceFail: (message: string) => void;
 }
 
 const CONVERSATION_ID_STORAGE_KEY = "webchat.conversationId";
@@ -79,8 +89,34 @@ function rotateConversationId(): string {
 // We require both delimiters so we never extract partial deltas.
 const STATUS_BLOCK_RE = /\n{2}\*([^*\n]+)\*\n{2}/;
 
+/**
+ * Append a streaming delta to a message buffer, extracting any complete
+ * `*status*` blocks into `currentStatus` (shown as a pill). Shared by the typed
+ * and voice paths so both render identically.
+ */
+function applyDelta(
+  rawBuffer: string,
+  currentStatus: string | null,
+  delta: string,
+): { rawBuffer: string; text: string; currentStatus: string | null } {
+  let raw = rawBuffer + delta;
+  let status = currentStatus;
+  let match: RegExpMatchArray | null;
+  while ((match = raw.match(STATUS_BLOCK_RE)) !== null) {
+    status = match[1].trim();
+    const start = match.index!;
+    const end = start + match[0].length;
+    // Replace the block with a single blank line so paragraphs stay separated.
+    raw = raw.slice(0, start) + "\n\n" + raw.slice(end);
+  }
+  return { rawBuffer: raw, text: raw, currentStatus: status };
+}
+
 let idCounter = 0;
 const newId = () => `m${Date.now()}-${++idCounter}`;
+
+// Id of the assistant message currently being filled by a voice turn.
+let voiceAssistantId: string | null = null;
 
 export const useChatStore = create<ChatState>((set, get) => ({
   messages: [],
@@ -88,6 +124,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   conversationId: loadOrCreateConversationId(),
   isStreaming: false,
   abortController: null,
+  voiceStatus: "idle",
+  voiceActive: false,
+  voiceHint: null,
 
   reset: () => {
     const { abortController, conversationId } = get();
@@ -100,17 +139,86 @@ export const useChatStore = create<ChatState>((set, get) => ({
       body: JSON.stringify({ conversation_id: conversationId }),
       keepalive: true,
     }).catch(() => {});
+    voiceAssistantId = null;
     set({
       messages: [],
       previousResponseId: null,
       conversationId: rotateConversationId(),
       isStreaming: false,
       abortController: null,
+      voiceStatus: "idle",
+      voiceActive: false,
+      voiceHint: null,
     });
   },
 
+  setVoiceStatus: (s) => set({ voiceStatus: s }),
+
+  voiceBeginTurn: (transcript) => {
+    const userMsg: Message = {
+      id: newId(),
+      role: "user",
+      text: transcript,
+      rawBuffer: transcript,
+      currentStatus: null,
+      status: "done",
+    };
+    const assistantId = newId();
+    voiceAssistantId = assistantId;
+    const assistantMsg: Message = {
+      id: assistantId,
+      role: "assistant",
+      text: "",
+      rawBuffer: "",
+      currentStatus: null,
+      status: "streaming",
+    };
+    set({
+      messages: [...get().messages, userMsg, assistantMsg],
+      voiceActive: true,
+      voiceHint: null,
+    });
+  },
+
+  voiceAppendDelta: (delta) => {
+    const id = voiceAssistantId;
+    if (!id) return;
+    set((state) => ({
+      messages: state.messages.map((m) =>
+        m.id === id ? { ...m, ...applyDelta(m.rawBuffer, m.currentStatus, delta) } : m,
+      ),
+    }));
+  },
+
+  voiceFinalizeTurn: (responseId) => {
+    const id = voiceAssistantId;
+    voiceAssistantId = null;
+    set((state) => ({
+      messages: state.messages.map((m) =>
+        m.id === id ? { ...m, status: "done", currentStatus: null } : m,
+      ),
+      voiceActive: false,
+      previousResponseId: responseId ?? state.previousResponseId,
+    }));
+  },
+
+  voiceFail: (message) => {
+    const id = voiceAssistantId;
+    if (id) {
+      voiceAssistantId = null;
+      set((state) => ({
+        messages: state.messages.map((m) =>
+          m.id === id ? { ...m, status: "error", errorText: message } : m,
+        ),
+        voiceActive: false,
+      }));
+    } else {
+      set({ voiceHint: message, voiceActive: false });
+    }
+  },
+
   send: async (input) => {
-    if (get().isStreaming) return;
+    if (get().isStreaming || get().voiceActive) return;
     const trimmed = input.trim();
     if (!trimmed) return;
 
@@ -141,21 +249,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     const appendDelta = (delta: string) => {
       set((state) => ({
-        messages: state.messages.map((m) => {
-          if (m.id !== assistantId) return m;
-          let raw = m.rawBuffer + delta;
-          let status = m.currentStatus;
-          // Extract any complete status blocks from the buffer.
-          let match: RegExpMatchArray | null;
-          while ((match = raw.match(STATUS_BLOCK_RE)) !== null) {
-            status = match[1].trim();
-            const start = match.index!;
-            const end = start + match[0].length;
-            // Replace the block with a single blank line so paragraphs stay separated.
-            raw = raw.slice(0, start) + "\n\n" + raw.slice(end);
-          }
-          return { ...m, rawBuffer: raw, text: raw, currentStatus: status };
-        }),
+        messages: state.messages.map((m) =>
+          m.id === assistantId
+            ? { ...m, ...applyDelta(m.rawBuffer, m.currentStatus, delta) }
+            : m,
+        ),
       }));
     };
 

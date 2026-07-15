@@ -72,6 +72,8 @@ All settings live in `webchat/.env`. See [`.env.example`](.env.example) for the 
 | `AGENT_TOKEN_SCOPE` | `https://ai.azure.com/.default` | OAuth scope for the bearer token. |
 | `MODEL_NAME` | `BlenderSceneAgent` | Sent as `model` in the Responses request body (cosmetic in foundry mode). |
 | `PORT` | `5174` | Proxy listen port. |
+| `VOICE_ENABLED` | `true` | Show the 🎙️ push-to-talk UI and enable the `/api/voice` relay. In local mode this must match the agent's own `ENABLE_VOICE`; in foundry mode the deployed agent must declare the `invocations_ws` protocol. |
+| `VOICE_LOCAL_WS_URL` | `ws://localhost:8089/invocations_ws` | Upstream voice WebSocket for local mode. |
 
 ## Project layout
 
@@ -82,12 +84,14 @@ webchat/
 │       ├── index.ts        # POST /api/chat, POST /api/reset, GET /api/health, GET /api/blob
 │       ├── auth.ts         # Cached DefaultAzureCredential token
 │       ├── sessions.ts     # Foundry hosted-agent session cache
+│       ├── voice.ts        # /api/voice WebSocket relay → agent invocations_ws
 │       └── config.ts
 └── client/                 # Vite + React + TypeScript chat UI
     └── src/
         ├── App.tsx
         ├── api/stream.ts   # Manual SSE parser over fetch()
-        ├── state/chatStore.ts   # zustand: messages + previous_response_id
+        ├── api/voice.ts    # Push-to-talk mic capture + PCM playback (Web Audio)
+        ├── state/chatStore.ts   # zustand: messages + previous_response_id + voice
         ├── components/     # ChatView, Composer, MessageBubble,
         │                   # StatusPill, ImageLightbox, DownloadButton
         ├── lib/parseMarkdown.ts
@@ -103,6 +107,7 @@ webchat/
 - **Inline images.** Tools like `get_viewport_screenshot`, `render_preview`, and `render_final` return their results as `![label](sas-url)`. The client's custom `img` renderer wraps them in a button that opens a full-screen lightbox (click backdrop or press `Esc` to close).
 - **Download buttons.** `save_scene_for_download` and `export_scene_as_glb_for_download` return `[Download…](sas-url)`. The custom `a` renderer detects `.blend` / `.glb` URLs and renders a styled download button instead of a plain link.
 - **Reset.** Clears local state, asks the proxy to delete the foundry session (no-op in local mode), and rotates the conversation id so the next message starts a fresh conversation (and a fresh Blender scene).
+- **Voice (push-to-talk).** When `VOICE_ENABLED=true`, a 🎙️ button appears. Hold it to talk: the browser captures the mic, downsamples to 24 kHz PCM, and streams it over `/api/voice` (a WebSocket the proxy relays to the agent's `invocations_ws` server). Release to send. The agent transcribes the speech, runs the *same* turn as the typed path (so voice and text share one Blender scene keyed by `conversation_id`), streams the reply text back as `delta` frames (rendered identically, with status pills, screenshots, and download buttons), and speaks the prose back as 24 kHz PCM audio. URLs are never read aloud — a short spoken cue announces screenshots/renders/downloads. Continuity is client-owned: the browser sends `conversation_id` + `previous_response_id` in the `commit` frame and updates `previous_response_id` from the `done` frame. Press the mic while the agent is speaking to barge in.
 
 ## Troubleshooting
 
@@ -110,6 +115,8 @@ webchat/
 - **HTTP 401 in foundry mode** — token scope mismatch. Try `AGENT_TOKEN_SCOPE=https://cognitiveservices.azure.com/.default`. Also confirm `az login` succeeded as the right tenant.
 - **Images don't load** — the agent uploads to Azure Blob Storage with user-delegation SAS. If the agent process can't mint SAS tokens, the URLs are unusable. See the parent README's troubleshooting section.
 - **Streaming stalls** — corporate proxies often buffer SSE. The proxy sets `X-Accel-Buffering: no` but a proxy in front of `localhost` is unusual; check that nothing is intercepting `:5173` ↔ `:5174`.
+- **Mic button missing** — `/api/health` must report `voiceEnabled: true` (set `VOICE_ENABLED=true`) and the browser must support `AudioContext` + `getUserMedia` + `WebSocket` (needs a secure context: `localhost` or HTTPS).
+- **Voice connects but no audio / "Voice service is unavailable"** — in local mode the agent must be started with `ENABLE_VOICE=true` and `SPEECH_*` configured so its `invocations_ws` server is listening on `:8089`; in foundry mode the deployed agent must declare the `invocations_ws` protocol and its identity needs the `Cognitive Services User` role.
 
 ## Limitations / not included
 

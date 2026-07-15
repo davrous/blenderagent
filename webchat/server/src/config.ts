@@ -55,4 +55,14 @@ export const config = {
     .filter(Boolean),
   // Foundry-Features header required by the hosted agent endpoint preview.
   foundryFeaturesHeader: "HostedAgents=V1Preview,AgentEndpoints=V1Preview",
+  // ── Voice (speech-in / speech-out) ──
+  // Whether the mic UI + `/api/voice` relay are offered. In local mode this
+  // must match the agent's own ENABLE_VOICE; in foundry mode it reflects the
+  // deployed agent's voice protocol.
+  voiceEnabled: ["1", "true", "yes", "on"].includes(
+    (process.env.VOICE_ENABLED ?? "true").trim().toLowerCase(),
+  ),
+  // Upstream voice WebSocket for local mode (the agent's invocations_ws server).
+  localVoiceWsUrl:
+    process.env.VOICE_LOCAL_WS_URL ?? "ws://localhost:8089/invocations_ws",
 };

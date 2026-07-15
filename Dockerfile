@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 \
     libgl1-mesa-dri libegl1 libsm6 libxkbcommon0 \
     libxrandr2 libxinerama1 libxcursor1 \
+    # Azure Speech SDK runtime dependency (ALSA) for the voice path
+    libasound2t64 \
     # Utilities
     wget netcat-openbsd curl ca-certificates xz-utils \
     && rm -rf /var/lib/apt/lists/*
@@ -53,6 +55,7 @@ RUN pip install --no-cache-dir --pre -r requirements.txt
 
 # ── 4. Copy application code ──
 COPY main.py .
+COPY voice_pipeline.py .
 COPY blender_startup.py .
 COPY blender_connection.py .
 COPY scene_manager.py .
@@ -63,8 +66,10 @@ RUN chmod +x /app/entrypoint.sh
 
 # ── 5. Expose ports ──
 # 8088 = Agent HTTP server
+# 8089 = Voice WebSocket (invocations_ws), used when ENABLE_VOICE is on
 # 9876 = Blender MCP socket (internal)
 EXPOSE 8088
+EXPOSE 8089
 
 # ── 6. Start everything ──
 ENTRYPOINT ["/app/entrypoint.sh"]

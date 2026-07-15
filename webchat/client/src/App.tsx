@@ -2,11 +2,13 @@ import { useEffect, useState } from "react";
 import { useChatStore } from "./state/chatStore";
 import { ChatView } from "./components/ChatView";
 import { Composer } from "./components/Composer";
+import { voice } from "./api/voice";
 
 interface Health {
   mode: string;
   agentUrl: string;
   model: string;
+  voiceEnabled?: boolean;
 }
 
 export function App() {
@@ -20,6 +22,23 @@ export function App() {
       .then(setHealth)
       .catch(() => setHealth(null));
   }, []);
+
+  const voiceAvailable = !!health?.voiceEnabled && voice.isSupported();
+
+  // Wire the voice controller to the chat store once voice is available.
+  useEffect(() => {
+    if (!voiceAvailable) return;
+    voice.init({
+      onStatus: (s) => useChatStore.getState().setVoiceStatus(s),
+      onUserTranscript: (t) => useChatStore.getState().voiceBeginTurn(t),
+      onAgentDelta: (d) => useChatStore.getState().voiceAppendDelta(d),
+      onAgentDone: (rid) => useChatStore.getState().voiceFinalizeTurn(rid),
+      onError: (m) => useChatStore.getState().voiceFail(m),
+      getConversationId: () => useChatStore.getState().conversationId,
+      getPreviousResponseId: () => useChatStore.getState().previousResponseId,
+    });
+    return () => voice.dispose();
+  }, [voiceAvailable]);
 
   return (
     <div className="app">
@@ -48,7 +67,7 @@ export function App() {
         <ChatView />
       </main>
       <footer className="app-footer">
-        <Composer />
+        <Composer voiceAvailable={voiceAvailable} />
       </footer>
     </div>
   );
