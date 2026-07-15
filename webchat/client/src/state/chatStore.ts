@@ -26,6 +26,8 @@ interface ChatState {
   voiceActive: boolean;
   voiceHint: string | null;
   send: (input: string) => Promise<void>;
+  selectModel: (modelUrl: string, name: string) => Promise<void>;
+  selectTexture: (assetId: string, name: string) => Promise<void>;
   reset: () => void;
   setVoiceStatus: (s: VoiceStatus) => void;
   voiceBeginTurn: (transcript: string) => void;
@@ -118,7 +120,110 @@ const newId = () => `m${Date.now()}-${++idCounter}`;
 // Id of the assistant message currently being filled by a voice turn.
 let voiceAssistantId: string | null = null;
 
-export const useChatStore = create<ChatState>((set, get) => ({
+export const useChatStore = create<ChatState>((set, get) => {
+  // Shared implementation for a normal agent turn — used by typed input and by
+  // silent gallery-selection notes. `userBubbleText` is what shows in the user
+  // bubble (null hides it entirely); `agentInput` is what is sent to the agent.
+  const runAgentTurn = async (
+    agentInput: string,
+    userBubbleText: string | null,
+  ): Promise<void> => {
+    if (get().isStreaming || get().voiceActive) return;
+    const trimmedInput = agentInput.trim();
+    if (!trimmedInput) return;
+
+    const newMessages: Message[] = [];
+    if (userBubbleText !== null) {
+      newMessages.push({
+        id: newId(),
+        role: "user",
+        text: userBubbleText,
+        rawBuffer: userBubbleText,
+        currentStatus: null,
+        status: "done",
+      });
+    }
+    const assistantId = newId();
+    newMessages.push({
+      id: assistantId,
+      role: "assistant",
+      text: "",
+      rawBuffer: "",
+      currentStatus: null,
+      status: "streaming",
+    });
+
+    const ac = new AbortController();
+    set({
+      messages: [...get().messages, ...newMessages],
+      isStreaming: true,
+      abortController: ac,
+    });
+
+    const appendDelta = (delta: string) => {
+      set((state) => ({
+        messages: state.messages.map((m) =>
+          m.id === assistantId
+            ? { ...m, ...applyDelta(m.rawBuffer, m.currentStatus, delta) }
+            : m,
+        ),
+      }));
+    };
+
+    const finalize = (status: Status, errorText?: string) => {
+      set((state) => ({
+        messages: state.messages.map((m) =>
+          m.id === assistantId
+            ? { ...m, status, errorText, currentStatus: status === "done" ? null : m.currentStatus }
+            : m,
+        ),
+        isStreaming: false,
+        abortController: null,
+      }));
+    };
+
+    try {
+      await streamChat(
+        trimmedInput,
+        get().previousResponseId,
+        get().conversationId,
+        (e) => {
+          if (!e.data) return;
+          let payload: any;
+          try {
+            payload = JSON.parse(e.data);
+          } catch {
+            return;
+          }
+          const eventType = e.event || payload?.type;
+
+          if (eventType === "response.created" && payload?.response?.id) {
+            set({ previousResponseId: payload.response.id });
+          } else if (
+            eventType === "response.output_text.delta" &&
+            typeof payload?.delta === "string"
+          ) {
+            appendDelta(payload.delta);
+          } else if (eventType === "response.completed") {
+            const id = payload?.response?.id;
+            if (id) set({ previousResponseId: id });
+          } else if (eventType === "error") {
+            finalize("error", payload?.message || JSON.stringify(payload));
+          }
+        },
+        ac.signal,
+      );
+      finalize("done");
+    } catch (err) {
+      if ((err as any)?.name === "AbortError") {
+        finalize("done");
+        return;
+      }
+      finalize("error", err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  return {
   messages: [],
   previousResponseId: null,
   conversationId: loadOrCreateConversationId(),
@@ -218,96 +323,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   send: async (input) => {
-    if (get().isStreaming || get().voiceActive) return;
-    const trimmed = input.trim();
-    if (!trimmed) return;
-
-    const userMsg: Message = {
-      id: newId(),
-      role: "user",
-      text: trimmed,
-      rawBuffer: trimmed,
-      currentStatus: null,
-      status: "done",
-    };
-    const assistantId = newId();
-    const assistantMsg: Message = {
-      id: assistantId,
-      role: "assistant",
-      text: "",
-      rawBuffer: "",
-      currentStatus: null,
-      status: "streaming",
-    };
-
-    const ac = new AbortController();
-    set({
-      messages: [...get().messages, userMsg, assistantMsg],
-      isStreaming: true,
-      abortController: ac,
-    });
-
-    const appendDelta = (delta: string) => {
-      set((state) => ({
-        messages: state.messages.map((m) =>
-          m.id === assistantId
-            ? { ...m, ...applyDelta(m.rawBuffer, m.currentStatus, delta) }
-            : m,
-        ),
-      }));
-    };
-
-    const finalize = (status: Status, errorText?: string) => {
-      set((state) => ({
-        messages: state.messages.map((m) =>
-          m.id === assistantId
-            ? { ...m, status, errorText, currentStatus: status === "done" ? null : m.currentStatus }
-            : m,
-        ),
-        isStreaming: false,
-        abortController: null,
-      }));
-    };
-
-    try {
-      await streamChat(
-        trimmed,
-        get().previousResponseId,
-        get().conversationId,
-        (e) => {
-          if (!e.data) return;
-          let payload: any;
-          try {
-            payload = JSON.parse(e.data);
-          } catch {
-            return;
-          }
-          const eventType = e.event || payload?.type;
-
-          if (eventType === "response.created" && payload?.response?.id) {
-            // Tentatively record the response id — confirmed on completion.
-            set({ previousResponseId: payload.response.id });
-          } else if (
-            eventType === "response.output_text.delta" &&
-            typeof payload?.delta === "string"
-          ) {
-            appendDelta(payload.delta);
-          } else if (eventType === "response.completed") {
-            const id = payload?.response?.id;
-            if (id) set({ previousResponseId: id });
-          } else if (eventType === "error") {
-            finalize("error", payload?.message || JSON.stringify(payload));
-          }
-        },
-        ac.signal,
-      );
-      finalize("done");
-    } catch (err) {
-      if ((err as any)?.name === "AbortError") {
-        finalize("done");
-        return;
-      }
-      finalize("error", err instanceof Error ? err.message : String(err));
-    }
+    await runAgentTurn(input, input.trim());
   },
-}));
+
+  // Clicking a model thumbnail in a gallery: send a silent note asking the agent
+  // to import that GLB into the Blender scene, then screenshot. Shown to the user
+  // as a compact "Selected model …" bubble.
+  selectModel: async (modelUrl, name) => {
+    const note =
+      `[gallery selection] The user picked the 3D model "${name}" ` +
+      `(modelUrl: ${modelUrl}) from the model gallery. Import it into the scene ` +
+      `by calling download_model with that modelUrl and a short descriptive name, ` +
+      `then take a single viewport screenshot so the user sees the result. ` +
+      `Do NOT list models again.`;
+    await runAgentTurn(note, `Selected model “${name}”`);
+  },
+
+  // Clicking a texture thumbnail: send a silent note asking the agent to apply
+  // that Poly Haven texture to the most relevant object (or ask which one).
+  selectTexture: async (assetId, name) => {
+    const note =
+      `[gallery selection] The user picked the Poly Haven texture "${name}" ` +
+      `(assetId: ${assetId}) from the texture gallery. Apply it with apply_texture ` +
+      `to the most relevant existing object in the scene; if it is ambiguous which ` +
+      `object they mean, ask which object to texture before applying. Then take a ` +
+      `single viewport screenshot. Do NOT list textures again.`;
+    await runAgentTurn(note, `Selected texture “${name}”`);
+  },
+  };
+});

@@ -206,6 +206,7 @@ class BlenderMCPServer:
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
             "get_polyhaven_status": self.get_polyhaven_status,
+            "import_model_from_url": self.import_model_from_url,
         }
 
         # Add Polyhaven handlers if enabled
@@ -897,6 +898,62 @@ class BlenderMCPServer:
             return {
                 "error": "Requested format or resolution not available for this model"
             }
+
+    def import_model_from_url(self, model_url, name=None):
+        """Download a GLB/GLTF model from an arbitrary URL and import it.
+
+        Used by the agent's `download_model` tool to bring a model chosen from the
+        Microsoft 3D-model library into the scene. Returns the names of the objects
+        that were imported (the root is renamed to `name` when provided).
+        """
+        if not model_url:
+            return {"error": "No model_url provided"}
+
+        lower = model_url.split("?")[0].lower()
+        if lower.endswith(".gltf"):
+            suffix = ".gltf"
+        else:
+            # Default to .glb — the Microsoft library serves self-contained GLBs.
+            suffix = ".glb"
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            file_path = os.path.join(temp_dir, f"model{suffix}")
+            response = requests.get(model_url, headers=REQ_HEADERS, timeout=60)
+            if response.status_code != 200:
+                return {
+                    "error": f"Failed to download model: HTTP {response.status_code}"
+                }
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+
+            before = {obj.name for obj in bpy.context.scene.objects}
+            bpy.ops.import_scene.gltf(filepath=file_path)
+            after = [
+                obj for obj in bpy.context.scene.objects if obj.name not in before
+            ]
+            imported_objects = [obj.name for obj in after]
+
+            # Rename the imported root so later turns can reference it by a
+            # friendly, predictable name.
+            if name and after:
+                roots = [obj for obj in after if obj.parent is None] or after
+                try:
+                    roots[0].name = name
+                    imported_objects = [obj.name for obj in after]
+                except Exception:
+                    pass
+
+            return {
+                "success": True,
+                "message": f"Model imported successfully from {model_url}",
+                "imported_objects": imported_objects,
+            }
+        except Exception as e:
+            return {"error": f"Failed to import model from URL: {str(e)}"}
+        finally:
+            with suppress(Exception):
+                shutil.rmtree(temp_dir)
 
     def set_texture(self, object_name, texture_id):
         """Apply a previously downloaded Polyhaven texture to an object"""

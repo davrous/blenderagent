@@ -16,6 +16,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Annotated
 
+import httpx
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -94,6 +95,22 @@ BLOB_CONTAINER_NAME = "screenshots"
 # post-mortem debugging (the most recent render is still on disk after restore).
 _PERSISTENT_TMP = os.path.join(os.path.expanduser("~"), "tmp")
 os.makedirs(_PERSISTENT_TMP, exist_ok=True)
+
+# ── Asset libraries ─────────────────────────────────────────────────────────
+# Microsoft Office / PowerPoint 3D-model media service — the same public
+# endpoint the PowerPoint "3D Models" picker uses. Returns thumbnail images +
+# GLB download links, which the web client renders as a selectable gallery.
+MODEL_SEARCH_URL = os.environ.get(
+    "MODEL_SEARCH_URL",
+    "https://hubble.officeapps.live.com/mediasvc/api/media/search?v=1&lang=en-us",
+)
+MODEL_SEARCH_PAGE_SIZE = int(os.environ.get("MODEL_SEARCH_PAGE_SIZE", "5"))
+
+# Poly Haven public asset API — used ONLY for free PBR surface textures now.
+POLYHAVEN_API = os.environ.get("POLYHAVEN_API", "https://api.polyhaven.com").rstrip("/")
+TEXTURE_SEARCH_PAGE_SIZE = int(os.environ.get("TEXTURE_SEARCH_PAGE_SIZE", "6"))
+TEXTURE_DEFAULT_RESOLUTION = os.environ.get("TEXTURE_DEFAULT_RESOLUTION", "2k")
+_HTTP_HEADERS = {"User-Agent": "BlenderSceneAgent/1.0"}
 
 logger.info(
     "Storage config: AZURE_STORAGE_ACCOUNT_NAME=%r (env_set=%s)",
@@ -900,172 +917,291 @@ def get_viewport_screenshot(
 
 
 # ──────────────────────────────────────────────
-# Agent tools - Poly Haven assets
+# Agent tools - 3D model library (Microsoft)
 # ──────────────────────────────────────────────
 
 
 @tool(approval_mode="never_require")
-def search_polyhaven_assets(
-    asset_type: Annotated[
+def list_available_models(
+    query: Annotated[
         str,
-        "Type of asset to search for: 'hdris', 'textures', 'models', or 'all'",
-    ] = "all",
-    categories: Annotated[
-        str,
-        "Optional comma-separated list of categories to filter by. "
-        "For models, valid categories include: furniture, seating, table, food, dishes, "
-        "plants, nature, rocks, trees, props, decorative, industrial, containers, tools, "
-        "electronics, appliances, lighting, shelves, structures, buildings, office. "
-        "Note: use 'seating' for chairs/benches, 'food' for food items, 'dishes' for plates/bowls.",
-    ] = None,
+        "What kind of 3D model to look for in the library, e.g. 'chair', 'dog', "
+        "'spaceship'. A short noun phrase works best.",
+    ],
 ) -> str:
+    """Search Microsoft's public 3D-model library for downloadable GLB models.
+
+    Returns a JSON array (as a string) of up to a few models, each shaped like
+    {"name": str, "imageUrl": str, "modelUrl": str}:
+      * imageUrl is a thumbnail preview the web client shows in the chat gallery.
+      * modelUrl is the GLB download link to pass to `download_model` when the
+        user picks one.
+    Returns "[]" when nothing matches, or a string starting with "ERROR:" on failure.
     """
-    Search for free assets on Poly Haven (HDRIs, textures, 3D models).
-    Use this to find high-quality assets to enhance the scene.
-    """
-    logger.info("Tool called: search_polyhaven_assets(type=%r, categories=%r)", asset_type, categories)
+    logger.info("Tool called: list_available_models(query=%r)", query)
+    payload = {
+        "type": "Search",
+        "pageSize": MODEL_SEARCH_PAGE_SIZE,
+        "query": query,
+        "parameters": {"firstpartycontent": False, "app": "office"},
+        "descriptor": {"$type": "FirstPartyContentSearchDescriptor"},
+    }
     try:
-        blender = get_blender_connection()
-        result = blender.send_command(
-            "search_polyhaven_assets",
-            {"asset_type": asset_type, "categories": categories},
-        )
-
-        if "error" in result:
-            return f"Error: {result['error']}"
-
-        assets = result.get("assets", {})
-        total = result.get("total_count", 0)
-        returned = result.get("returned_count", 0)
-        note = result.get("note")
-
-        output = ""
-        if note:
-            output += f"⚠️ {note}\n\n"
-        output += f"Found {total} assets"
-        if categories:
-            output += f" in categories: {categories}"
-        output += f"\nShowing {returned} assets:\n\n"
-
-        sorted_assets = sorted(
-            assets.items(),
-            key=lambda x: x[1].get("download_count", 0),
-            reverse=True,
-        )[:10]  # Limit to top 10 to reduce token usage
-
-        for asset_id, data in sorted_assets:
-            type_names = {0: "HDRI", 1: "Texture", 2: "Model"}
-            output += f"- {data.get('name', asset_id)} (ID: {asset_id})"
-            output += f" | {type_names.get(data.get('type', 0), 'Unknown')}"
-            output += f" | {', '.join(data.get('categories', []))}\n"
-
-        logger.info("search_polyhaven_assets succeeded: %d total assets found", total)
-        return output
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(
+                MODEL_SEARCH_URL,
+                json=payload,
+                headers={"Content-Type": "application/json", **_HTTP_HEADERS},
+            )
+            response.raise_for_status()
+            content = response.json()
     except Exception as e:
-        logger.error("search_polyhaven_assets failed", exc_info=True)
-        return f"Error searching Poly Haven: {str(e)}"
+        logger.error("list_available_models transport error", exc_info=True)
+        return f"ERROR: could not reach the 3D-model library ({e})."
+
+    result = content.get("Result") or {}
+    part_groups = result.get("PartGroups") or []
+    models: list[dict[str, str]] = []
+    for group in part_groups:
+        image_parts = group.get("ImageParts") or []
+        image_url = image_parts[0].get("SourceUrl") if image_parts else None
+
+        title = None
+        model_url = None
+        for text_part in group.get("TextParts") or []:
+            category = text_part.get("TextCategory")
+            if category == "Title":
+                title = text_part.get("Text")
+            elif category == "OasisGlbLink":
+                model_url = text_part.get("Text")
+
+        # Only surface entries that have everything the client needs to show + load.
+        if title and image_url and model_url:
+            models.append({"name": title, "imageUrl": image_url, "modelUrl": model_url})
+
+    logger.info("list_available_models: %d model(s) found", len(models))
+    return json.dumps(models)
 
 
 @tool(approval_mode="never_require")
-def download_polyhaven_asset(
-    asset_id: Annotated[str, "The ID of the Poly Haven asset to download"],
-    asset_type: Annotated[
+def download_model(
+    model_url: Annotated[
         str,
-        "Type of asset: 'hdris', 'textures', or 'models'",
+        "The GLB download link (modelUrl) of the model to import, taken from a "
+        "previous list_available_models result.",
     ],
-    resolution: Annotated[str, "Resolution to download (e.g. '1k', '2k', '4k')"] = "1k",
-    file_format: Annotated[
+    name: Annotated[
         str,
-        "File format: 'hdr'/'exr' for HDRIs, 'jpg'/'png' for textures, 'gltf'/'fbx' for models",
-    ] = None,
+        "A short, descriptive name for the imported model. Becomes the Blender "
+        "object name so later turns can reference it (e.g. 'red_chair').",
+    ],
 ) -> str:
+    """Download a chosen GLB model from the library and import it into the scene.
+
+    After it succeeds, take ONE viewport screenshot so the user sees the result.
+    Returns a confirmation with the imported object names, or a message starting
+    with "Error"/"Blender crashed" on failure.
     """
-    Download and import a Poly Haven asset into the Blender scene.
-    - HDRIs: Set as world environment lighting
-    - Textures: Created as a material that can be applied to objects
-    - Models: Imported directly into the scene
-    """
-    logger.info("Tool called: download_polyhaven_asset(id=%r, type=%r, res=%r, fmt=%r)",
-                asset_id, asset_type, resolution, file_format)
+    logger.info("Tool called: download_model(name=%r, url=%r)", name, model_url)
     try:
         blender = get_blender_connection()
         result = blender.send_command(
-            "download_polyhaven_asset",
-            {
-                "asset_id": asset_id,
-                "asset_type": asset_type,
-                "resolution": resolution,
-                "file_format": file_format,
-            },
+            "import_model_from_url",
+            {"model_url": model_url, "name": name},
         )
 
         if "error" in result:
             return f"Error: {result['error']}"
 
         if result.get("success"):
-            message = result.get("message", "Asset imported successfully")
-            if asset_type == "hdris":
-                return f"{message}. The HDRI has been set as the world environment."
-            elif asset_type == "textures":
-                material = result.get("material", "")
-                maps = ", ".join(result.get("maps", []))
-                return f"{message}. Created material '{material}' with maps: {maps}."
-            elif asset_type == "models":
-                return f"{message}. The model has been imported into the scene."
-            logger.info("download_polyhaven_asset succeeded: %s", asset_id)
-            return message
-        else:
-            logger.warning("download_polyhaven_asset failed for %r: %s",
-                           asset_id, result.get('message', 'Unknown error'))
-            return f"Failed to download asset: {result.get('message', 'Unknown error')}"
-    except Exception as e:
-        logger.error("download_polyhaven_asset failed for %r", asset_id, exc_info=True)
-        if _is_blender_crash_error(e):
-            recovered = _recover_blender_scene("download_polyhaven_asset")
-            if recovered:
-                return _crash_user_message(
-                    f"download_polyhaven_asset(id={asset_id!r}, res={resolution!r})",
-                    e,
-                )
+            imported = ", ".join(result.get("imported_objects", [])) or name
+            logger.info("download_model succeeded: %s", imported)
             return (
-                f"Blender crashed while importing '{asset_id}' and could not recover. "
+                f"Imported the model into the scene as: {imported}. "
+                f"Now take a single viewport screenshot so the user can see it."
+            )
+        logger.warning("download_model failed: %s", result.get("message", "Unknown error"))
+        return f"Failed to import model: {result.get('message', 'Unknown error')}"
+    except Exception as e:
+        logger.error("download_model failed for url=%r", model_url, exc_info=True)
+        if _is_blender_crash_error(e):
+            recovered = _recover_blender_scene("download_model")
+            if recovered:
+                return _crash_user_message(f"download_model(name={name!r})", e)
+            return (
+                f"Blender crashed while importing the model and could not recover. "
                 f"Please ask the user to retry; the saved scene was preserved. "
                 f"Original error: {e}"
             )
-        return f"Error downloading asset: {str(e)}"
+        return f"Error importing model: {str(e)}"
+
+
+# ──────────────────────────────────────────────
+# Agent tools - Poly Haven textures
+# ──────────────────────────────────────────────
+
+
+def _score_texture(asset_id: str, meta: dict, tokens: list[str]) -> int:
+    """Rank a Poly Haven texture asset against the search tokens.
+
+    Higher weight for hits in the human name / id, then categories, then tags.
+    """
+    name_hay = f"{meta.get('name', '')} {asset_id}".lower()
+    tags = [str(t).lower() for t in (meta.get("tags") or [])]
+    cats = [str(c).lower() for c in (meta.get("categories") or [])]
+    score = 0
+    for tok in tokens:
+        if tok in name_hay:
+            score += 3
+        if tok in cats:
+            score += 2
+        elif any(tok in c for c in cats):
+            score += 1
+        if tok in tags:
+            score += 2
+        elif any(tok in t for t in tags):
+            score += 1
+    return score
 
 
 @tool(approval_mode="never_require")
-def apply_polyhaven_texture(
-    object_name: Annotated[str, "Name of the object to apply the texture to"],
-    texture_id: Annotated[
-        str, "ID of the Poly Haven texture (must be downloaded first)"
+def list_available_textures(
+    query: Annotated[
+        str,
+        "What kind of surface texture to look for, e.g. 'red brick', 'mossy rock', "
+        "'wood planks', 'concrete', 'sand'. A short descriptive phrase works best.",
     ],
 ) -> str:
+    """Search the Poly Haven library for free PBR surface textures.
+
+    Returns a JSON array (as a string) of up to a few textures, each shaped like
+    {"name": str, "imageUrl": str, "assetId": str}:
+      * imageUrl is a thumbnail preview the web client shows in the chat gallery.
+      * assetId is the Poly Haven id to pass to `apply_texture` when the user
+        picks one and names an object to apply it to.
+    Returns "[]" when nothing matches, or a string starting with "ERROR:" on failure.
     """
-    Apply a previously downloaded Poly Haven texture to an object.
-    The texture must be downloaded first using download_polyhaven_asset.
-    """
-    logger.info("Tool called: apply_polyhaven_texture(object=%r, texture=%r)", object_name, texture_id)
+    logger.info("Tool called: list_available_textures(query=%r)", query)
     try:
-        blender = get_blender_connection()
-        result = blender.send_command(
-            "set_texture",
-            {"object_name": object_name, "texture_id": texture_id},
+        with httpx.Client(timeout=30.0) as client:
+            response = client.get(
+                f"{POLYHAVEN_API}/assets",
+                params={"t": "textures"},
+                headers=_HTTP_HEADERS,
+            )
+            response.raise_for_status()
+            assets = response.json()
+    except Exception as e:
+        logger.error("list_available_textures transport error", exc_info=True)
+        return f"ERROR: could not reach the Poly Haven library ({e})."
+
+    if not isinstance(assets, dict):
+        return "ERROR: unexpected response from the Poly Haven library."
+
+    tokens = [t for t in query.lower().split() if t]
+    scored: list[tuple[int, str, dict]] = []
+    for asset_id, meta in assets.items():
+        if not isinstance(meta, dict):
+            continue
+        score = _score_texture(asset_id, meta, tokens) if tokens else 0
+        if score > 0:
+            scored.append((score, asset_id, meta))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    textures: list[dict[str, str]] = []
+    for _score, asset_id, meta in scored[:TEXTURE_SEARCH_PAGE_SIZE]:
+        thumb = meta.get("thumbnail_url") or (
+            f"https://cdn.polyhaven.com/asset_img/thumbs/{asset_id}.png?width=256&height=256"
+        )
+        textures.append(
+            {
+                "name": meta.get("name") or asset_id,
+                "imageUrl": thumb,
+                "assetId": asset_id,
+            }
         )
 
+    logger.info("list_available_textures: %d texture(s) found", len(textures))
+    return json.dumps(textures)
+
+
+@tool(approval_mode="never_require")
+def apply_texture(
+    asset_id: Annotated[
+        str,
+        "The Poly Haven texture id (assetId) to apply, taken from a previous "
+        "list_available_textures result, e.g. 'brick_wall_006'.",
+    ],
+    object_name: Annotated[
+        str,
+        "The name of the object in the scene to apply the texture to (e.g. "
+        "'ground', 'wall1', 'red_chair').",
+    ],
+    resolution: Annotated[
+        str,
+        "Texture resolution to download: '1k', '2k', or '4k'. Use '2k' unless the "
+        "user asks for sharper/heavier ('4k') or lighter ('1k') textures.",
+    ] = TEXTURE_DEFAULT_RESOLUTION,
+) -> str:
+    """Download a Poly Haven PBR texture and apply it as a material to an object.
+
+    Downloads the texture's maps into Blender, builds a Principled BSDF material,
+    and assigns it to `object_name`. After it succeeds, take ONE viewport
+    screenshot so the user sees the result.
+    """
+    resolution = (resolution or TEXTURE_DEFAULT_RESOLUTION).lower()
+    logger.info(
+        "Tool called: apply_texture(asset=%r, object=%r, res=%r)",
+        asset_id, object_name, resolution,
+    )
+    try:
+        blender = get_blender_connection()
+        # 1) Download the texture maps into Blender (creates a material + images
+        #    named "<asset_id>_<map>").
+        dl = blender.send_command(
+            "download_polyhaven_asset",
+            {
+                "asset_id": asset_id,
+                "asset_type": "textures",
+                "resolution": resolution,
+                "file_format": None,
+            },
+        )
+        if "error" in dl:
+            return f"Error downloading texture '{asset_id}': {dl['error']}"
+
+        # 2) Build a material from those maps and assign it to the object.
+        result = blender.send_command(
+            "set_texture",
+            {"object_name": object_name, "texture_id": asset_id},
+        )
         if "error" in result:
             return f"Error: {result['error']}"
 
         if result.get("success"):
-            logger.info("apply_polyhaven_texture succeeded: %r -> %r", texture_id, object_name)
-            return f"Applied texture '{texture_id}' to '{object_name}'. Material: {result.get('material', '')}"
-        else:
-            logger.warning("apply_polyhaven_texture failed: %s", result.get('message', 'Unknown error'))
-            return f"Failed to apply texture: {result.get('message', 'Unknown error')}"
+            logger.info("apply_texture succeeded: %r -> %r", asset_id, object_name)
+            return (
+                f"Applied texture '{asset_id}' to '{object_name}'. "
+                f"Now take a single viewport screenshot so the user can see it."
+            )
+        logger.warning("apply_texture failed: %s", result.get("message", "Unknown error"))
+        return f"Failed to apply texture: {result.get('message', 'Unknown error')}"
     except Exception as e:
-        logger.error("apply_polyhaven_texture failed for object=%r texture=%r",
-                     object_name, texture_id, exc_info=True)
+        logger.error(
+            "apply_texture failed for asset=%r object=%r",
+            asset_id, object_name, exc_info=True,
+        )
+        if _is_blender_crash_error(e):
+            recovered = _recover_blender_scene("apply_texture")
+            if recovered:
+                return _crash_user_message(
+                    f"apply_texture(asset={asset_id!r}, object={object_name!r})", e
+                )
+            return (
+                f"Blender crashed while applying the texture and could not recover. "
+                f"Please ask the user to retry; the saved scene was preserved. "
+                f"Original error: {e}"
+            )
         return f"Error applying texture: {str(e)}"
 
 
@@ -1485,9 +1621,10 @@ _TOOL_STATUS_MESSAGES: dict[str, str] = {
     "apply_material": "Applying material…",
     "execute_blender_code": "Executing Blender code…",
     "get_viewport_screenshot": "Capturing viewport screenshot…",
-    "search_polyhaven_assets": "Searching Poly Haven assets…",
-    "download_polyhaven_asset": "Downloading asset from Poly Haven…",
-    "apply_polyhaven_texture": "Applying Poly Haven texture…",
+    "list_available_models": "Searching the 3D model library…",
+    "download_model": "Importing the 3D model…",
+    "list_available_textures": "Searching Poly Haven textures…",
+    "apply_texture": "Applying the texture…",
     "setup_scene": "Setting up the scene…",
     "render_preview": "Rendering a quick preview…",
     "render_final": "Rendering the final image (this may take a moment)…",
@@ -2172,19 +2309,50 @@ async def main():
 - For batch operations (multiple objects, materials, transforms), prefer a single execute_blender_code() call with one combined Python script instead of many sequential tool calls.
 - When creating an object that needs a color, call create_object() then apply_material() — but batch multiple such pairs into one execute_blender_code() call when possible.
 - Use setup_scene() to initialize camera and lighting when starting a new scene.
-- Use Poly Haven assets for high-quality textures, HDRIs, and models.
+- Use the 3D model library (list_available_models / download_model) to add ready-made models, and Poly Haven textures (list_available_textures / apply_texture) to dress surfaces. See the "3D model library & Poly Haven textures" section below for the exact gallery workflow.
 - Position objects thoughtfully — avoid overlapping, ensure proper scale (1 unit = 1 meter).
 - Rotation values are in degrees.
 - **Rendering workflow**:
   1. When the user asks for a high-fidelity render WITHOUT specifying a resolution (or at 640x480 or smaller): call render_final() ONCE at **640x480 with 32 samples**. Do NOT call render_preview() — a single render_final() call is sufficient. Include the render image from render_final() in your response.
   2. When the user asks for a high-fidelity render at a resolution HIGHER than 640x480 (e.g. 1920x1080): first call render_final() at **640x480 with 32 samples** as a quick preview, return that image to the user immediately, then ASK the user to confirm whether they want to generate the higher-resolution version. If confirmed, call render_final() again at the **requested resolution with 256 samples** and return that image.
-- Poly Haven asset types: hdris (environment lighting), textures (materials), models (3D models).
 - NEVER set `collection.name` — it is read-only in this Blender environment. To organize objects, create new collections with `bpy.data.collections.new("Name")` and link them to the scene with `bpy.context.scene.collection.children.link(new_collection)` instead of renaming existing ones.
 - The render engine enum for Eevee in Blender 4.x is `'BLENDER_EEVEE_NEXT'`, NOT `'BLENDER_EEVEE'`. Valid engines are: `'BLENDER_EEVEE_NEXT'`, `'BLENDER_WORKBENCH'`, `'CYCLES'`.
 - When a tool returns an image in markdown format (e.g. `![screenshot](url)` or `![render](url)`), you MUST include that exact markdown image link in your response so the chat client can display the image. Never omit, summarize, or rewrite the image URL.
 
+## 3D model library & Poly Haven textures
+You have two asset libraries. The web chat renders picture galleries the user can click, so you MUST follow this exact protocol.
+
+### Ready-made 3D models (Microsoft library)
+- `list_available_models(query)` — search the library. Returns a JSON array of models, each with `name`, `imageUrl` (a thumbnail) and `modelUrl`.
+- `download_model(model_url, name)` — downloads a chosen GLB and imports it into the Blender scene.
+
+Workflow:
+- When the user wants to find or browse ready-made models ("find a chair", "show me some dinosaurs", "do you have a spaceship?"), call `list_available_models`. Then, in your reply, include the tool's JSON array VERBATIM inside a single fenced block tagged ` ```models ` (NOT ` ```json `). The web client renders those thumbnails as a clickable gallery. Add ONE short friendly sentence before the block, and do NOT also create objects or take a screenshot in this turn — just present the gallery.
+- Example reply shape:
+    Here are a few chairs I found:
+    ```models
+    [{"name":"Wooden Chair","imageUrl":"https://…","modelUrl":"https://….glb"}]
+    ```
+- When the user then picks one (by clicking a thumbnail, or saying "load the wooden one", "add the 2nd"), call `download_model` with that model's `modelUrl` and a short descriptive `name`, then take ONE viewport screenshot so they see the result.
+- If `list_available_models` returns "[]", tell the user nothing matched and suggest a different search term. If it returns an "ERROR:…" string, briefly apologize and do NOT include a ` ```models ` block.
+
+### Poly Haven PBR textures
+- `list_available_textures(query)` — search Poly Haven for free surface textures (brick, wood, rock, concrete, fabric, sand, …). Returns a JSON array of textures, each with `name`, `imageUrl` (a thumbnail) and `assetId`.
+- `apply_texture(asset_id, object_name, resolution)` — downloads that texture and applies it as a PBR material to a named object.
+
+Workflow:
+- When the user wants to find or browse textures ("find a brick texture", "show me some wood surfaces"), call `list_available_textures`. Then, in your reply, include the tool's JSON array VERBATIM inside a single fenced block tagged ` ```textures ` (NOT ` ```models ` and NOT ` ```json `). The web client renders those thumbnails as a clickable gallery. Add ONE short friendly sentence before the block, and do NOT apply a texture or take a screenshot in this turn — just present the gallery.
+- Example reply shape:
+    Here are a few brick textures I found:
+    ```textures
+    [{"name":"Brick Wall 006","imageUrl":"https://…","assetId":"brick_wall_006"}]
+    ```
+- When the user then picks one AND names an object to texture ("put the first brick on the wall", "apply that rock to the ground"), call `apply_texture` with the chosen `assetId`, the target `object_name`, and a `resolution` ('2k' unless they ask sharper/lighter), then take ONE viewport screenshot.
+- If the user picks a texture but has not said which object to apply it to, ASK which object before calling `apply_texture`.
+- If `list_available_textures` returns "[]", tell the user nothing matched and suggest a different search term. If it returns an "ERROR:…" string, briefly apologize and do NOT include a ` ```textures ` block.
+
 ## Recovering from Blender crashes
-Some operations (especially importing large or complex Poly Haven models, or running heavy `execute_blender_code` scripts) can occasionally crash the Blender process. When this happens, a tool will return a message that begins with **"Blender crashed"**. The previous scene has already been automatically restored from the saved state — you do NOT need to rebuild it. When you see such a message:
+Some operations (especially importing large or complex 3D models, or running heavy `execute_blender_code` scripts) can occasionally crash the Blender process. When this happens, a tool will return a message that begins with **"Blender crashed"**. The previous scene has already been automatically restored from the saved state — you do NOT need to rebuild it. When you see such a message:
 1. Acknowledge the crash to the user briefly (one short sentence).
 2. Try a different approach for that step: a smaller resolution (e.g. `'1k'` instead of `'2k'`), a simpler asset, or build the missing geometry with `create_object` primitives.
 3. Do NOT immediately retry the EXACT same operation — it is likely to crash again.
@@ -2251,9 +2419,10 @@ This environment runs **Blender 4.4**. The following Blender 3.x APIs were remov
             apply_material,
             execute_blender_code,
             get_viewport_screenshot,
-            search_polyhaven_assets,
-            download_polyhaven_asset,
-            apply_polyhaven_texture,
+            list_available_models,
+            download_model,
+            list_available_textures,
+            apply_texture,
             setup_scene,
             render_preview,
             render_final,

@@ -330,6 +330,64 @@ html, body, #root {
   margin-top: 2px;
 }
 
+/* ── Asset gallery (models / textures) ─────── */
+
+.asset-gallery {
+  margin: 10px 0 4px;
+}
+.asset-gallery-title {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+.asset-gallery-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 10px;
+}
+.asset-card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elev-2);
+  color: var(--text);
+  cursor: pointer;
+  overflow: hidden;
+  text-align: left;
+  transition: border-color 0.12s ease, transform 0.12s ease;
+}
+.asset-card:hover:not(:disabled) {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+}
+.asset-card:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.asset-card img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  background: var(--bg);
+}
+.asset-gallery-textures .asset-card img {
+  object-fit: cover;
+}
+.asset-card-caption {
+  padding: 6px 8px;
+  font-size: 12px;
+  line-height: 1.25;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* ── Composer ─────────────────────────────── */
 
 .composer {

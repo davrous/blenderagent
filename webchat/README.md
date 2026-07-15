@@ -92,7 +92,7 @@ webchat/
         ├── api/stream.ts   # Manual SSE parser over fetch()
         ├── api/voice.ts    # Push-to-talk mic capture + PCM playback (Web Audio)
         ├── state/chatStore.ts   # zustand: messages + previous_response_id + voice
-        ├── components/     # ChatView, Composer, MessageBubble,
+        ├── components/     # ChatView, Composer, MessageBubble, AssetGallery,
         │                   # StatusPill, ImageLightbox, DownloadButton
         ├── lib/parseMarkdown.ts
         └── styles.css
@@ -106,6 +106,7 @@ webchat/
 - **Status pills.** The agent's `ToolStatusMiddleware` emits italic single-line markers like `*Rendering the final image…*`. The client extracts complete blocks of this shape from the streamed buffer and renders them as a pulsing badge above the message instead of inline italic text. The latest one replaces the previous; they disappear when the response completes.
 - **Inline images.** Tools like `get_viewport_screenshot`, `render_preview`, and `render_final` return their results as `![label](sas-url)`. The client's custom `img` renderer wraps them in a button that opens a full-screen lightbox (click backdrop or press `Esc` to close).
 - **Download buttons.** `save_scene_for_download` and `export_scene_as_glb_for_download` return `[Download…](sas-url)`. The custom `a` renderer detects `.blend` / `.glb` URLs and renders a styled download button instead of a plain link.
+- **Asset galleries.** When the agent surfaces 3D models (`list_available_models`) or Poly Haven textures (`list_available_textures`), it emits the tool's JSON verbatim inside a ` ```models ` / ` ```textures ` fenced block. The client parses those blocks (`parseMarkdown.ts`), strips them from the prose, and renders clickable thumbnail galleries (`AssetGallery`). Clicking a model card asks the agent to import that GLB into the Blender scene; clicking a texture card asks it to apply that texture to an object. Galleries render the same way for typed and voice turns, and clicks are disabled while a turn is in flight.
 - **Reset.** Clears local state, asks the proxy to delete the foundry session (no-op in local mode), and rotates the conversation id so the next message starts a fresh conversation (and a fresh Blender scene).
 - **Voice (push-to-talk).** When `VOICE_ENABLED=true`, a 🎙️ button appears. Hold it to talk: the browser captures the mic, downsamples to 24 kHz PCM, and streams it over `/api/voice` (a WebSocket the proxy relays to the agent's `invocations_ws` server). Release to send. The agent transcribes the speech, runs the *same* turn as the typed path (so voice and text share one Blender scene keyed by `conversation_id`), streams the reply text back as `delta` frames (rendered identically, with status pills, screenshots, and download buttons), and speaks the prose back as 24 kHz PCM audio. URLs are never read aloud — a short spoken cue announces screenshots/renders/downloads. Continuity is client-owned: the browser sends `conversation_id` + `previous_response_id` in the `commit` frame and updates `previous_response_id` from the `done` frame. Press the mic while the agent is speaking to barge in.
 

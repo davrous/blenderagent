@@ -5,7 +5,8 @@ name: new-fantasy-worlds-agent
 description: >
   An AI agent that creates and manipulates 3D scenes in Blender.
   Communicates with a headless Blender instance via TCP socket to create
-  objects, apply materials, use Poly Haven assets, and return viewport screenshots.
+  objects, apply materials, import ready-made 3D models from Microsoft's
+  model library, apply Poly Haven PBR textures, and return viewport screenshots.
 metadata:
   authors:
     - Microsoft

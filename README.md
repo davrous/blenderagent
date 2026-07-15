@@ -38,7 +38,8 @@ and streams the spoken reply back as 24 kHz PCM.
 
 - **Create 3D objects**: Cubes, spheres, cylinders, cones, torus, planes, monkeys
 - **Apply materials**: Hex colors with metallic/roughness control
-- **Poly Haven integration**: Search and download free HDRIs, textures, and 3D models
+- **3D model library** — the agent can search Microsoft's public 3D-model service (`list_available_models`) and return a clickable thumbnail gallery in the chat. Click a thumbnail (or ask in natural language) and the agent imports that GLB into the Blender scene (`download_model`) and screenshots the result.
+- **Poly Haven textures** — the agent can search [Poly Haven](https://polyhaven.com/) for free PBR surface textures (`list_available_textures`) and return a clickable gallery; pick one and name an object and it applies the texture as a material (`apply_texture`).
 - **Viewport screenshots**: Capture and return the current viewport as base64 PNG
 - **Full render**: Render scenes with EEVEE or Cycles engines
 - **Voice (speech-in / speech-out)**: Optional push-to-talk voice powered by Azure Speech; shares the same server-side Blender scene as text chat
@@ -366,16 +367,17 @@ mic button to talk.
 | `apply_material` | Apply a colored material with metallic/roughness |
 | `execute_blender_code` | Run arbitrary Python code in Blender |
 | `get_viewport_screenshot` | Capture the 3D viewport as PNG |
-| `search_polyhaven_assets` | Search Poly Haven for HDRIs/textures/models |
-| `download_polyhaven_asset` | Download and import a Poly Haven asset |
-| `apply_polyhaven_texture` | Apply a downloaded texture to an object |
+| `list_available_models` | Search Microsoft's 3D-model library (returns a clickable gallery) |
+| `download_model` | Import a chosen GLB model from the library into the scene |
+| `list_available_textures` | Search Poly Haven for free PBR textures (returns a clickable gallery) |
+| `apply_texture` | Download a Poly Haven texture and apply it to an object |
 | `setup_scene` | Initialize camera, lighting, and ground plane |
 | `render_scene` | Render the scene with EEVEE or Cycles |
 | `save_scene_for_download` | Save the scene as a .blend file and return a download link (expires after 1 hour) |
 
 ## Demos prompts
 
-- "Load a table from Poly Haven, place it at the center, create 12 metallic cubes of various colors around it and share a high fidelity rendering of the result"
+- "Find a table in the model library, add it to the center, create 12 metallic cubes of various colors around it and share a high fidelity rendering of the result"
 - "Add a plastic yellow sphere on top of the table"
 
 ![Screenshot of the Foundry Hosted Blender Agent in action](ScreenshotDemoFoundryBlenderAgent.jpg)
@@ -504,7 +506,7 @@ Provides **per-VM Blender scene persistence** on top of a single shared Blender 
 
 Transforms the raw streaming response into a richer UX stream for the WebChat client:
 
-- **Human-readable status pills** — when a `FunctionCallContent` chunk is seen for a tool such as `render_final` or `download_polyhaven_asset`, an extra status message ("Rendering the final image…", "Downloading asset from Poly Haven…") is emitted via the `_TOOL_STATUS_MESSAGES` map. Without this the user just sees a long pause while a tool runs.
+- **Human-readable status pills** — when a `FunctionCallContent` chunk is seen for a tool such as `render_final` or `download_model`, an extra status message ("Rendering the final image…", "Importing the 3D model…") is emitted via the `_TOOL_STATUS_MESSAGES` map. Without this the user just sees a long pause while a tool runs.
 - **Deduplication** — the framework can emit multiple `FunctionCallContent` chunks with different `call_id`s for one logical invocation; a per-turn `announced_names` set ensures only one pill per tool.
 - **Early image surfacing** — for image-producing tools (`get_viewport_screenshot`, `render_preview`, `render_final`) the markdown image is pulled out of the tool result and streamed immediately, instead of waiting for the model to echo it in its final answer.
 - **Early download-link surfacing** — same treatment for `save_scene_for_download` and `export_scene_as_glb_for_download`.

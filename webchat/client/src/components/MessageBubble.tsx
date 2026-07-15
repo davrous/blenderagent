@@ -2,11 +2,17 @@ import { memo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import clsx from "clsx";
-import type { Message } from "../state/chatStore";
+import { useChatStore, type Message } from "../state/chatStore";
 import { StatusPill } from "./StatusPill";
 import { ImageLightbox } from "./ImageLightbox";
 import { DownloadButton } from "./DownloadButton";
-import { isDownloadLink, dedupeMarkdownMedia } from "../lib/parseMarkdown";
+import { AssetGallery } from "./AssetGallery";
+import {
+  isDownloadLink,
+  dedupeMarkdownMedia,
+  extractGalleries,
+  stripGalleryBlocks,
+} from "../lib/parseMarkdown";
 
 interface Props {
   message: Message;
@@ -14,6 +20,9 @@ interface Props {
 
 function MessageBubbleImpl({ message }: Props) {
   const [lightbox, setLightbox] = useState<{ src: string; alt?: string } | null>(null);
+  const selectModel = useChatStore((s) => s.selectModel);
+  const selectTexture = useChatStore((s) => s.selectTexture);
+  const busy = useChatStore((s) => s.isStreaming || s.voiceActive);
 
   if (message.role === "user") {
     return (
@@ -22,6 +31,9 @@ function MessageBubbleImpl({ message }: Props) {
       </div>
     );
   }
+
+  const galleries = extractGalleries(message.text);
+  const prose = dedupeMarkdownMedia(stripGalleryBlocks(message.text));
 
   return (
     <div className={clsx("msg msg-assistant", `msg-${message.status}`)}>
@@ -34,7 +46,7 @@ function MessageBubbleImpl({ message }: Props) {
           <div className="msg-error">⚠️ {message.errorText ?? "Error"}</div>
         )}
 
-        {message.text && (
+        {prose && (
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
             components={{
@@ -68,11 +80,21 @@ function MessageBubbleImpl({ message }: Props) {
               },
             }}
           >
-            {dedupeMarkdownMedia(message.text)}
+            {prose}
           </ReactMarkdown>
         )}
 
-        {message.status === "streaming" && !message.text && !message.currentStatus && (
+        {galleries.map((gallery, i) => (
+          <AssetGallery
+            key={`${gallery.kind}-${i}`}
+            gallery={gallery}
+            disabled={busy}
+            onSelectModel={(m) => selectModel(m.modelUrl, m.name)}
+            onSelectTexture={(t) => selectTexture(t.assetId, t.name)}
+          />
+        ))}
+
+        {message.status === "streaming" && !prose && !galleries.length && !message.currentStatus && (
           <div className="msg-thinking">
             <span className="dot" />
             <span className="dot" />
@@ -80,7 +102,7 @@ function MessageBubbleImpl({ message }: Props) {
           </div>
         )}
 
-        {message.status === "done" && !message.text && !message.errorText && (
+        {message.status === "done" && !prose && !galleries.length && !message.errorText && (
           <div className="msg-empty">
             <em>(no response)</em>
           </div>
@@ -99,3 +121,4 @@ function MessageBubbleImpl({ message }: Props) {
 }
 
 export const MessageBubble = memo(MessageBubbleImpl);
+
