@@ -5,25 +5,34 @@ An AI agent that creates and manipulates 3D scenes in a headless Blender instanc
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Docker Container                                       │
-│                                                         │
-│  ┌──────────┐    ┌──────────────────┐    ┌───────────┐  │
-│  │  Xvfb    │◄───│  Blender 4.2     │    │  Python   │  │
-│  │ :99      │    │  (background)    │◄──►│  Agent    │  │
-│  │ virtual  │    │                  │TCP │  Server   │  │
-│  │ display  │    │  blender_startup │9876│  :8088    │  │
-│  └──────────┘    │  .py (socket     │    │           │  │
-│                  │   server)        │    │  main.py  │  │
-│                  └──────────────────┘    └─────┬─────┘  │
-│                                               │        │
-└───────────────────────────────────────────────┼────────┘
-                                                │ HTTPS
-                                     ┌──────────▼──────────┐
-                                     │  Azure AI Foundry   │
-                                     │  (GPT-4.1-mini)     │
-                                     └─────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│  Docker Container                                                │
+│                                                                  │
+│  ┌──────────┐    ┌──────────────────┐    ┌──────────────────┐    │
+│  │  Xvfb    │◄───│  Blender 4.2     │    │  Python Agent    │    │
+│  │ :99      │    │  (background)    │◄──►│  Server          │    │
+│  │ virtual  │    │                  │TCP │                  │    │
+│  │ display  │    │  blender_startup │9876│  main.py  :8088  │    │
+│  └──────────┘    │  .py (socket     │    │  (Responses API) │    │
+│                  │   server)        │    │                  │    │
+│                  │                  │    │  voice_pipeline  │    │
+│                  │                  │    │  .py      :8089  │    │
+│                  └──────────────────┘    │  (voice WS)      │    │
+│                                          └────┬────────┬────┘    │
+│                                               │        │         │
+└───────────────────────────────────────────────┼────────┼────────┘
+                                          HTTPS  │        │  STT/TTS
+                                   ┌─────────────▼───┐  ┌─▼──────────────────┐
+                                   │  Azure AI       │  │  Azure Speech /    │
+                                   │  Foundry        │  │  AI Services       │
+                                   │  (GPT model)    │  │  (speech-in/out)   │
+                                   └─────────────────┘  └────────────────────┘
 ```
+
+The voice server is optional (see [Voice](#voice-speech-in--speech-out)): it
+transcribes microphone audio with Azure Speech, routes the transcript through the
+*same* agent turn as text (so voice and text share one server-side Blender scene),
+and streams the spoken reply back as 24 kHz PCM.
 
 ## Features
 
@@ -32,6 +41,7 @@ An AI agent that creates and manipulates 3D scenes in a headless Blender instanc
 - **Poly Haven integration**: Search and download free HDRIs, textures, and 3D models
 - **Viewport screenshots**: Capture and return the current viewport as base64 PNG
 - **Full render**: Render scenes with EEVEE or Cycles engines
+- **Voice (speech-in / speech-out)**: Optional push-to-talk voice powered by Azure Speech; shares the same server-side Blender scene as text chat
 - **Arbitrary code execution**: Run custom Blender Python code for advanced operations
 - **Per-VM Blender scene persistence**: Each Foundry micro-VM owns a single Blender scene, saved/restored from `$HOME` across idle resumes
 
@@ -40,6 +50,7 @@ An AI agent that creates and manipulates 3D scenes in a headless Blender instanc
 | File | Purpose |
 |------|---------|
 | `main.py` | Agent server with 13 tool functions, Azure AI Foundry client |
+| `voice_pipeline.py` | Optional voice server: Azure Speech STT/TTS over the `invocations_ws` WebSocket (port 8089), routing speech through the same agent turn as text |
 | `blender_startup.py` | Blender addon (runs inside Blender) - TCP socket server on port 9876 |
 | `blender_connection.py` | TCP client module used by the agent to talk to Blender |
 | `scene_manager.py` | Single-scene-per-VM Blender persistence on `$HOME` |
