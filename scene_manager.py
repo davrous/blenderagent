@@ -136,6 +136,27 @@ class SceneManager:
         """True if ``$HOME/blender_scenes/scene.blend`` exists."""
         return os.path.exists(_SCENE_FILE)
 
+    def is_conversation_reset(self, conversation_id: str | None) -> bool:
+        """True when this turn's conversation id differs from the last saved one.
+
+        The web-chat **Reset** button rotates the client's conversation id (and
+        drops ``previous_response_id``). Because the Blender scene is persisted
+        per micro-VM — NOT keyed by conversation id — a rotated id is our only
+        signal that the user asked to start over, so we discard the saved scene
+        instead of restoring it.
+
+        Deliberately conservative so we never destroy a scene the user wants to
+        keep: returns True only when this is NOT a brand-new container, a saved
+        scene actually exists, and BOTH the incoming and last-saved conversation
+        ids are known and differ. A missing/unknown id falls through to restore.
+        """
+        if self._new_scene or not conversation_id:
+            return False
+        if not os.path.exists(_SCENE_FILE):
+            return False
+        last = _read_session_state().get("last_conversation_id")
+        return bool(last) and conversation_id != last
+
     # ── State-file updates ──
 
     def set_blender_ready(self, ready: bool) -> None:
@@ -156,16 +177,28 @@ class SceneManager:
         With the single-scene/micro-VM model this is straightforward:
 
           * If ``new_scene`` is True (fresh container), reset to clean.
+          * Else if the conversation id was rotated by the web-chat Reset
+            button (``is_conversation_reset``), discard the saved scene and
+            reset to clean.
           * Else if ``$HOME/blender_scenes/scene.blend`` exists, load it.
           * Else (state says we should have one but the file is missing),
             log a warning and reset to clean.
 
-        ``conversation_id`` is accepted for logging/diagnostics only.
+        ``conversation_id`` is used to detect a Reset (id change) and for
+        logging/diagnostics.
         """
         if self._new_scene:
             logger.info(
                 "activate_scene: fresh container (conversation=%s) — resetting to clean scene",
                 conversation_id,
+            )
+            self._reset_scene()
+        elif self.is_conversation_reset(conversation_id):
+            last = _read_session_state().get("last_conversation_id")
+            logger.info(
+                "activate_scene: conversation id changed (last=%s -> now=%s) — web-chat "
+                "Reset requested; discarding saved scene and starting from a clean scene",
+                last, conversation_id,
             )
             self._reset_scene()
         elif os.path.exists(_SCENE_FILE):

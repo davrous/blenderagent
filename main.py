@@ -2171,10 +2171,15 @@ class SceneIsolationMiddleware(AgentMiddleware):
         # per container lifetime; either it exists (resume) or it doesn't
         # (fresh container).
         is_brand_new = self._scene_manager.new_scene
+        is_reset = (not is_brand_new) and self._scene_manager.is_conversation_reset(conversation_id)
         has_local = self._scene_manager.has_saved_scene()
         if is_brand_new:
             recovery_messages.append(
                 "🆕 First time using the agent in this session — setting up a fresh Blender scene for you."
+            )
+        elif is_reset:
+            recovery_messages.append(
+                "🆕 Starting a brand-new scene for your reset conversation."
             )
         elif has_local:
             recovery_messages.append(
