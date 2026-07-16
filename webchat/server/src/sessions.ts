@@ -28,6 +28,13 @@ interface SessionCacheEntry {
 
 let versionCache: VersionCacheEntry | null = null;
 const sessionCache = new Map<string, SessionCacheEntry>();
+// Foundry Responses `conversation` (conv_...) per browser conversation id. This
+// is DISTINCT from the hosted-agent session: the session gives compute/scene
+// affinity, while the conversation gives platform-managed history AND is what
+// the Foundry portal groups traces by (gen_ai.conversation.id). Sending only a
+// session leaves gen_ai.conversation.id empty, so webchat turns never show up
+// as a conversation in the portal / Monitor tab.
+const conversationCache = new Map<string, string>();
 
 function buildHeaders(token: string, contentType?: string): Record<string, string> {
   const h: Record<string, string> = {
@@ -152,6 +159,53 @@ export async function getOrCreateSession(
 
 export function evictSession(conversationId: string): void {
   sessionCache.delete(conversationId);
+}
+
+/**
+ * Get (or lazily create) the Foundry Responses `conversation` id (conv_...) for
+ * a browser conversation. Both the text and voice paths call this with the same
+ * browser conversation id, so they resolve to ONE Foundry conversation — which
+ * is what makes turns appear (and group) in the portal traces / Monitor tab.
+ */
+export async function getOrCreateConversation(
+  conversationId: string,
+): Promise<string> {
+  const cached = conversationCache.get(conversationId);
+  if (cached) return cached;
+
+  const token = await ensureToken();
+  const url = withApiVersion(
+    `${config.foundryAgentBase}/endpoint/protocols/openai/conversations`,
+  );
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: buildHeaders(token, "application/json"),
+    body: JSON.stringify({ metadata: { webchat_conversation_id: conversationId } }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(
+      `Failed to create conversation: ${res.status} ${text.slice(0, 500)}`,
+    );
+  }
+
+  const body = (await res.json()) as { id?: string };
+  const foundryConversationId = body.id;
+  if (!foundryConversationId) {
+    throw new Error("Conversation create response missing id");
+  }
+
+  conversationCache.set(conversationId, foundryConversationId);
+  console.log(
+    `[conversations] created ${foundryConversationId} for conversation=${conversationId}`,
+  );
+  return foundryConversationId;
+}
+
+export function evictConversation(conversationId: string): void {
+  conversationCache.delete(conversationId);
 }
 
 export async function deleteSession(conversationId: string): Promise<void> {

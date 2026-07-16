@@ -6,7 +6,9 @@ import { config } from "./config.js";
 import { getBearerToken } from "./auth.js";
 import {
   getOrCreateSession,
+  getOrCreateConversation,
   evictSession,
+  evictConversation,
   deleteSession,
 } from "./sessions.js";
 import { attachVoiceRelay } from "./voice.js";
@@ -203,6 +205,12 @@ async function buildUpstreamRequest(
 
   // Foundry mode
   const { agentSessionId } = await getOrCreateSession(conversationId);
+  // Also resolve the Foundry Responses `conversation` (conv_...). The hosted
+  // agent runs the `responses` protocol, which per the Foundry docs should
+  // carry BOTH a session (compute/scene affinity) AND a conversation (history +
+  // portal trace grouping). Without `conversation`, gen_ai.conversation.id is
+  // empty, so turns never appear as a conversation in the portal / Monitor tab.
+  const foundryConversationId = await getOrCreateConversation(conversationId);
 
   headers["Foundry-Features"] = config.foundryFeaturesHeader;
 
@@ -215,6 +223,9 @@ async function buildUpstreamRequest(
     input,
     stream: true,
     agent_session_id: agentSessionId,
+    // Group turns into one Foundry conversation so the portal traces / Monitor
+    // tab record them and multi-turn history is platform-managed.
+    conversation: foundryConversationId,
     // The Foundry `agent_session_id` is a Foundry-internal session id that
     // does NOT propagate to `context.session.session_id` in the agent_framework
     // middleware. We therefore also pass the WebChat conversation UUID through
@@ -225,7 +236,7 @@ async function buildUpstreamRequest(
   };
 
   console.log(
-    `[chat] foundry mode: conversation=${conversationId} agent_session_id=${agentSessionId}`,
+    `[chat] foundry mode: conversation=${conversationId} agent_session_id=${agentSessionId} foundry_conversation=${foundryConversationId}`,
   );
 
   return { url, headers, payload, conversationId };
@@ -283,6 +294,7 @@ app.post("/api/chat", async (req, res) => {
       `[chat] stale session (${upstream.status}); evicting and retrying once: ${text.slice(0, 300)}`,
     );
     evictSession(upstreamReq.conversationId);
+    evictConversation(upstreamReq.conversationId);
     try {
       upstreamReq = await buildUpstreamRequest(body, input);
       upstream = await doFetch();
@@ -361,6 +373,7 @@ app.post("/api/reset", async (req, res) => {
   }
   try {
     await deleteSession(body.conversation_id);
+    evictConversation(body.conversation_id);
     res.json({ ok: true });
   } catch (err) {
     console.error("Reset failed:", err);
