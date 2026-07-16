@@ -3,7 +3,6 @@ import type { Server, IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
 import { config } from "./config.js";
 import { getBearerToken } from "./auth.js";
-import { getOrCreateSession } from "./sessions.js";
 
 const VOICE_PATH = "/api/voice";
 
@@ -54,33 +53,38 @@ function sendTo(ws: WebSocket, data: RawData, isBinary: boolean): void {
   }
 }
 
-function buildFoundryVoiceWsUrl(agentSessionId: string): string {
+function buildFoundryVoiceWsUrl(conversationId: string): string {
+  // Per the `invocations_ws` protocol (Foundry voice-agent docs + foundry-
+  // samples): the project and agent are PATH segments (mirroring the Responses
+  // URL), `api-version` is REQUIRED, and `agent_session_id` is optional. The
+  // bearer token is sent as an Authorization header on the upgrade. The
+  // container serves this route on the same agentserver port as /responses.
   const base = `${config.foundryAgentBase}/endpoint/protocols/invocations_ws`
     .replace(/^https:/i, "wss:")
     .replace(/^http:/i, "ws:");
-  const sep = base.includes("?") ? "&" : "?";
-  return (
-    `${base}${sep}api-version=${encodeURIComponent(config.apiVersion)}` +
-    `&agent_session_id=${encodeURIComponent(agentSessionId)}`
-  );
+  const qs = new URLSearchParams({
+    "api-version": config.apiVersion,
+    agent_session_id: conversationId,
+  });
+  return `${base}?${qs.toString()}`;
 }
 
 async function openUpstream(conversationId: string | undefined): Promise<WebSocket> {
   if (config.mode === "local") {
     return new WebSocket(config.localVoiceWsUrl);
   }
-  // Foundry: reuse the same session the typed chat uses, then authenticate the
-  // upstream WebSocket with a bearer token + the Foundry-Features header.
+  // Foundry: the container serves `/invocations_ws` on the same agentserver
+  // port as the Responses API (the platform proxies the upgrade there). The
+  // conversation id rides as `agent_session_id`; scene continuity stays
+  // client-owned via the control frames. Authenticate the upgrade with a
+  // bearer token (no session pre-creation is required for invocations_ws).
   if (!conversationId) {
     throw new Error("sessionId (conversation UUID) is required for voice in foundry mode");
   }
-  const { agentSessionId } = await getOrCreateSession(conversationId);
   const token = await getBearerToken();
-  const headers: Record<string, string> = {
-    "Foundry-Features": config.foundryFeaturesHeader,
-  };
+  const headers: Record<string, string> = {};
   if (token) headers.Authorization = `Bearer ${token}`;
-  return new WebSocket(buildFoundryVoiceWsUrl(agentSessionId), { headers });
+  return new WebSocket(buildFoundryVoiceWsUrl(conversationId), { headers });
 }
 
 function relay(browser: WebSocket, upstream: WebSocket): void {
@@ -94,6 +98,7 @@ function relay(browser: WebSocket, upstream: WebSocket): void {
 
   upstream.on("open", () => {
     upstreamOpen = true;
+    console.log("[voice] upstream connected");
     while (pending.length) {
       const m = pending.shift()!;
       sendTo(upstream, m.data, m.isBinary);
@@ -101,6 +106,23 @@ function relay(browser: WebSocket, upstream: WebSocket): void {
   });
 
   upstream.on("message", (data: RawData, isBinary: boolean) => {
+    // Surface agent-side error frames in the server log (they otherwise only
+    // reach the browser and show as a generic bubble). Cheap: text frames only.
+    if (!isBinary) {
+      try {
+        const text = Array.isArray(data)
+          ? Buffer.concat(data).toString("utf-8")
+          : data.toString();
+        if (text.includes('"error"')) {
+          const obj = JSON.parse(text);
+          if (obj && obj.type === "error") {
+            console.error("[voice] agent error frame:", obj.message ?? text.slice(0, 400));
+          }
+        }
+      } catch {
+        /* not JSON — ignore */
+      }
+    }
     sendTo(browser, data, isBinary);
   });
 
@@ -110,7 +132,12 @@ function relay(browser: WebSocket, upstream: WebSocket): void {
   };
 
   browser.on("close", (code, reason) => closeBoth(code, reason?.toString()));
-  upstream.on("close", (code, reason) => closeBoth(code, reason?.toString()));
+  upstream.on("close", (code, reason) => {
+    if (code && code !== 1000) {
+      console.warn(`[voice] upstream closed code=${code} reason=${reason?.toString() || ""}`);
+    }
+    closeBoth(code, reason?.toString());
+  });
   browser.on("error", () => closeBoth(1011, "browser error"));
   upstream.on("error", (err) => {
     console.error("[voice] upstream WS error:", err instanceof Error ? err.message : err);
@@ -137,6 +164,9 @@ async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): 
 
   let upstream: WebSocket;
   try {
+    console.log(
+      `[voice] browser connected; opening upstream (conversation=${conversationId ?? "none"}, mode=${config.mode})`,
+    );
     upstream = await openUpstream(conversationId);
   } catch (err) {
     console.error("[voice] failed to open upstream:", err instanceof Error ? err.message : err);

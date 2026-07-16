@@ -235,13 +235,23 @@ class VoiceController {
 
   async stopAndCommit(): Promise<void> {
     if (!this.capturing) return;
+    // Push-to-talk tail guard: keep capturing for a short window AFTER the
+    // button is released so the final word (and a little trailing audio) still
+    // reaches STT. Tearing down capture the instant the user stops speaking
+    // clips the end of the utterance — the mic delivers audio in ~85 ms blocks
+    // and continuous recognition needs a bit of trailing audio to finalize —
+    // which is why releasing immediately returns an empty transcript
+    // ("Didn't catch that") while holding a beat longer works.
+    const TAIL_MS = 350;
+    this.setStatus("thinking");
+    await new Promise((resolve) => setTimeout(resolve, TAIL_MS));
+    if (!this.capturing) return; // cancelled during the tail window
     this.teardownCapture();
     this.sendControl({
       type: "commit",
       conversation_id: this.handlers?.getConversationId(),
       previous_response_id: this.handlers?.getPreviousResponseId() ?? undefined,
     });
-    this.setStatus("thinking");
   }
 
   private teardownCapture(): void {

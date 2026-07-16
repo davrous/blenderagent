@@ -205,6 +205,13 @@ def _build_speech_config():
     cfg.set_speech_synthesis_output_format(
         speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm
     )
+    # Shorten the trailing-silence window STT waits for before emitting a final
+    # result. The default (~500 ms+) makes brief push-to-talk utterances feel
+    # like they need an extra beat of holding before release; 300 ms lets short
+    # phrases finalize promptly without truncating normal speech.
+    cfg.set_property(
+        speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, "300"
+    )
     return cfg
 
 
@@ -388,6 +395,7 @@ class VoiceSession:
         send_text: Callable[[dict], Awaitable[None]],
         send_bytes: Callable[[bytes], Awaitable[None]],
         session_id: Optional[str] = None,
+        call_id: Optional[str] = None,
     ) -> None:
         self._agent = agent
         self._send_text_cb = send_text
@@ -396,6 +404,23 @@ class VoiceSession:
         # Continuity / scene key (owned by the browser, arrives on control frames).
         self._conversation_id: Optional[str] = session_id
         self._previous_response_id: Optional[str] = None
+        # Self-managed conversation history for voice turns. The loopback call
+        # goes DIRECT to the container's own /responses (localhost:8088),
+        # bypassing the Foundry gateway, so the response ids it returns
+        # (``caresp_...``) are NOT resolvable by FoundryStorageProvider on a
+        # later turn — chaining via ``previous_response_id`` fails with a 404
+        # ("Response '...' not found"). We therefore carry context INLINE: the
+        # recent user/assistant turns are replayed in the ``input`` array each
+        # turn so "pick the pink one" still resolves against the prior list.
+        self._history: list[dict[str, str]] = []
+        # Cap replayed context (last ~4 exchanges) to bound payload growth.
+        self._history_max_messages = 8
+        # Platform per-request call id (``x-agent-foundry-call-id``) captured from
+        # the inbound WS upgrade. The hosted responses protocol v2.0.0 REQUIRES
+        # it on every /responses call, so we forward it on the in-container
+        # loopback call (otherwise the handler fails fast with "the hosted
+        # environment is running on protocol 1.0.0").
+        self._call_id: Optional[str] = call_id
 
         # STT state.
         self._recognizer = None
@@ -411,6 +436,14 @@ class VoiceSession:
         # Turn / barge-in state.
         self._turn_task: Optional[asyncio.Task] = None
         self._cancelled = False
+
+        # STT finalization signalling. Continuous recognition delivers the FINAL
+        # `recognized` result asynchronously (after it drains trailing audio and
+        # detects end-of-utterance), so `_commit_and_run` must wait for it rather
+        # than read immediately (else the transcript is empty → "Didn't catch
+        # that"). Set from the SDK's background thread via the captured loop.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._stt_done: Optional[asyncio.Event] = None
 
     # -- outbound helpers ---------------------------------------------------
     async def _send_text(self, obj: dict) -> None:
@@ -476,6 +509,14 @@ class VoiceSession:
                 speech_config=cfg, audio_config=audio_config
             )
             self._recognized_parts = []
+            self._loop = asyncio.get_running_loop()
+            self._stt_done = asyncio.Event()
+
+            def _signal_stt_done() -> None:
+                loop = self._loop
+                ev = self._stt_done
+                if loop is not None and ev is not None:
+                    loop.call_soon_threadsafe(ev.set)
 
             def _on_recognized(evt) -> None:
                 try:
@@ -486,7 +527,30 @@ class VoiceSession:
                 except Exception:
                     logger.debug("recognized handler failed", exc_info=True)
 
+            def _on_canceled(evt) -> None:
+                # Surface STT-side failures (auth/RBAC, network, quota) that are
+                # otherwise silent (they just yield an empty transcript). Logs
+                # only — the SDK fires this on a background thread where we can't
+                # await an outbound frame.
+                try:
+                    logger.warning(
+                        "STT canceled: reason=%s error_code=%s details=%s",
+                        getattr(evt, "reason", "?"),
+                        getattr(evt, "error_code", "?"),
+                        getattr(evt, "error_details", ""),
+                    )
+                except Exception:
+                    logger.debug("canceled handler failed", exc_info=True)
+                _signal_stt_done()
+
+            def _on_session_stopped(evt) -> None:
+                # Fires after the recognizer drains the closed input stream and
+                # finalizes — the point at which all `recognized` results are in.
+                _signal_stt_done()
+
             self._recognizer.recognized.connect(_on_recognized)
+            self._recognizer.canceled.connect(_on_canceled)
+            self._recognizer.session_stopped.connect(_on_session_stopped)
             self._recognizer.start_continuous_recognition_async()
             self._capturing = True
             await self._send_text({"type": "listening"})
@@ -517,11 +581,40 @@ class VoiceSession:
         if not self._capturing:
             # Nothing was being captured; ignore stray commit.
             return
-        self._stop_capture()
-        # Give the recognizer a brief moment to flush the final segment.
-        await asyncio.sleep(0.25)
+        self._capturing = False
+        # Signal end-of-audio and WAIT for the recognizer to finalize before
+        # reading the transcript. Continuous recognition emits the final
+        # `recognized` result only after it drains the trailing audio and
+        # detects end-of-utterance, so a fixed short sleep races it (→ empty
+        # transcript → "Didn't catch that"). Closing the push stream ends the
+        # input; `session_stopped`/`canceled` then set `_stt_done`.
+        rec = self._recognizer
+        stream = self._push_stream
+        self._recognizer = None
+        self._push_stream = None
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        if self._stt_done is not None:
+            try:
+                await asyncio.wait_for(self._stt_done.wait(), timeout=8.0)
+            except asyncio.TimeoutError:
+                logger.info(
+                    "STT finalize wait timed out (8s) — using whatever was recognized."
+                )
+        # Tiny grace so a final `recognized` immediately preceding
+        # `session_stopped` is appended before we read.
+        await asyncio.sleep(0.1)
+        if rec is not None:
+            try:
+                rec.stop_continuous_recognition_async()
+            except Exception:
+                pass
         transcript = " ".join(p for p in self._recognized_parts if p).strip()
         self._recognized_parts = []
+        logger.info("Voice commit: transcript=%r", transcript[:200])
         if not transcript:
             await self._send_text(
                 {"type": "stt", "text": "", "final": True}
@@ -555,18 +648,34 @@ class VoiceSession:
         self._ensure_tts_worker()
         progress_task = asyncio.ensure_future(self._progress_loop(state))
         reply = ""
+        errored = False
         try:
             reply = await self._stream_agent(transcript, state)
         except asyncio.CancelledError:
             progress_task.cancel()
             raise
         except Exception as exc:
+            errored = True
             logger.warning("Voice turn failed.", exc_info=True)
             await self._send_text({"type": "error", "message": str(exc)})
         finally:
             progress_task.cancel()
 
         if self._cancelled:
+            return
+
+        # Record this exchange so the NEXT voice turn can replay it inline
+        # (loopback ids aren't chainable via Foundry storage — see _stream_agent).
+        # We do this even when `errored` is set: the reply text was still
+        # produced (typically only a terminal *storage* persistence failed), so
+        # preserving it keeps multi-turn context ("load the green one") working.
+        self._history.append({"role": "user", "content": transcript})
+        if reply:
+            self._history.append({"role": "assistant", "content": reply})
+        if len(self._history) > self._history_max_messages:
+            self._history = self._history[-self._history_max_messages:]
+
+        if errored:
             return
 
         has_image = _reply_has_image(reply)
@@ -594,11 +703,16 @@ class VoiceSession:
             await self._send_text({"type": "progress", "text": cue})
             await self._tts_queue.put(cue)
 
+        # Report response_id=None: voice manages its own inline history, and the
+        # loopback's `caresp_...` id is NOT resolvable by the Foundry gateway.
+        # Feeding it back into the shared client `previousResponseId` would
+        # poison the next TEXT turn (the gateway would 404 on it), so we leave
+        # the client's chain untouched (voiceFinalizeTurn keeps it on null).
         await self._send_text(
             {
                 "type": "done",
                 "reply": reply,
-                "response_id": self._previous_response_id,
+                "response_id": None,
             }
         )
 
@@ -609,28 +723,38 @@ class VoiceSession:
         streamer = _ProseSentenceStreamer()
         reply_parts: list[str] = []
 
+        # Keep this request MINIMAL — model/input/stream. We call the container's
+        # OWN /responses directly (localhost:8088), so we must NOT forward a
+        # Foundry `agent_session_id` (the browser conversation UUID is not a
+        # valid Foundry session id) NOR chain via `previous_response_id`: the
+        # loopback bypasses the gateway, so its `caresp_...` ids are not
+        # resolvable by FoundryStorageProvider on the next turn (it 404s with
+        # "Response '...' not found"). Instead we replay recent turns INLINE as
+        # an `input` message array so multi-turn voice keeps context without any
+        # server-side storage dependency. The Blender scene is per-container, so
+        # scene isolation does not need the session id either.
+        messages: list[dict[str, str]] = list(self._history)
+        messages.append({"role": "user", "content": transcript})
         body: dict[str, Any] = {
             "model": AGENT_MODEL,
-            "input": transcript,
+            "input": messages,
             "stream": True,
-            # Bind the turn to the SAME conversation/scene key the typed chat
-            # uses so SceneIsolationMiddleware activates & saves the correct
-            # per-conversation Blender scene.
-            "agent_session_id": self._conversation_id or "voice-default",
         }
-        if self._conversation_id:
-            body["user"] = self._conversation_id
-            body["metadata"] = {"conversation_id": self._conversation_id}
-        if self._previous_response_id:
-            body["previous_response_id"] = self._previous_response_id
 
         timeout = httpx.Timeout(600.0, connect=10.0)
+        headers = {"Accept": "text/event-stream"}
+        # Forward the platform per-request call id so the hosted responses
+        # protocol v2.0.0 accepts this in-container loopback call. Without it the
+        # handler raises "the hosted environment is running on protocol 1.0.0,
+        # but the agent requires protocol 2.0.0".
+        if self._call_id:
+            headers["x-agent-foundry-call-id"] = self._call_id
         async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream(
                 "POST",
                 LOCAL_RESPONSES_URL,
                 json=body,
-                headers={"Accept": "text/event-stream"},
+                headers=headers,
             ) as resp:
                 if resp.status_code >= 400:
                     detail = (await resp.aread()).decode("utf-8", "replace")
@@ -702,8 +826,38 @@ class VoiceSession:
             if rid:
                 self._previous_response_id = rid
         elif etype in ("response.failed", "error"):
-            msg = payload.get("message") or json.dumps(payload)
-            await self._send_text({"type": "error", "message": msg})
+            # Dig out the most specific message the platform gives us.
+            err = payload.get("error")
+            if not isinstance(err, dict):
+                err = (payload.get("response") or {}).get("error") or {}
+            msg = (
+                (err.get("message") if isinstance(err, dict) else None)
+                or payload.get("message")
+                or json.dumps(payload)[:500]
+            )
+            # A FAILED PERSISTENCE to Foundry storage is NON-FATAL for us: the
+            # reply content has already streamed back in full (deltas above) and
+            # we keep our own inline history, so retrieval-side storage is
+            # irrelevant to the voice turn. The hosted `/storage/responses`
+            # backend is intermittently returning 500 and surfaces it as a
+            # terminal `error` frame — swallow it (log only) so the turn still
+            # completes with speech + a proper `done`, instead of failing a fully
+            # generated answer. We keep store=True (default) so the Foundry
+            # portal still gets response traces when persistence succeeds.
+            low = (msg or "").lower()
+            if (
+                "storing the response" in low
+                or "while storing" in low
+                or "retrieval is not guaranteed" in low
+            ):
+                logger.warning(
+                    "Voice: ignoring non-fatal storage persistence error: %s", msg
+                )
+                return
+            # Anything else (model/tool/agent failure) IS fatal — abort the turn
+            # so the error reaches the browser and the container log.
+            logger.warning("Voice: /responses emitted an error event: %s", msg)
+            raise RuntimeError(msg)
 
     # -- progress narration -------------------------------------------------
     async def _progress_loop(self, state: dict) -> None:
@@ -820,12 +974,15 @@ async def drive_connection(
     send_bytes: Callable[[bytes], Awaitable[None]],
     incoming: AsyncIterator[Any],
     session_id: Optional[str] = None,
+    call_id: Optional[str] = None,
 ) -> None:
     """Drive one voice connection given an async iterator of inbound messages.
 
     ``incoming`` yields ``str`` (JSON control frames) or ``bytes`` (PCM audio).
     """
-    session = VoiceSession(agent, send_text, send_bytes, session_id=session_id)
+    session = VoiceSession(
+        agent, send_text, send_bytes, session_id=session_id, call_id=call_id
+    )
     try:
         async for message in incoming:
             if isinstance(message, (bytes, bytearray)):
@@ -872,6 +1029,17 @@ async def run_ws_server(agent: Any, *, host: str = "0.0.0.0", port: Optional[int
         except Exception:
             pass
 
+        # Platform per-request call id (present on hosted protocol v2.0.0
+        # upgrades; absent in local dev). Forwarded to the loopback /responses.
+        call_id = None
+        try:
+            request = getattr(websocket, "request", None)
+            hdrs = getattr(request, "headers", None)
+            if hdrs is not None:
+                call_id = hdrs.get("x-agent-foundry-call-id")
+        except Exception:
+            pass
+
         async def send_text(obj: dict) -> None:
             await websocket.send(json.dumps(obj))
 
@@ -882,7 +1050,10 @@ async def run_ws_server(agent: Any, *, host: str = "0.0.0.0", port: Optional[int
             async for message in websocket:
                 yield message
 
-        logger.info("Voice WS connection opened (session_id=%s).", session_id)
+        logger.info(
+            "Voice WS connection opened (session_id=%s, foundry_call_id=%s).",
+            session_id, "present" if call_id else "ABSENT",
+        )
         try:
             await drive_connection(
                 agent,
@@ -890,6 +1061,7 @@ async def run_ws_server(agent: Any, *, host: str = "0.0.0.0", port: Optional[int
                 send_bytes=send_bytes,
                 incoming=incoming(),
                 session_id=session_id,
+                call_id=call_id,
             )
         finally:
             logger.info("Voice WS connection closed.")
@@ -901,3 +1073,103 @@ async def run_ws_server(agent: Any, *, host: str = "0.0.0.0", port: Optional[int
             "Voice WebSocket listening on ws://%s:%d%s", host, listen_port, VOICE_WS_PATH
         )
         await asyncio.Future()  # run forever
+
+
+def register_invocations_ws_route(agent: Any, host_server: Any) -> bool:
+    """Mount the ``/invocations_ws`` voice route on the agent's Starlette host.
+
+    The Foundry hosted-agent platform proxies **every** declared protocol
+    (``responses`` *and* ``invocations_ws``) to the single agentserver port
+    that :class:`ResponsesHostServer` listens on (see the official
+    ``invocations_ws`` samples, which all serve the WebSocket on that same
+    port via ``@app.ws_handler``). The standalone :func:`run_ws_server` on a
+    separate port (8089) is therefore only reachable in local Docker, not
+    through the Foundry gateway (which forwards the upgrade to the agentserver
+    port and returns 403 when no ``/invocations_ws`` route exists there).
+
+    :class:`ResponsesHostServer` is a :class:`starlette.applications.Starlette`
+    subclass, so — exactly like the SDK's own ``_WSHandlerMixin`` — we append a
+    :class:`~starlette.routing.WebSocketRoute` to ``host_server.router.routes``
+    before the app starts serving. The Starlette WebSocket is adapted to the
+    ``send_text`` / ``send_bytes`` / ``incoming`` interface that
+    :func:`drive_connection` expects. Returns ``True`` when the route is
+    registered (voice available), ``False`` otherwise.
+    """
+    if not voice_available():
+        return False
+
+    from starlette.routing import WebSocketRoute
+    from starlette.websockets import WebSocket, WebSocketDisconnect
+
+    prewarm_speech_auth()
+
+    async def endpoint(websocket: WebSocket) -> None:
+        await websocket.accept()
+
+        session_id = websocket.query_params.get(
+            "agent_session_id"
+        ) or websocket.query_params.get("sessionId")
+        # Platform per-request call id injected on the upgrade (protocol v2.0.0).
+        # Forwarded to the loopback /responses call so the hosted responses
+        # handler accepts it. Logged present/ABSENT so we can tell whether the
+        # platform injects it on invocations_ws upgrades.
+        call_id = websocket.headers.get("x-agent-foundry-call-id")
+
+        async def send_text(obj: dict) -> None:
+            await websocket.send_text(json.dumps(obj))
+
+        async def send_bytes(data: bytes) -> None:
+            await websocket.send_bytes(data)
+
+        async def incoming() -> AsyncIterator[Any]:
+            try:
+                while True:
+                    message = await websocket.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        break
+                    text = message.get("text")
+                    if text is not None:
+                        yield text
+                        continue
+                    data = message.get("bytes")
+                    if data is not None:
+                        yield data
+            except WebSocketDisconnect:
+                return
+
+        logger.info(
+            "Voice WS connection opened on agentserver port (session_id=%s, foundry_call_id=%s).",
+            session_id, "present" if call_id else "ABSENT",
+        )
+        try:
+            await drive_connection(
+                agent,
+                send_text=send_text,
+                send_bytes=send_bytes,
+                incoming=incoming(),
+                session_id=session_id,
+                call_id=call_id,
+            )
+        finally:
+            logger.info("Voice WS connection closed (agentserver port).")
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+
+    router = getattr(host_server, "router", None)
+    routes = getattr(router, "routes", None)
+    if routes is None:
+        logger.warning(
+            "Cannot mount voice route: host server has no mutable router.routes."
+        )
+        return False
+
+    # Idempotent: skip if a WebSocketRoute for the path already exists.
+    for route in routes:
+        if isinstance(route, WebSocketRoute) and getattr(route, "path", None) == VOICE_WS_PATH:
+            return True
+
+    routes.append(WebSocketRoute(VOICE_WS_PATH, endpoint, name="invocations_ws"))
+    logger.info("Voice route mounted on agentserver port at %s.", VOICE_WS_PATH)
+    return True

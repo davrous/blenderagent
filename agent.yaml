@@ -18,11 +18,11 @@ metadata:
     - BlenderMCP
 protocols:
   - protocol: responses
-    version: 1.0.0
+    version: 2.0.0
   # Voice path: speech-in / speech-out over a WebSocket. The platform relays
   # browser frames to the container's voice WebSocket (port VOICE_WS_PORT).
   - protocol: invocations_ws
-    version: 1.0.0
+    version: 2.0.0
 environment_variables:
   - name: PROJECT_ENDPOINT
     value: "{{PROJECT_ENDPOINT}}"

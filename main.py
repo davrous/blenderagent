@@ -2488,6 +2488,16 @@ This environment runs **Blender 4.4**. The following Blender 3.x APIs were remov
                 "Voice path ENABLED — serving voice WebSocket on port %d.",
                 voice_pipeline.VOICE_WS_PORT,
             )
+            # Mount /invocations_ws on the SAME agentserver app/port (8088) that
+            # ResponsesHostServer serves. The Foundry platform proxies every
+            # protocol — responses AND invocations_ws — to that single port, so
+            # the voice route must live there or the gateway 403s the upgrade.
+            if voice_pipeline.register_invocations_ws_route(agent, server):
+                logger.info(
+                    "Voice route mounted on agentserver port for Foundry gateway."
+                )
+            # Also keep the standalone WebSocket server on VOICE_WS_PORT (8089)
+            # for local Docker, where the webchat relay connects directly.
             tasks.append(asyncio.ensure_future(voice_pipeline.run_ws_server(agent)))
         else:
             logger.info(
