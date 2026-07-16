@@ -3,6 +3,7 @@ import type { Server, IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
 import { config } from "./config.js";
 import { getBearerToken } from "./auth.js";
+import { getOrCreateSession } from "./sessions.js";
 
 const VOICE_PATH = "/api/voice";
 
@@ -53,47 +54,88 @@ function sendTo(ws: WebSocket, data: RawData, isBinary: boolean): void {
   }
 }
 
-function buildFoundryVoiceWsUrl(conversationId: string): string {
+/**
+ * Inject the shared Foundry `agent_session_id` into browser control frames so
+ * the container voice pipeline threads each turn into the SAME server-side
+ * session as the text path (unified conversation: portal traces + cross-modal
+ * memory). Binary (audio) frames and non-JSON text pass through untouched.
+ */
+function injectSession(
+  data: RawData,
+  isBinary: boolean,
+  foundryAgentSessionId: string | undefined,
+): { data: RawData; isBinary: boolean } {
+  if (isBinary || !foundryAgentSessionId) return { data, isBinary };
+  try {
+    const text = Array.isArray(data)
+      ? Buffer.concat(data).toString("utf-8")
+      : data.toString();
+    const obj = JSON.parse(text);
+    if (obj && typeof obj === "object" && typeof obj.type === "string") {
+      obj.foundry_agent_session_id = foundryAgentSessionId;
+      return { data: Buffer.from(JSON.stringify(obj)), isBinary: false };
+    }
+  } catch {
+    /* not JSON — pass through */
+  }
+  return { data, isBinary };
+}
+
+function buildFoundryVoiceWsUrl(routeSessionId: string): string {
   // Per the `invocations_ws` protocol (Foundry voice-agent docs + foundry-
   // samples): the project and agent are PATH segments (mirroring the Responses
   // URL), `api-version` is REQUIRED, and `agent_session_id` is optional. The
   // bearer token is sent as an Authorization header on the upgrade. The
   // container serves this route on the same agentserver port as /responses.
+  //
+  // `routeSessionId` is the SHARED Foundry `agent_session_id` (same one the text
+  // path uses) when available, so the gateway routes voice to the SAME
+  // container/session as text — unifying the conversation. Falls back to the
+  // raw conversation id when no Foundry session could be created.
   const base = `${config.foundryAgentBase}/endpoint/protocols/invocations_ws`
     .replace(/^https:/i, "wss:")
     .replace(/^http:/i, "ws:");
   const qs = new URLSearchParams({
     "api-version": config.apiVersion,
-    agent_session_id: conversationId,
+    agent_session_id: routeSessionId,
   });
   return `${base}?${qs.toString()}`;
 }
 
-async function openUpstream(conversationId: string | undefined): Promise<WebSocket> {
+async function openUpstream(
+  conversationId: string | undefined,
+  foundryAgentSessionId?: string,
+): Promise<WebSocket> {
   if (config.mode === "local") {
     return new WebSocket(config.localVoiceWsUrl);
   }
   // Foundry: the container serves `/invocations_ws` on the same agentserver
-  // port as the Responses API (the platform proxies the upgrade there). The
-  // conversation id rides as `agent_session_id`; scene continuity stays
-  // client-owned via the control frames. Authenticate the upgrade with a
-  // bearer token (no session pre-creation is required for invocations_ws).
+  // port as the Responses API (the platform proxies the upgrade there).
+  // Authenticate the upgrade with a bearer token (no session pre-creation is
+  // required for invocations_ws). Route to the SHARED Foundry session when we
+  // have it so voice lands on the SAME container/conversation as text.
   if (!conversationId) {
     throw new Error("sessionId (conversation UUID) is required for voice in foundry mode");
   }
   const token = await getBearerToken();
   const headers: Record<string, string> = {};
   if (token) headers.Authorization = `Bearer ${token}`;
-  return new WebSocket(buildFoundryVoiceWsUrl(conversationId), { headers });
+  const routeSessionId = foundryAgentSessionId ?? conversationId;
+  return new WebSocket(buildFoundryVoiceWsUrl(routeSessionId), { headers });
 }
 
-function relay(browser: WebSocket, upstream: WebSocket): void {
+function relay(
+  browser: WebSocket,
+  upstream: WebSocket,
+  foundryAgentSessionId?: string,
+): void {
   const pending: Array<{ data: RawData; isBinary: boolean }> = [];
   let upstreamOpen = false;
 
   browser.on("message", (data: RawData, isBinary: boolean) => {
-    if (upstreamOpen) sendTo(upstream, data, isBinary);
-    else pending.push({ data, isBinary });
+    const out = injectSession(data, isBinary, foundryAgentSessionId);
+    if (upstreamOpen) sendTo(upstream, out.data, out.isBinary);
+    else pending.push({ data: out.data, isBinary: out.isBinary });
   });
 
   upstream.on("open", () => {
@@ -162,12 +204,39 @@ async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): 
     /* ignore */
   }
 
+  // Resolve the shared Foundry session BEFORE opening the upstream. This MUST
+  // happen first for two reasons:
+  //   1. Awaiting it AFTER openUpstream() lets the upstream 'open' event fire
+  //      during the await — before relay() attaches its listener — so the relay
+  //      never flushes buffered frames and voice is silently dead (until a
+  //      second attempt warms the session cache and shrinks the race window).
+  //   2. We route the voice WS to this same session id so voice and text land
+  //      on ONE container / ONE Foundry conversation.
+  // getOrCreateSession caches by conversation id, so text and voice resolve to
+  // the SAME agent_session_id. If it fails, voice still works via the
+  // container's inline-history fallback (just not unified).
+  let foundryAgentSessionId: string | undefined;
+  if (config.mode === "foundry" && conversationId) {
+    try {
+      const { agentSessionId } = await getOrCreateSession(conversationId);
+      foundryAgentSessionId = agentSessionId;
+      console.log(
+        `[voice] threading into foundry session ${agentSessionId} (conversation=${conversationId})`,
+      );
+    } catch (err) {
+      console.warn(
+        "[voice] could not resolve foundry session; falling back to inline history:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
   let upstream: WebSocket;
   try {
     console.log(
-      `[voice] browser connected; opening upstream (conversation=${conversationId ?? "none"}, mode=${config.mode})`,
+      `[voice] browser connected; opening upstream (conversation=${conversationId ?? "none"}, session=${foundryAgentSessionId ?? "none"}, mode=${config.mode})`,
     );
-    upstream = await openUpstream(conversationId);
+    upstream = await openUpstream(conversationId, foundryAgentSessionId);
   } catch (err) {
     console.error("[voice] failed to open upstream:", err instanceof Error ? err.message : err);
     sendTo(
@@ -184,7 +253,7 @@ async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): 
     return;
   }
 
-  relay(browser, upstream);
+  relay(browser, upstream, foundryAgentSessionId);
 }
 
 /**

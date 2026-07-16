@@ -404,16 +404,17 @@ class VoiceSession:
         # Continuity / scene key (owned by the browser, arrives on control frames).
         self._conversation_id: Optional[str] = session_id
         self._previous_response_id: Optional[str] = None
-        # Self-managed conversation history for voice turns. The loopback call
-        # goes DIRECT to the container's own /responses (localhost:8088),
-        # bypassing the Foundry gateway, so the response ids it returns
-        # (``caresp_...``) are NOT resolvable by FoundryStorageProvider on a
-        # later turn — chaining via ``previous_response_id`` fails with a 404
-        # ("Response '...' not found"). We therefore carry context INLINE: the
-        # recent user/assistant turns are replayed in the ``input`` array each
-        # turn so "pick the pink one" still resolves against the prior list.
+        # Real Foundry `agent_session_id` (foundry mode only), injected by the
+        # relay in the control frames. When set, voice threads each turn into the
+        # SAME server-side session the TEXT path uses (the relay calls
+        # getOrCreateSession(conversation_id) for both), so voice + text share
+        # ONE Foundry conversation — portal traces + cross-modal memory. None in
+        # local dev (no gateway session exists).
+        self._agent_session_id: Optional[str] = None
+        # Self-managed inline history — used ONLY in local mode. In foundry mode
+        # the shared `agent_session_id` carries history server-side (like text),
+        # so this stays unused. Capped to bound payload growth.
         self._history: list[dict[str, str]] = []
-        # Cap replayed context (last ~4 exchanges) to bound payload growth.
         self._history_max_messages = 8
         # Platform per-request call id (``x-agent-foundry-call-id``) captured from
         # the inbound WS upgrade. The hosted responses protocol v2.0.0 REQUIRES
@@ -467,6 +468,11 @@ class VoiceSession:
         prev = (message or {}).get("previous_response_id")
         if isinstance(prev, str) and prev:
             self._previous_response_id = prev
+        # Real Foundry agent_session_id injected by the relay (foundry mode) so
+        # voice threads into the SAME server session as text.
+        fsid = (message or {}).get("foundry_agent_session_id")
+        if isinstance(fsid, str) and fsid:
+            self._agent_session_id = fsid
 
         if mtype == "start":
             await self._start_capture()
@@ -664,11 +670,11 @@ class VoiceSession:
         if self._cancelled:
             return
 
-        # Record this exchange so the NEXT voice turn can replay it inline
-        # (loopback ids aren't chainable via Foundry storage — see _stream_agent).
-        # We do this even when `errored` is set: the reply text was still
-        # produced (typically only a terminal *storage* persistence failed), so
-        # preserving it keeps multi-turn context ("load the green one") working.
+        # Record this exchange for INLINE replay next turn. invocations_ws voice
+        # is agent-managed (the platform stores no history and the loopback isn't
+        # gateway-threaded), so this is the ONLY thing that gives multi-turn
+        # voice its memory. Record even when `errored` is set (the reply text was
+        # still produced — typically only a terminal storage persist failed).
         self._history.append({"role": "user", "content": transcript})
         if reply:
             self._history.append({"role": "assistant", "content": reply})
@@ -723,16 +729,17 @@ class VoiceSession:
         streamer = _ProseSentenceStreamer()
         reply_parts: list[str] = []
 
-        # Keep this request MINIMAL — model/input/stream. We call the container's
-        # OWN /responses directly (localhost:8088), so we must NOT forward a
-        # Foundry `agent_session_id` (the browser conversation UUID is not a
-        # valid Foundry session id) NOR chain via `previous_response_id`: the
-        # loopback bypasses the gateway, so its `caresp_...` ids are not
-        # resolvable by FoundryStorageProvider on the next turn (it 404s with
-        # "Response '...' not found"). Instead we replay recent turns INLINE as
-        # an `input` message array so multi-turn voice keeps context without any
-        # server-side storage dependency. The Blender scene is per-container, so
-        # scene isolation does not need the session id either.
+        # invocations_ws is AGENT-MANAGED history: per the Foundry hosted-agent
+        # protocol, the platform does NOT store or prepend conversation history
+        # for the voice (WebSocket) transport, and this in-container loopback to
+        # /responses is NOT gateway-threaded either. So multi-turn voice memory
+        # is OURS to keep — we ALWAYS replay recent turns INLINE as an `input`
+        # message array. (We tried relying on a shared `agent_session_id` for
+        # server-side history; the loopback never prepends it, so context was
+        # lost — hence inline is the reliable mechanism.)
+        #
+        # We also pass `user`/`metadata` (the browser conversation id) so
+        # SceneIsolationMiddleware keys the SAME Blender scene as the text path.
         messages: list[dict[str, str]] = list(self._history)
         messages.append({"role": "user", "content": transcript})
         body: dict[str, Any] = {
@@ -740,6 +747,9 @@ class VoiceSession:
             "input": messages,
             "stream": True,
         }
+        if self._conversation_id:
+            body["user"] = self._conversation_id
+            body["metadata"] = {"conversation_id": self._conversation_id}
 
         timeout = httpx.Timeout(600.0, connect=10.0)
         headers = {"Accept": "text/event-stream"}

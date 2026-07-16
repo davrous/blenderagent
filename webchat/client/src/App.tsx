@@ -37,6 +37,10 @@ export function App() {
       getConversationId: () => useChatStore.getState().conversationId,
       getPreviousResponseId: () => useChatStore.getState().previousResponseId,
     });
+    // Warm up the voice connection now so the hosted container cold-starts in
+    // the background — otherwise the FIRST mic press is lost to invocations_ws
+    // cold-start and the user has to press twice.
+    void voice.prewarm();
     return () => voice.dispose();
   }, [voiceAvailable]);
 

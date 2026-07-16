@@ -67,6 +67,12 @@ function downsampleToPcm16(
 class VoiceController {
   private handlers: VoiceHandlers | null = null;
   private ws: WebSocket | null = null;
+  // Conversation id the current socket was opened for; used to drop a stale
+  // socket after a Reset (new conversation) so we don't reuse the old session.
+  private wsConversationId: string | null = null;
+  // True while opening the socket as a background warm-up (see prewarm()); used
+  // to keep connection errors silent until the user actually presses the mic.
+  private prewarming = false;
   private _status: VoiceStatus = "idle";
 
   // Capture
@@ -117,16 +123,31 @@ class VoiceController {
   }
 
   private async ensureSocket(): Promise<WebSocket> {
+    const cid = this.handlers?.getConversationId() ?? "";
+    // If the conversation changed (e.g. Reset rotated the id), the existing
+    // socket is bound to the old Foundry session — drop it and reconnect.
+    if (this.ws && this.wsConversationId !== cid) {
+      try {
+        this.ws.close(1000, "conversation changed");
+      } catch {
+        /* ignore */
+      }
+      this.ws = null;
+    }
     if (this.ws && this.ws.readyState === WebSocket.OPEN) return this.ws;
     if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
       await this.waitForOpen(this.ws);
       return this.ws;
     }
     const ws = new WebSocket(this.wsUrl());
+    this.wsConversationId = cid;
     ws.binaryType = "arraybuffer";
     this.ws = ws;
     ws.onmessage = (ev) => this.onMessage(ev);
     ws.onerror = () => {
+      // Stay silent for background warm-up failures; the first real mic press
+      // will retry and surface a connection error itself if it still fails.
+      if (this.prewarming) return;
       this.handlers?.onError("Voice connection error.");
       this.setStatus("error");
     };
@@ -135,6 +156,25 @@ class VoiceController {
     };
     await this.waitForOpen(ws);
     return ws;
+  }
+
+  /**
+   * Open the voice WebSocket ahead of the first mic press so the hosted
+   * container (Blender + speech pipeline) cold-starts in the background.
+   * invocations_ws cold-start on the FIRST connect is expected; without this
+   * warm-up the first utterance is lost and the user has to press twice.
+   * Best-effort and silent on failure — the first real press retries.
+   */
+  async prewarm(): Promise<void> {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
+    this.prewarming = true;
+    try {
+      await this.ensureSocket();
+    } catch {
+      /* ignore — the first real press will reconnect */
+    } finally {
+      this.prewarming = false;
+    }
   }
 
   private waitForOpen(ws: WebSocket): Promise<void> {
