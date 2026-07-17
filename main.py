@@ -932,9 +932,8 @@ def get_viewport_screenshot(
                     width, height, local_path)
         return (
             f"Screenshot captured ({width}x{height} pixels). "
-            f"The image has ALREADY been displayed to the user automatically. "
-            f"Do NOT include, repeat, or reproduce the image markdown in your reply — "
-            f"just confirm briefly in one short sentence.\n\n![screenshot]({blob_url})"
+            f"Include this exact image markdown in your reply.\n\n"
+            f"![screenshot]({blob_url})"
         )
     except Exception as e:
         logger.error("get_viewport_screenshot failed", exc_info=True)
@@ -1415,9 +1414,8 @@ print("Render complete: {render_path}")
                             label, resolution_x, resolution_y, render_path)
                 return (
                     f"Render complete ({resolution_x}x{resolution_y}). "
-                    f"The image has ALREADY been displayed to the user automatically. "
-                    f"Do NOT include, repeat, or reproduce the image markdown in your reply — "
-                    f"just confirm briefly in one short sentence.\n\n![{label}]({blob_url})"
+                    f"Include this exact image markdown in your reply.\n\n"
+                    f"![{label}]({blob_url})"
                 )
             else:
                 logger.warning("%s: output file not found at %r", label, render_path)
