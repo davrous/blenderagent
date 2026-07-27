@@ -19,3 +19,20 @@ debugpy>=1.8.20
 azure-cognitiveservices-speech>=1.40.0
 websockets>=13.0
 httpx>=0.27.0
+
+# Activity protocol host (Teams / M365 Copilot). Composed with
+# ResponsesHostServer into a single multi-protocol server — see
+# activity_bridge.py. Optional at runtime: main.py falls back to a
+# responses-only host if these imports fail or ENABLE_ACTIVITY=false.
+#
+# Pinned to the published beta because 1.0.0b1 is the only release that
+# matches the `azure-ai-agentserver-core` 2.0.0b* line that
+# agent-framework-foundry-hosting depends on. Bump both together.
+azure-ai-agentserver-activity==1.0.0b1
+# Microsoft 365 Agents SDK — the activity host bridges to it for activity
+# processing and outbound Bot Connector delivery.
+microsoft-agents-hosting-core
+microsoft-agents-authentication-msal
+microsoft-agents-activity
+# The M365 SDK connector imports aiohttp but does not declare it; pin explicitly.
+aiohttp>=3.9.0

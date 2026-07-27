@@ -56,6 +56,7 @@ RUN pip install --no-cache-dir --pre -r requirements.txt
 # ── 4. Copy application code ──
 COPY main.py .
 COPY voice_pipeline.py .
+COPY activity_bridge.py .
 COPY blender_startup.py .
 COPY blender_connection.py .
 COPY scene_manager.py .

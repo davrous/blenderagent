@@ -5,7 +5,7 @@ An AI agent that creates and manipulates 3D scenes in a headless Blender instanc
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────────┐
 │  Docker Container                                                │
 │                                                                  │
 │  ┌──────────┐    ┌──────────────────┐    ┌──────────────────┐    │
@@ -20,9 +20,9 @@ An AI agent that creates and manipulates 3D scenes in a headless Blender instanc
 │                  └──────────────────┘    │  (voice WS)      │    │
 │                                          └────┬────────┬────┘    │
 │                                               │        │         │
-└───────────────────────────────────────────────┼────────┼────────┘
-                                          HTTPS  │        │  STT/TTS
-                                   ┌─────────────▼───┐  ┌─▼──────────────────┐
+└───────────────────────────────────────────────┼────────┼─────────┘
+                                          HTTPS │        │  STT/TTS
+                                   ┌────────────▼────┐  ┌▼───────────────────┐
                                    │  Azure AI       │  │  Azure Speech /    │
                                    │  Foundry        │  │  AI Services       │
                                    │  (GPT model)    │  │  (speech-in/out)   │
@@ -43,6 +43,7 @@ and streams the spoken reply back as 24 kHz PCM.
 - **Viewport screenshots**: Capture and return the current viewport as base64 PNG
 - **Full render**: Render scenes with EEVEE or Cycles engines
 - **Voice (speech-in / speech-out)**: Optional push-to-talk voice powered by Azure Speech; shares the same server-side Blender scene as text chat
+- **Teams / M365 Copilot (Activity protocol)**: The container serves the Activity protocol natively alongside `responses`, so the agent's custom waiting messages appear as live *informative updates* in Teams instead of a generic "working on it" indicator
 - **Arbitrary code execution**: Run custom Blender Python code for advanced operations
 - **Per-VM Blender scene persistence**: Each Foundry micro-VM owns a single Blender scene, saved/restored from `$HOME` across idle resumes
 
@@ -52,6 +53,7 @@ and streams the spoken reply back as 24 kHz PCM.
 |------|---------|
 | `main.py` | Agent server with 13 tool functions, Azure AI Foundry client |
 | `voice_pipeline.py` | Optional voice server: Azure Speech STT/TTS over the `invocations_ws` WebSocket (port 8089), routing speech through the same agent turn as text |
+| `activity_bridge.py` | Optional Activity protocol bridge for Teams / M365 Copilot: composes the multi-protocol host and maps middleware status updates onto informative updates |
 | `blender_startup.py` | Blender addon (runs inside Blender) - TCP socket server on port 9876 |
 | `blender_connection.py` | TCP client module used by the agent to talk to Blender |
 | `scene_manager.py` | Single-scene-per-VM Blender persistence on `$HOME` |
@@ -558,6 +560,129 @@ Transforms the raw streaming response into a richer UX stream for the WebChat cl
 | Streaming images / download links the moment the tool returns them | `ToolStatusMiddleware` |
 | Heartbeats and per-turn timeout with friendly fallback text | `ToolStatusMiddleware` |
 | Structured diagnostics on stream failure | `ToolStatusMiddleware` |
+
+## Teams / M365 Copilot (Activity protocol)
+
+### The problem this solves
+
+The Foundry portal's **Publish to M365** button wires the agent to Teams by adapting the `responses` protocol. That adapter has no concept of an *informative update*, so every custom waiting message this agent streams from `ToolStatusMiddleware` ("Rendering the final image…", "Importing the 3D model…") is collapsed into a single generic waiting indicator. Renders can take a while, and during that time the Teams user sees nothing useful.
+
+The **Activity protocol** — the native protocol of Teams and M365 Copilot — does have that concept. So the container now speaks it directly.
+
+### How it works
+
+[`activity_bridge.py`](activity_bridge.py) composes [`ActivityAgentServerHost`](https://pypi.org/project/azure-ai-agentserver-activity/) with the existing `ResponsesHostServer` into one Starlette app via plain mixin inheritance (the pattern documented by the SDK's `05-multi-protocol` sample). A single container, one port, three protocols:
+
+| Route | Protocol | Client |
+|---|---|---|
+| `POST /responses` | `responses` | WebChat proxy, voice loopback |
+| `POST /activity/messages` (alias `POST /api/messages`) | `activity` | Teams, M365 Copilot, Agents Playground |
+| `WS /invocations_ws` | `invocations_ws` | Voice |
+
+The `message` handler runs the **same** `Agent` object — same 17 tools, same `SceneIsolationMiddleware(ToolStatusMiddleware(), …)` stack — and routes each streamed `AgentResponseUpdate` by its `message_id`:
+
+| `message_id` | Emitted as |
+|---|---|
+| `status-*`, `scene-status-*` | `streaming_response.queue_informative_update()` — a live status line above the reply |
+| `tool-img-*`, `tool-link-*`, model prose, error text | `streaming_response.queue_text_chunk()` — the streamed answer |
+
+Routing on `message_id` is why the bridge lives in-process: the WebChat client has to regex the `\n\n*status*\n\n` markers back out of the text stream, but here the structured update objects are still available.
+
+The Teams conversation id is passed through as `options={"user": …}`, which is exactly the channel `SceneIsolationMiddleware._get_conversation_id` already reads for the WebChat proxy.
+
+### Non-streaming fallback (M365 Copilot)
+
+`StreamingResponse` silently drops informative updates on channels that don't support streaming, and the M365 Agents SDK **explicitly disables streaming for agentic requests** — which is the M365 Copilot path. On those channels the bridge sends each status as its own message activity instead. Chattier than a live status line, but it is the only way the custom waiting text reaches the user today. Teams (non-agentic) gets the streaming experience.
+
+### Turning it off
+
+The Activity stack is optional and isolated exactly like the voice path. Set `ENABLE_ACTIVITY=false` (declared in [agent.yaml](agent.yaml)) to fall back to a responses-only host without rebuilding the image. If the `azure-ai-agentserver-activity` / `microsoft-agents-*` packages fail to import for any reason, `main()` logs a warning and degrades the same way instead of taking the agent down.
+
+### Conversation history
+
+Unlike `/responses`, the Activity path gets **no** Foundry-managed history — the hosting layer does not thread it. The bridge keeps the last 20 user/assistant messages in the M365 conversation state (`TurnState`, backed by the host's `Storage`, which defaults to in-memory) and replays them on each turn.
+
+### Setup from scratch (newcomers)
+
+If you have never wired a Foundry hosted agent to Teams, the `azd` path does everything for you:
+
+```bash
+# one-time
+azd extension install azure.ai.agents
+az login && azd auth login
+
+azd env new <env-name>
+azd provision    # Foundry project + Container Registry
+azd deploy       # builds the image, creates the agent version, patches the
+                 # `activity` protocol onto the agent endpoint, then the
+                 # foundry extension's postdeploy registers the Azure Bot
+                 # (`<agent-name>-bot-uai`, whose msaAppId is the agent
+                 # instance identity) and the Microsoft Teams channel
+```
+
+> **Pick a unique agent name before the first deploy.** The agent name becomes the *globally* unique Azure Bot name `<agent-name>-bot-uai`; a collision fails the bot-creation step with `"The requested bot name is not available"`.
+
+Then package and sideload the Teams app (Teams → **Apps** → **Manage your apps** → **Upload a custom app**). If that option is greyed out, custom-app upload is disabled for your account — ask an admin to enable it in Teams Admin Center → Teams apps → Setup policies, or publish the package to your org's app catalog.
+
+The agent endpoint also needs `authorizationSchemes: [{ type: BotServiceRbac }]`, which the `azd` `azure.ai.agent` service target sets for you.
+
+### If you already published from the Foundry portal
+
+The Azure Bot and Teams channel already exist and are reused. After deploying this change, **re-run the publish** so the agent endpoint advertises the `activity` protocol — otherwise Teams traffic keeps going through the old `responses` adapter and you will still see the generic waiting message.
+
+### Local debugging (no deployment required)
+
+The Activity endpoint accepts **unauthenticated** inbound requests when no Bot credentials are configured, so the whole Teams experience can be exercised against your local Docker container — no Azure Bot, no Teams app package, no deploy.
+
+Run the container exactly as documented in [Build & Run](#run-the-container) (port `8088` is all that's needed for text), then:
+
+```powershell
+winget install agentsplayground
+```
+
+The Activity protocol is **bidirectional**, and that matters when the agent runs in Docker:
+
+- **Inbound** — the Playground POSTs the activity to the agent: `http://localhost:8088/api/messages`. Works out of the box, since `-p 8088:8088` publishes the port.
+- **Outbound** — the agent posts its replies back to the `serviceUrl` carried in the activity. The Playground defaults that to `http://localhost:56150/_connector`, and **inside the container `localhost` is the container itself**, so the reply fails with:
+
+  ```
+  ClientConnectorError: Cannot connect to host localhost:56150
+  ConnectionRefusedError: [Errno 111] Connect call failed ('127.0.0.1', 56150)
+  ```
+
+  The agent turn actually ran fine (you'll see the tools execute in the logs) — only the reply was undeliverable, so the Playground shows nothing.
+
+Use `--service-url` to make the Playground advertise the host address instead:
+
+```powershell
+agentsplayground -e http://localhost:8088/api/messages --service-url http://host.docker.internal:56150/_connector
+```
+
+`host.docker.internal` resolves to the host gateway from inside Docker Desktop containers with no extra flags. Verify it if replies still don't arrive:
+
+```powershell
+docker exec <container-id> sh -c "nc -z -w 3 host.docker.internal 56150 && echo REACHABLE || echo UNREACHABLE"
+```
+
+On a Docker engine without Docker Desktop's magic hostname, add `--add-host=host.docker.internal:host-gateway` to your `docker run`.
+
+> Running the agent **outside** Docker (`python main.py --port 8088`) needs no `--service-url` at all — plain `agentsplayground -e http://localhost:8088/api/messages` works, because both sides share the same `localhost`. That path still requires a reachable Blender on port 9876.
+
+Sanity check without the Playground, using any HTTP client:
+
+```powershell
+curl -X POST http://localhost:8088/api/messages -H "Content-Type: application/json" -d '{
+  "type": "message", "id": "1", "channelId": "msteams",
+  "serviceUrl": "http://localhost:9999",
+  "from": { "id": "user-1" }, "recipient": { "id": "bot-1" },
+  "conversation": { "id": "local-test-1" },
+  "text": "create a red cube"
+}'
+```
+
+`202 Accepted` means the activity was routed to the handler and the agent ran. The reply itself is delivered *outbound* to `serviceUrl`, so with a fake URL you will see a `Could not finish the activity response` warning in the logs — that is expected and harmless; the Playground provides a real `serviceUrl` that receives the reply.
+
+> **Do not expose port 8088 publicly.** Inbound authentication is enforced by the Foundry platform in front of the container (the `BotServiceRbac` authorization scheme on the agent endpoint), not by the container itself — same posture as the existing `/responses` endpoint.
 
 ## Credits
 

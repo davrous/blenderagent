@@ -2471,7 +2471,33 @@ This environment runs **Blender 4.4**. The following Blender 3.x APIs were remov
         ],
     )
     print("Blender Scene Agent running on http://localhost:8088")
-    server = ResponsesHostServer(agent)
+
+    # Host selection. By default we serve BOTH the Responses protocol (the web
+    # chat and the voice loopback) and the Activity protocol (Teams / M365
+    # Copilot) from one Starlette app on port 8088 — see activity_bridge for
+    # why the Activity protocol is needed rather than the portal's default
+    # publish path. The Activity stack is optional and isolated exactly like
+    # the voice path: any failure degrades to a responses-only host instead of
+    # taking the agent down.
+    server = None
+    try:
+        import activity_bridge
+
+        if activity_bridge.activity_available():
+            server = activity_bridge.build_multi_protocol_host(agent)
+            activity_bridge.register_activity_handlers(server, agent)
+            logger.info("Activity protocol ENABLED — Teams / M365 Copilot supported.")
+        else:
+            logger.info("Activity protocol DISABLED — serving responses only.")
+    except Exception:
+        logger.warning(
+            "Activity protocol failed to initialise; continuing with responses only.",
+            exc_info=True,
+        )
+        server = None
+
+    if server is None:
+        server = ResponsesHostServer(agent)
 
     # Serve the text Responses API. Optionally also serve the voice WebSocket
     # (speech-in / speech-out) alongside it when Speech is configured. The voice
