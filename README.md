@@ -588,7 +588,12 @@ The `message` handler runs the **same** `Agent` object — same 17 tools, same `
 
 Routing on `message_id` is why the bridge lives in-process: the WebChat client has to regex the `\n\n*status*\n\n` markers back out of the text stream, but here the structured update objects are still available.
 
-The Teams conversation id is passed through as `options={"user": …}`, which is exactly the channel `SceneIsolationMiddleware._get_conversation_id` already reads for the WebChat proxy.
+The conversation is identified to `SceneIsolationMiddleware._get_conversation_id` via `options={"user": …}` — the same channel the WebChat proxy uses. The value is **not** the raw Teams conversation id but a SHA-256 digest of it (`teams-<32 hex>`), because:
+
+- the Responses API caps `user` at 64 characters, and real Teams conversation ids are ~131 — the raw id fails the whole turn with `400 string_above_max_length`;
+- the digest is deterministic, which matters because `is_conversation_reset` treats a *changed* id as a new conversation and would otherwise discard the Blender scene on every message.
+
+Both the raw id and the derived key are logged at turn start so they can be correlated.
 
 ### Non-streaming fallback (M365 Copilot)
 

@@ -46,6 +46,7 @@ the imports fail or ``ENABLE_ACTIVITY`` is turned off, mirroring how
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import Any
@@ -60,9 +61,12 @@ _STATUS_PREFIXES = ("status-", "scene-status-")
 # How many prior messages (user + assistant) to replay on each turn. The
 # Activity path has NO Foundry-managed history — unlike /responses, which gets
 # it from the hosting layer — so we keep our own in the M365 conversation
-# state.
+# state. NOTE: this is a property name on the ConversationState scope, NOT a
+# dotted `TurnState.get_value` path — `TurnState` registers its scopes under
+# their CLASS names (`ConversationState`, `UserState`; only `temp` is
+# lowercase), so "conversation.<key>" raises ValueError: Scope not found.
 _MAX_HISTORY_MESSAGES = 20
-_HISTORY_PATH = "conversation.blender_history"
+_HISTORY_KEY = "blender_history"
 
 _WELCOME_TEXT = (
     "Hi! I'm a 3D scene assistant powered by Blender. Ask me to build a scene "
@@ -162,10 +166,11 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
         return
 
     conversation_id = _conversation_id(context)
+    scene_key = _scene_key(conversation_id) if conversation_id else None
     streaming = _supports_streaming(context)
     logger.info(
-        "Activity turn started: channel=%s conversation=%s streaming=%s",
-        _channel(context), conversation_id, streaming,
+        "Activity turn started: channel=%s conversation=%s scene_key=%s streaming=%s",
+        _channel(context), conversation_id, scene_key, streaming,
     )
 
     history = _load_history(state)
@@ -180,12 +185,12 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
     emitter = _StreamingEmitter(context) if streaming else _FallbackEmitter(context)
     reply_parts: list[str] = []
 
-    # `user` carries the Teams conversation id into
+    # `user` carries the scene key into
     # SceneIsolationMiddleware._get_conversation_id (it reads
     # `context.options["user"]`), exactly like the web chat proxy does. It is
     # used for logging / the persisted state file only — the scene file itself
     # has a fixed name per micro-VM.
-    options = {"user": conversation_id} if conversation_id else None
+    options = {"user": scene_key} if scene_key else None
 
     try:
         async for update in agent.run(messages, stream=True, options=options):
@@ -343,6 +348,23 @@ def _conversation_id(context: Any) -> str | None:
     return conversation_id if isinstance(conversation_id, str) and conversation_id else None
 
 
+def _scene_key(conversation_id: str) -> str:
+    """Derive a short, stable scene key from the channel conversation id.
+
+    The key travels to the model as ChatOptions ``user``, which the Responses
+    API caps at 64 characters. Real Teams conversation ids are ~131 chars and
+    were rejected with HTTP 400 ``string_above_max_length``, failing the whole
+    turn, so the raw id cannot be used.
+
+    A SHA-256 digest is short enough AND deterministic, which matters just as
+    much: ``SceneIsolationMiddleware.is_conversation_reset`` treats a *changed*
+    id as a new conversation and starts a fresh scene, so anything random or
+    per-turn would silently discard the user's work on every message.
+    """
+    digest = hashlib.sha256(conversation_id.encode("utf-8")).hexdigest()[:32]
+    return f"teams-{digest}"
+
+
 def _clean_status(text: str) -> str:
     """Unwrap the ``\\n\\n*status*\\n\\n`` marker the middleware emits."""
     return text.strip().strip("*").strip()
@@ -350,7 +372,7 @@ def _clean_status(text: str) -> str:
 
 def _load_history(state: Any) -> list[dict[str, str]]:
     try:
-        history = state.get_value(_HISTORY_PATH)
+        history = state.conversation.get_value(_HISTORY_KEY)
     except Exception:  # pragma: no cover - defensive
         logger.warning("Could not read Activity conversation history", exc_info=True)
         return []
@@ -365,6 +387,6 @@ def _load_history(state: Any) -> list[dict[str, str]]:
 
 def _save_history(state: Any, history: list[dict[str, str]]) -> None:
     try:
-        state.set_value(_HISTORY_PATH, history[-_MAX_HISTORY_MESSAGES:])
+        state.conversation.set_value(_HISTORY_KEY, history[-_MAX_HISTORY_MESSAGES:])
     except Exception:  # pragma: no cover - defensive
         logger.warning("Could not persist Activity conversation history", exc_info=True)
