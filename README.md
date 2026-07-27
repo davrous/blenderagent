@@ -599,6 +599,36 @@ Both the raw id and the derived key are logged at turn start so they can be corr
 
 `StreamingResponse` silently drops informative updates on channels that don't support streaming, and the M365 Agents SDK **explicitly disables streaming for agentic requests** — which is the M365 Copilot path. On those channels the bridge sends each status as its own message activity instead. Chattier than a live status line, but it is the only way the custom waiting text reaches the user today. Teams (non-agentic) gets the streaming experience.
 
+### `/reset` — starting a genuinely new scene
+
+Teams owns the conversation id and keeps it **stable even after "Remove chat history"**, so a user who clears the chat and starts talking again silently resumes the previous Blender scene — the persisted `scene.blend` is restored as usual.
+
+Sending **`/reset`** fixes that. It is handled before the agent runs (no model call), and it:
+
+1. clears the stored conversation history, and
+2. bumps a `blender_scene_generation` counter in the M365 conversation state, which is folded into the scene key.
+
+The next message therefore presents a **different** scene key to `SceneIsolationMiddleware`, which is precisely the signal the web chat's Reset button produces by rotating its conversation UUID: `SceneManager.is_conversation_reset` sees an id that differs from the one recorded by the last `save_scene` and resets Blender to a clean scene instead of loading the saved file. No changes to `SceneManager` or [main.py](main.py) were needed.
+
+The reset lands on the **next** message, which is what the confirmation says. Generation `0` hashes the bare conversation id, so scene keys minted before `/reset` existed stay valid — upgrading does not wipe live scenes.
+
+### Adaptive Card galleries
+
+For asset searches the system prompt makes the model answer with a fenced ` ```models ` / ` ```textures ` block containing the tool's raw JSON. The web client renders that as a clickable thumbnail gallery; dumped into Teams verbatim it is a wall of JSON.
+
+`_GalleryFilter` splits the streamed text into prose and cards:
+
+- text streams straight through until a fence opens, then is held back until it closes (a card cannot be built until the whole JSON block has arrived);
+- fences that are **not** gallery tags (` ```python `, ` ```json `) pass through untouched;
+- a fence that never closes is emitted verbatim at flush time rather than swallowed;
+- a fence split across streaming chunks is handled — a trailing partial `` ` `` / ``` `` ``` is never emitted in case it turns out to open one.
+
+Each gallery becomes one Adaptive Card (v1.4) whose rows are tappable via `selectAction` → `Action.Submit`. Attachments ride on the **final** message the stream emits, which is the only place the M365 SDK allows them.
+
+Tapping a row comes back as a `message` activity with an empty `text` and the payload in `activity.value`. The bridge turns that into the user message the existing tools expect — e.g. *"I picked the 3D model "Wooden Chair". Import it by calling `download_model` with `model_url="…"` …"* — so no new tools or prompt changes were required.
+
+The raw text (fenced JSON included) is what gets stored in conversation history, so the model still knows which gallery it offered on the next turn.
+
 ### Turning it off
 
 The Activity stack is optional and isolated exactly like the voice path. Set `ENABLE_ACTIVITY=false` (declared in [agent.yaml](agent.yaml)) to fall back to a responses-only host without rebuilding the image. If the `azure-ai-agentserver-activity` / `microsoft-agents-*` packages fail to import for any reason, `main()` logs a warning and degrades the same way instead of taking the agent down.
@@ -686,6 +716,16 @@ curl -X POST http://localhost:8088/api/messages -H "Content-Type: application/js
 ```
 
 `202 Accepted` means the activity was routed to the handler and the agent ran. The reply itself is delivered *outbound* to `serviceUrl`, so with a fake URL you will see a `Could not finish the activity response` warning in the logs — that is expected and harmless; the Playground provides a real `serviceUrl` that receives the reply.
+
+#### Verifying the two Teams-specific features locally
+
+Both are fully exercisable in the Playground before deploying:
+
+| Feature | How to check |
+|---|---|
+| Adaptive Card gallery | Ask *"find me a chair"*. Instead of a JSON block you should get a card with thumbnails; tapping a row sends the model back as `activity.value` and the agent imports it. |
+| `/reset` | Build something, send `/reset`, then ask *"what's in the scene?"* — it should be empty. The logs show `Activity /reset: … new_generation=1 new_scene_key=…` followed by `activate_scene: conversation id changed … discarding saved scene` on the next turn. |
+
 
 > **Do not expose port 8088 publicly.** Inbound authentication is enforced by the Foundry platform in front of the container (the `BotServiceRbac` authorization scheme on the agent endpoint), not by the container itself — same posture as the existing `/responses` endpoint.
 

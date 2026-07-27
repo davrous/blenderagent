@@ -47,6 +47,7 @@ the imports fail or ``ENABLE_ACTIVITY`` is turned off, mirroring how
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 from typing import Any
@@ -68,13 +69,34 @@ _STATUS_PREFIXES = ("status-", "scene-status-")
 _MAX_HISTORY_MESSAGES = 20
 _HISTORY_KEY = "blender_history"
 
+# Bumped by /reset. Folded into the scene key so the next turn presents a NEW
+# id to SceneIsolationMiddleware, which is exactly the signal the web chat's
+# Reset button produces by rotating its conversation UUID.
+_SCENE_GENERATION_KEY = "blender_scene_generation"
+_RESET_COMMAND = "/reset"
+
+# Fenced blocks the system prompt tells the model to emit for the asset
+# galleries. On the web chat these render as clickable thumbnail grids; in
+# Teams they become Adaptive Cards.
+_GALLERY_TAGS = ("models", "textures")
+_MAX_CARD_ITEMS = 6
+_ADAPTIVE_CARD_CONTENT_TYPE = "application/vnd.microsoft.card.adaptive"
+
 _WELCOME_TEXT = (
     "Hi! I'm a 3D scene assistant powered by Blender. Ask me to build a scene "
     "— for example *\"create a small cabin on a snowy hill and render it\"* — "
-    "and I'll model it, texture it and send you back a render."
+    "and I'll model it, texture it and send you back a render.\n\n"
+    "Send **/reset** at any time to throw away the current scene and start from scratch."
+)
+
+_RESET_TEXT = (
+    "🧹 Done — I've cleared this conversation. Your next message starts from a "
+    "brand-new, empty Blender scene."
 )
 
 _EMPTY_REPLY_TEXT = "I finished that step but didn't have anything to add."
+
+_GALLERY_ONLY_TEXT = "Here's what I found — tap one to use it."
 
 _ERROR_TEXT = (
     "Sorry — something went wrong while working on your scene. "
@@ -88,7 +110,7 @@ try:
     from agent_framework import Content, Message
     from agent_framework_foundry_hosting import ResponsesHostServer
     from azure.ai.agentserver.activity import ActivityAgentServerHost
-    from microsoft_agents.activity import Channels, DeliveryModes
+    from microsoft_agents.activity import Activity, Attachment, Channels, DeliveryModes
 except Exception as exc:  # pragma: no cover - exercised only on broken installs
     _IMPORT_ERROR = exc
 
@@ -161,16 +183,24 @@ def register_activity_handlers(host: Any, agent: Any) -> None:
 
 
 async def _run_turn(agent: Any, context: Any, state: Any) -> None:
-    user_text = _user_text(context)
+    conversation_id = _conversation_id(context)
+
+    # A tapped Adaptive Card arrives as a `message` activity with no text and
+    # the card's Action.Submit payload in `activity.value`.
+    user_text = _card_submit_text(context) or _user_text(context)
     if not user_text:
         return
 
-    conversation_id = _conversation_id(context)
-    scene_key = _scene_key(conversation_id) if conversation_id else None
+    if _is_reset_command(user_text):
+        await _handle_reset(context, state, conversation_id)
+        return
+
+    generation = _scene_generation(state)
+    scene_key = _scene_key(conversation_id, generation) if conversation_id else None
     streaming = _supports_streaming(context)
     logger.info(
-        "Activity turn started: channel=%s conversation=%s scene_key=%s streaming=%s",
-        _channel(context), conversation_id, scene_key, streaming,
+        "Activity turn started: channel=%s conversation=%s generation=%d scene_key=%s streaming=%s",
+        _channel(context), conversation_id, generation, scene_key, streaming,
     )
 
     history = _load_history(state)
@@ -183,6 +213,7 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
     ]
 
     emitter = _StreamingEmitter(context) if streaming else _FallbackEmitter(context)
+    gallery = _GalleryFilter()
     reply_parts: list[str] = []
 
     # `user` carries the scene key into
@@ -204,8 +235,11 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                     # Model prose, plus the tool images / download links that
                     # ToolStatusMiddleware surfaces early (markdown, which
                     # Teams renders) and the middleware's friendly error text.
+                    # Keep the RAW text for history so the model still knows
+                    # which gallery it offered; the user sees the filtered
+                    # version with the fenced JSON replaced by a card.
                     reply_parts.append(content.text)
-                    await emitter.text(content.text)
+                    await _emit_filtered(emitter, gallery.feed(content.text))
     except Exception:
         # ToolStatusMiddleware already emitted user-facing error text before
         # re-raising, so only add our own when nothing reached the user.
@@ -213,6 +247,10 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
         if not reply_parts:
             await emitter.text(_ERROR_TEXT)
     finally:
+        try:
+            await _emit_filtered(emitter, gallery.flush())
+        except Exception:
+            logger.warning("Could not flush the gallery buffer", exc_info=True)
         # The streaming queue drains in the background, so a Bot Connector
         # delivery failure surfaces here rather than on the individual
         # queue_* calls. Swallow it: an outbound failure must not become a
@@ -235,6 +273,252 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
     logger.info("Activity turn finished: conversation=%s reply_chars=%d", conversation_id, len(reply))
 
 
+async def _emit_filtered(emitter: Any, filtered: tuple[str, list[Any]]) -> None:
+    """Send the plain-text part of a filtered chunk, then any gallery cards."""
+    text, cards = filtered
+    if text:
+        await emitter.text(text)
+    for card in cards:
+        emitter.card(card)
+
+
+# ──────────────────────────────────────────────
+# /reset
+# ──────────────────────────────────────────────
+
+
+def _is_reset_command(text: str) -> bool:
+    return text.strip().lower().rstrip(".!") == _RESET_COMMAND
+
+
+async def _handle_reset(context: Any, state: Any, conversation_id: str | None) -> None:
+    """Start over: forget the transcript and hand out a fresh scene key.
+
+    Teams owns the conversation id and keeps it stable even after "Remove chat
+    history", so the agent cannot tell that the user wanted a clean slate — the
+    persisted ``scene.blend`` is happily restored on the next turn.
+
+    Rotating the *scene key* reproduces exactly what the web chat's Reset
+    button does by rotating its conversation UUID:
+    ``SceneManager.is_conversation_reset`` sees an id that differs from the one
+    recorded by the last ``save_scene`` and resets Blender to a clean scene
+    instead of loading the saved file. The reset therefore lands on the NEXT
+    message, which is why the confirmation says so.
+    """
+    generation = _bump_scene_generation(state)
+    _save_history(state, [])
+    logger.info(
+        "Activity /reset: conversation=%s new_generation=%d new_scene_key=%s",
+        conversation_id,
+        generation,
+        _scene_key(conversation_id, generation) if conversation_id else None,
+    )
+    await _safe_send(context, _RESET_TEXT)
+
+
+def _scene_generation(state: Any) -> int:
+    try:
+        value = state.conversation.get_value(_SCENE_GENERATION_KEY)
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("Could not read the scene generation", exc_info=True)
+        return 0
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _bump_scene_generation(state: Any) -> int:
+    generation = _scene_generation(state) + 1
+    try:
+        state.conversation.set_value(_SCENE_GENERATION_KEY, generation)
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("Could not persist the scene generation", exc_info=True)
+    return generation
+
+
+# ──────────────────────────────────────────────
+# Adaptive Card galleries
+# ──────────────────────────────────────────────
+
+
+class _GalleryFilter:
+    """Splits the model's streamed text into prose and gallery Adaptive Cards.
+
+    The system prompt makes the model answer asset searches with a fenced
+    ```` ```models ```` / ```` ```textures ```` block containing the tool's raw
+    JSON. The web client renders those as a thumbnail gallery; dumped into
+    Teams verbatim they are a wall of JSON.
+
+    A card cannot be built until the whole block has arrived, so text is
+    streamed straight through until a fence opens, then held back until it
+    closes. Fences that are not gallery tags (```` ```python ````, ````
+    ```json ````) pass through untouched, and a fence that never closes is
+    emitted verbatim at flush time rather than swallowed.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+
+    def feed(self, chunk: str) -> tuple[str, list[Any]]:
+        self._buffer += chunk
+        return self._drain(final=False)
+
+    def flush(self) -> tuple[str, list[Any]]:
+        return self._drain(final=True)
+
+    def _drain(self, *, final: bool) -> tuple[str, list[Any]]:
+        out: list[str] = []
+        cards: list[Any] = []
+
+        while True:
+            start = self._buffer.find("```")
+            if start == -1:
+                break
+            newline = self._buffer.find("\n", start + 3)
+            end = self._buffer.find("```", newline + 1) if newline != -1 else -1
+            if newline == -1 or end == -1:
+                if final:
+                    break  # unterminated fence — fall through and emit raw
+                # Hold the incomplete block; emit only what precedes it.
+                out.append(self._buffer[:start])
+                self._buffer = self._buffer[start:]
+                return "".join(out), cards
+
+            tag = self._buffer[start + 3:newline].strip().lower()
+            body = self._buffer[newline + 1:end]
+            out.append(self._buffer[:start])
+            card = _gallery_card(tag, body) if tag in _GALLERY_TAGS else None
+            if card is not None:
+                cards.append(card)
+            else:
+                out.append(self._buffer[start:end + 3])
+            self._buffer = self._buffer[end + 3:]
+
+        if final:
+            out.append(self._buffer)
+            self._buffer = ""
+        else:
+            # A fence can be split across chunks, so never emit a trailing
+            # partial "`" / "``" that might turn out to open one.
+            hold = 2 if self._buffer.endswith("``") else 1 if self._buffer.endswith("`") else 0
+            if hold:
+                out.append(self._buffer[:-hold])
+                self._buffer = self._buffer[-hold:]
+            else:
+                out.append(self._buffer)
+                self._buffer = ""
+
+        return "".join(out), cards
+
+
+def _gallery_card(tag: str, body: str) -> Any | None:
+    """Build an Adaptive Card attachment from a gallery JSON block.
+
+    Returns ``None`` when the block isn't usable, in which case the caller
+    falls back to emitting the original text so nothing is silently lost.
+    """
+    try:
+        items = json.loads(body.strip())
+    except (ValueError, TypeError):
+        logger.info("Gallery block for '%s' was not valid JSON — leaving as text", tag)
+        return None
+    if not isinstance(items, list) or not items:
+        return None
+
+    is_models = tag == "models"
+    rows: list[dict[str, Any]] = []
+    for item in items[:_MAX_CARD_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "Untitled")
+        reference = item.get("modelUrl") if is_models else item.get("assetId")
+        if not isinstance(reference, str) or not reference:
+            continue
+
+        data = (
+            {"action": "load_model", "name": name, "modelUrl": reference}
+            if is_models
+            else {"action": "apply_texture", "name": name, "assetId": reference}
+        )
+
+        columns: list[dict[str, Any]] = []
+        image_url = item.get("imageUrl")
+        if isinstance(image_url, str) and image_url:
+            columns.append({
+                "type": "Column",
+                "width": "auto",
+                "items": [{"type": "Image", "url": image_url, "size": "Medium", "altText": name}],
+            })
+        columns.append({
+            "type": "Column",
+            "width": "stretch",
+            "verticalContentAlignment": "Center",
+            "items": [
+                {"type": "TextBlock", "text": name, "weight": "Bolder", "wrap": True},
+                {
+                    "type": "TextBlock",
+                    "text": "Tap to add it to the scene" if is_models else "Tap to use this texture",
+                    "isSubtle": True,
+                    "spacing": "None",
+                    "wrap": True,
+                },
+            ],
+        })
+        rows.append({
+            "type": "ColumnSet",
+            "columns": columns,
+            "separator": True,
+            # selectAction makes the whole row tappable; the payload comes back
+            # on the next message activity as `activity.value`.
+            "selectAction": {"type": "Action.Submit", "title": name, "data": data},
+        })
+
+    if not rows:
+        return None
+
+    card = {
+        "type": "AdaptiveCard",
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.4",
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": "3D models you can add" if is_models else "Textures you can apply",
+                "weight": "Bolder",
+                "size": "Medium",
+                "wrap": True,
+            },
+            *rows,
+        ],
+    }
+    return Attachment(content_type=_ADAPTIVE_CARD_CONTENT_TYPE, content=card)
+
+
+def _card_submit_text(context: Any) -> str | None:
+    """Turn a tapped card into the user message the agent's tools expect."""
+    value = getattr(context.activity, "value", None)
+    if not isinstance(value, dict):
+        return None
+
+    action = value.get("action")
+    name = str(value.get("name") or "").strip() or "the one I picked"
+
+    if action == "load_model":
+        model_url = value.get("modelUrl")
+        if isinstance(model_url, str) and model_url:
+            return (
+                f'I picked the 3D model "{name}". Import it by calling download_model with '
+                f'model_url="{model_url}" and a short descriptive name, then take ONE '
+                f"viewport screenshot so I can see it."
+            )
+    elif action == "apply_texture":
+        asset_id = value.get("assetId")
+        if isinstance(asset_id, str) and asset_id:
+            return (
+                f'I picked the texture "{name}" (assetId "{asset_id}"). Apply it with '
+                f"apply_texture — if it is not obvious which object I mean, ask me first."
+            )
+    return None
+
+
 # ──────────────────────────────────────────────
 # Emitters
 # ──────────────────────────────────────────────
@@ -248,6 +532,7 @@ class _StreamingEmitter:
         self._stream = context.streaming_response
         self._stream.set_generated_by_ai_label(True)
         self._sent_text = False
+        self._sent_card = False
 
     async def status(self, text: str) -> None:
         # Renders as a live "thinking" line above the reply in Teams.
@@ -257,11 +542,19 @@ class _StreamingEmitter:
         self._sent_text = True
         self._stream.queue_text_chunk(chunk)
 
+    def card(self, attachment: Any) -> None:
+        # Attachments ride on the FINAL message the stream emits, which is the
+        # only place the M365 SDK allows them.
+        self._sent_card = True
+        self._stream.add_attachment(attachment)
+
     async def finish(self) -> None:
         if not self._sent_text:
             # end_stream() falls back to a placeholder string when the message
             # is empty; send something intentional instead.
-            self._stream.queue_text_chunk(_EMPTY_REPLY_TEXT)
+            self._stream.queue_text_chunk(
+                _GALLERY_ONLY_TEXT if self._sent_card else _EMPTY_REPLY_TEXT
+            )
         await self._stream.end_stream()
 
 
@@ -276,6 +569,7 @@ class _FallbackEmitter:
     def __init__(self, context: Any) -> None:
         self._context = context
         self._parts: list[str] = []
+        self._attachments: list[Any] = []
 
     async def status(self, text: str) -> None:
         await _safe_send(self._context, text)
@@ -283,20 +577,28 @@ class _FallbackEmitter:
     async def text(self, chunk: str) -> None:
         self._parts.append(chunk)
 
+    def card(self, attachment: Any) -> None:
+        self._attachments.append(attachment)
+
     async def finish(self) -> None:
         body = "".join(self._parts).strip()
-        await _safe_send(self._context, body or _EMPTY_REPLY_TEXT)
+        if not body:
+            body = _GALLERY_ONLY_TEXT if self._attachments else _EMPTY_REPLY_TEXT
+        await _safe_send(
+            self._context,
+            Activity(type="message", text=body, attachments=self._attachments or []),
+        )
 
 
-async def _safe_send(context: Any, text: str) -> None:
-    """Send an activity, logging (not raising) on delivery failure.
+async def _safe_send(context: Any, message: Any) -> None:
+    """Send an activity (or plain text), logging — not raising — on failure.
 
     Outbound delivery goes to the Bot Connector. A transient failure there must
     not surface as a 500 on the inbound webhook, or the connector retries the
     whole turn.
     """
     try:
-        await context.send_activity(text)
+        await context.send_activity(message)
     except Exception as exc:  # pragma: no cover - network dependent
         logger.warning("Could not send activity: %s", exc)
 
@@ -348,7 +650,7 @@ def _conversation_id(context: Any) -> str | None:
     return conversation_id if isinstance(conversation_id, str) and conversation_id else None
 
 
-def _scene_key(conversation_id: str) -> str:
+def _scene_key(conversation_id: str, generation: int = 0) -> str:
     """Derive a short, stable scene key from the channel conversation id.
 
     The key travels to the model as ChatOptions ``user``, which the Responses
@@ -360,8 +662,14 @@ def _scene_key(conversation_id: str) -> str:
     much: ``SceneIsolationMiddleware.is_conversation_reset`` treats a *changed*
     id as a new conversation and starts a fresh scene, so anything random or
     per-turn would silently discard the user's work on every message.
+
+    ``generation`` is bumped by /reset to deliberately produce a different key
+    and trigger exactly that reset. Generation 0 hashes the bare conversation
+    id so keys minted before /reset existed stay valid — otherwise upgrading
+    would wipe every live Teams scene once.
     """
-    digest = hashlib.sha256(conversation_id.encode("utf-8")).hexdigest()[:32]
+    seed = conversation_id if generation <= 0 else f"{conversation_id}#{generation}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
     return f"teams-{digest}"
 
 
