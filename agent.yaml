@@ -45,6 +45,14 @@ environment_variables:
   # rebuilding the image.
   - name: ENABLE_ACTIVITY
     value: "true"
+  # Teams / M365 Copilot drop a turn that goes quiet for ~45s. Re-state the
+  # current status when nothing has been sent for this long.
+  - name: ACTIVITY_KEEPALIVE_SECONDS
+    value: "20"
+  # Teams kills a streamed message after a hard 2 minutes; close it before that
+  # and continue with ordinary messages so a long render is never lost.
+  - name: ACTIVITY_STREAM_MAX_SECONDS
+    value: "100"
   # ── Voice (speech-in / speech-out) ──
   # Keyless Speech auth: grant this agent's Entra identity the
   # "Cognitive Services User" (or "Cognitive Services Speech User") role on the

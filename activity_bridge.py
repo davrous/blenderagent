@@ -46,11 +46,14 @@ the imports fail or ``ENABLE_ACTIVITY`` is turned off, mirroring how
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import re
+import time
 from typing import Any
 
 logger = logging.getLogger("blender_agent.activity")
@@ -113,6 +116,22 @@ _ERROR_TEXT = (
     "Sorry — something went wrong while working on your scene. "
     "Please try again, or rephrase your request."
 )
+
+# ── Keeping long turns alive ────────────────────────────────────────────────
+# Teams and M365 Copilot abandon a turn that goes quiet for roughly 45s, and a
+# single tool call (a final render, a model import) routinely takes longer than
+# that. Status updates only fire when a tool *starts*, so a pump re-states the
+# current status whenever nothing has been sent for a while.
+_KEEPALIVE_SECONDS = float(os.environ.get("ACTIVITY_KEEPALIVE_SECONDS", "20"))
+_KEEPALIVE_POLL_SECONDS = 2.0
+_KEEPALIVE_FALLBACK_TEXT = "Working on your scene"
+
+# Teams enforces a hard two-minute lifetime on a streamed message and then
+# rejects everything further with 403 ContentStreamNotAllowed ("Content stream
+# finished due to exceeded streaming time"), which would lose the whole reply.
+# Close the stream before that and keep going with ordinary messages.
+_STREAM_MAX_SECONDS = float(os.environ.get("ACTIVITY_STREAM_MAX_SECONDS", "100"))
+_STREAM_CONTINUED_TEXT = "Still working on it — I'll send the rest right here."
 
 # Populated by the guarded import below; `activity_available()` reports on it.
 _IMPORT_ERROR: Exception | None = None
@@ -257,6 +276,10 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
     # has a fixed name per micro-VM.
     options = {"user": scene_key} if scene_key else None
 
+    # Tool calls can run for minutes; without this the channel sees nothing
+    # between two status updates and gives up on the turn.
+    pump = asyncio.create_task(_keepalive_pump(emitter))
+
     try:
         async for update in agent.run(messages, stream=True, options=options):
             for content in update.contents or []:
@@ -281,6 +304,11 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
         if not reply_parts:
             await emitter.text(_ERROR_TEXT)
     finally:
+        # Stop the pump before finishing so a keep-alive can't land after (or
+        # interleave with) the final message.
+        pump.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump
         try:
             await _emit_filtered(emitter, gallery.flush(), dedupe, final=True)
         except Exception:
@@ -326,7 +354,7 @@ async def _emit_filtered(
     if text:
         await emitter.text(text)
     for card in cards:
-        emitter.card(card)
+        await emitter.card(card)
 
 
 # ──────────────────────────────────────────────
@@ -675,61 +703,175 @@ def _card_submit_text(context: Any) -> str | None:
 # ──────────────────────────────────────────────
 
 
-class _StreamingEmitter:
-    """Streams via the M365 streaming response (Teams, WebChat, DirectLine)."""
+class _Emitter:
+    """Shared bookkeeping: what was said last, and how long ago."""
 
     def __init__(self, context: Any) -> None:
         self._context = context
+        self._started = time.monotonic()
+        self._last_sent = self._started
+        self._last_status = ""
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self._started
+
+    @property
+    def idle(self) -> float:
+        """Seconds since anything was last put on the wire."""
+        return time.monotonic() - self._last_sent
+
+    def _touch(self) -> None:
+        self._last_sent = time.monotonic()
+
+    def _keepalive_text(self) -> str:
+        """Restate the live status rather than a canned 'please wait'."""
+        detail = self._last_status.rstrip("…. ") or _KEEPALIVE_FALLBACK_TEXT
+        return f"{detail} — still working ({int(self.elapsed)}s)"
+
+    async def keepalive(self) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+
+async def _keepalive_pump(emitter: _Emitter) -> None:
+    """Nudge the channel while the agent is busy but silent."""
+    try:
+        while True:
+            await asyncio.sleep(_KEEPALIVE_POLL_SECONDS)
+            if emitter.idle >= _KEEPALIVE_SECONDS:
+                await emitter.keepalive()
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # pragma: no cover - defensive
+        # A dead pump must never fail the turn; the answer still gets through.
+        logger.warning("Keep-alive pump stopped", exc_info=True)
+
+
+class _StreamingEmitter(_Emitter):
+    """Streams via the M365 streaming response (Teams, WebChat, DirectLine)."""
+
+    def __init__(self, context: Any) -> None:
+        super().__init__(context)
         self._stream = context.streaming_response
         self._stream.set_generated_by_ai_label(True)
         self._sent_text = False
         self._sent_card = False
+        # Set once the two-minute cap forces the stream shut; everything after
+        # that goes out as ordinary messages.
+        self._overflow: _FallbackEmitter | None = None
 
     async def status(self, text: str) -> None:
+        self._last_status = text
+        target = await self._target()
+        if target is not None:
+            await target.status(text)
+            return
         # Renders as a live "thinking" line above the reply in Teams.
         self._stream.queue_informative_update(text)
+        self._touch()
 
     async def text(self, chunk: str) -> None:
+        target = await self._target()
+        if target is not None:
+            await target.text(chunk)
+            return
         self._sent_text = True
         self._stream.queue_text_chunk(chunk)
+        self._touch()
 
-    def card(self, attachment: Any) -> None:
+    async def card(self, attachment: Any) -> None:
+        target = await self._target()
+        if target is not None:
+            await target.card(attachment)
+            return
         # Attachments ride on the FINAL message the stream emits, which is the
         # only place the M365 SDK allows them.
         self._sent_card = True
         self._stream.add_attachment(attachment)
 
+    async def keepalive(self) -> None:
+        target = await self._target()
+        if target is not None:
+            await target.keepalive()
+            return
+        # Teams stops *rendering* informative updates once real text has been
+        # streamed, but they still count as stream traffic, and by then the
+        # partial answer plus the typing indicator already show progress. Never
+        # inject keep-alive noise into the answer body: streamed content is
+        # cumulative, so it could not be taken back out.
+        self._stream.queue_informative_update(self._keepalive_text())
+        self._touch()
+
     async def finish(self) -> None:
+        if self._overflow is not None:
+            await self._overflow.finish()
+            return
+        await self._end_stream(
+            _GALLERY_ONLY_TEXT if self._sent_card else _EMPTY_REPLY_TEXT
+        )
+
+    async def _target(self) -> _FallbackEmitter | None:
+        """Close the stream before Teams' two-minute cap kills it.
+
+        Returns the plain-message emitter that took over, or ``None`` while the
+        stream is still healthy.
+        """
+        if self._overflow is None and self.elapsed > _STREAM_MAX_SECONDS:
+            logger.info(
+                "Closing the Teams stream after %.0fs (cap %.0fs) and "
+                "continuing with plain messages",
+                self.elapsed, _STREAM_MAX_SECONDS,
+            )
+            try:
+                await self._end_stream(_STREAM_CONTINUED_TEXT)
+            except Exception as exc:  # pragma: no cover - network dependent
+                logger.warning("Could not close the stream cleanly: %s", exc)
+            self._overflow = _FallbackEmitter(self._context)
+            # Carry the turn clock over so the keep-alive keeps counting from
+            # the user's message, not from the handover.
+            self._overflow._started = self._started
+            self._overflow._last_status = self._last_status
+        return self._overflow
+
+    async def _end_stream(self, placeholder: str) -> None:
         if not self._sent_text:
             # end_stream() falls back to a placeholder string when the message
             # is empty; send something intentional instead.
-            self._stream.queue_text_chunk(
-                _GALLERY_ONLY_TEXT if self._sent_card else _EMPTY_REPLY_TEXT
-            )
+            self._sent_text = True
+            self._stream.queue_text_chunk(placeholder)
         await self._stream.end_stream()
 
 
-class _FallbackEmitter:
+class _FallbackEmitter(_Emitter):
     """Non-streaming channels — notably M365 Copilot's agentic requests.
 
     Informative updates are dropped on these channels, so each status becomes
     its own message activity. That is chattier than a live status line, but it
-    is the only way the custom waiting text reaches the user today.
+    is the only way the custom waiting text reaches the user today — and it is
+    also what keeps a long turn from being abandoned, since those messages are
+    the only traffic the channel sees while a tool runs.
     """
 
     def __init__(self, context: Any) -> None:
-        self._context = context
+        super().__init__(context)
         self._parts: list[str] = []
         self._attachments: list[Any] = []
 
     async def status(self, text: str) -> None:
+        self._last_status = text
         await _safe_send(self._context, text)
+        self._touch()
 
     async def text(self, chunk: str) -> None:
+        # Buffered until finish(), so this is deliberately not a _touch().
         self._parts.append(chunk)
 
-    def card(self, attachment: Any) -> None:
+    async def card(self, attachment: Any) -> None:
         self._attachments.append(attachment)
+
+    async def keepalive(self) -> None:
+        await _safe_send(self._context, self._keepalive_text())
+        self._touch()
 
     async def finish(self) -> None:
         body = "".join(self._parts).strip()

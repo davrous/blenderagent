@@ -625,6 +625,19 @@ Both the raw id and the derived key are logged at turn start so they can be corr
 
 `StreamingResponse` silently drops informative updates on channels that don't support streaming, and the M365 Agents SDK **explicitly disables streaming for agentic requests** — which is the M365 Copilot path. On those channels the bridge sends each status as its own message activity instead. Chattier than a live status line, but it is the only way the custom waiting text reaches the user today. Teams (non-agentic) gets the streaming experience.
 
+### Surviving long turns
+
+Two independent limits bite on turns that take a while, and both are handled in the emitters:
+
+**Silence.** Teams and M365 Copilot abandon a turn that produces no traffic for roughly 45 s, and a single tool call (a final render, a model import) routinely takes longer. Status updates only fire when a tool *starts*, so a keep-alive pump (`_keepalive_pump`, `ACTIVITY_KEEPALIVE_SECONDS`, default 20 s) re-states the **current** status whenever nothing has gone out for that long — `Rendering the final image — still working (63s)`. It runs as a task alongside the agent stream and is cancelled before the final message so a keep-alive can never interleave with it.
+
+- Streaming channels get an informative update. Teams stops *rendering* those once real text has been streamed, but they still count as stream traffic, and by then the partial answer plus the typing indicator already show progress. Keep-alives are deliberately never queued as text chunks: streamed content is cumulative, so the noise could not be taken back out of the final message.
+- Non-streaming channels (M365 Copilot) get a short message activity — the same mechanism that already carries the per-tool statuses there.
+
+**The two-minute stream cap.** Teams kills a streamed message after a hard two minutes and rejects everything further with `403 ContentStreamNotAllowed` (*"Content stream finished due to exceeded streaming time"*), which would lose the entire reply. `_StreamingEmitter` closes the stream itself at `ACTIVITY_STREAM_MAX_SECONDS` (default 100 s) and hands over to the plain-message emitter, so a long render finishes as ordinary messages instead of a dead stream. Everything already streamed stays on screen.
+
+Note that neither knob can extend the *inbound* timeout of the platform in front of the container: if the gateway gives up, it surfaces an error in the client while the container keeps working and delivers the reply out-of-band a moment later. Keeping traffic flowing is what avoids that, which is exactly what the pump does.
+
 ### `/clear` — starting a genuinely new scene
 
 Teams owns the conversation id and keeps it **stable even after "Remove chat history"**, so a user who clears the chat and starts talking again silently resumes the previous Blender scene — the persisted `scene.blend` is restored as usual. Teams sends the bot **no event at all** for "Remove chat history", so it cannot be detected.
