@@ -50,6 +50,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from typing import Any
 
 logger = logging.getLogger("blender_agent.activity")
@@ -69,11 +70,13 @@ _STATUS_PREFIXES = ("status-", "scene-status-")
 _MAX_HISTORY_MESSAGES = 20
 _HISTORY_KEY = "blender_history"
 
-# Bumped by /reset. Folded into the scene key so the next turn presents a NEW
+# Bumped by /clear. Folded into the scene key so the next turn presents a NEW
 # id to SceneIsolationMiddleware, which is exactly the signal the web chat's
 # Reset button produces by rotating its conversation UUID.
 _SCENE_GENERATION_KEY = "blender_scene_generation"
-_RESET_COMMAND = "/reset"
+# NOT "/reset": Teams treats that as one of its own native chat commands, so it
+# never reaches the agent.
+_CLEAR_COMMAND = "/clear"
 
 # Fenced blocks the system prompt tells the model to emit for the asset
 # galleries. On the web chat these render as clickable thumbnail grids; in
@@ -82,14 +85,22 @@ _GALLERY_TAGS = ("models", "textures")
 _MAX_CARD_ITEMS = 6
 _ADAPTIVE_CARD_CONTENT_TYPE = "application/vnd.microsoft.card.adaptive"
 
+# Markdown image `![alt](url)` or link `[text](url)`; group 1 is the leading
+# `!`, group 2 the url. Mirrors MEDIA_RE in the web client's parseMarkdown.ts.
+_MEDIA_RE = re.compile(r"(!?)\[[^\]\n]*\]\(([^)\s]+)(?:\s+[^)\n]*)?\)")
+_DOWNLOAD_SUFFIXES = (".blend", ".glb", ".gltf", ".fbx")
+# Cap on how much text may be held back waiting for a half-arrived media token,
+# so a stray "[" can never stall the stream for a whole turn.
+_MAX_MEDIA_HOLD = 4096
+
 _WELCOME_TEXT = (
     "Hi! I'm a 3D scene assistant powered by Blender. Ask me to build a scene "
     "— for example *\"create a small cabin on a snowy hill and render it\"* — "
     "and I'll model it, texture it and send you back a render.\n\n"
-    "Send **/reset** at any time to throw away the current scene and start from scratch."
+    "Send **/clear** at any time to throw away the current scene and start from scratch."
 )
 
-_RESET_TEXT = (
+_CLEAR_TEXT = (
     "🧹 Done — I've cleared this conversation. Your next message starts from a "
     "brand-new, empty Blender scene."
 )
@@ -169,12 +180,34 @@ def register_activity_handlers(host: Any, agent: Any) -> None:
                 continue
             await _safe_send(context, _WELCOME_TEXT)
 
+    @app.activity("installationUpdate")
+    async def on_installation_update(context: Any, state: Any) -> None:  # pyright: ignore[reportUnusedFunction]
+        # Teams fires this with action "add" / "remove" (and "*-upgrade") when
+        # the app is installed or uninstalled — the only app-lifecycle signal a
+        # bot gets, and the one the docs point at for dropping stored user data
+        # on uninstall. There is NO event for "Remove chat history", so an
+        # uninstall/reinstall is the closest thing to the user asking for a
+        # clean slate: wipe both ends of it.
+        #
+        # Silent on purpose — messages sent after an uninstall are rejected
+        # (403), and on install the membersAdded welcome already greets the user.
+        action = str(getattr(context.activity, "action", "") or "").lower()
+        conversation_id = _conversation_id(context)
+        generation = _clear_conversation(state)
+        logger.info(
+            "Activity installationUpdate: action=%s conversation=%s new_generation=%d",
+            action, conversation_id, generation,
+        )
+
     @app.error
     async def on_error(context: Any, error: Exception) -> None:  # pyright: ignore[reportUnusedFunction]
         logger.error("Activity handler error: %s", error, exc_info=True)
         await _safe_send(context, _ERROR_TEXT)
 
-    logger.info("Activity protocol handlers registered (message, conversationUpdate, error).")
+    logger.info(
+        "Activity protocol handlers registered "
+        "(message, conversationUpdate, installationUpdate, error)."
+    )
 
 
 # ──────────────────────────────────────────────
@@ -191,8 +224,8 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
     if not user_text:
         return
 
-    if _is_reset_command(user_text):
-        await _handle_reset(context, state, conversation_id)
+    if _is_clear_command(user_text):
+        await _handle_clear(context, state, conversation_id)
         return
 
     generation = _scene_generation(state)
@@ -214,6 +247,7 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
 
     emitter = _StreamingEmitter(context) if streaming else _FallbackEmitter(context)
     gallery = _GalleryFilter()
+    dedupe = _MediaDedupeFilter()
     reply_parts: list[str] = []
 
     # `user` carries the scene key into
@@ -239,7 +273,7 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                     # which gallery it offered; the user sees the filtered
                     # version with the fenced JSON replaced by a card.
                     reply_parts.append(content.text)
-                    await _emit_filtered(emitter, gallery.feed(content.text))
+                    await _emit_filtered(emitter, gallery.feed(content.text), dedupe)
     except Exception:
         # ToolStatusMiddleware already emitted user-facing error text before
         # re-raising, so only add our own when nothing reached the user.
@@ -248,7 +282,7 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
             await emitter.text(_ERROR_TEXT)
     finally:
         try:
-            await _emit_filtered(emitter, gallery.flush())
+            await _emit_filtered(emitter, gallery.flush(), dedupe, final=True)
         except Exception:
             logger.warning("Could not flush the gallery buffer", exc_info=True)
         # The streaming queue drains in the background, so a Bot Connector
@@ -273,9 +307,22 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
     logger.info("Activity turn finished: conversation=%s reply_chars=%d", conversation_id, len(reply))
 
 
-async def _emit_filtered(emitter: Any, filtered: tuple[str, list[Any]]) -> None:
-    """Send the plain-text part of a filtered chunk, then any gallery cards."""
+async def _emit_filtered(
+    emitter: Any,
+    filtered: tuple[str, list[Any]],
+    dedupe: Any,
+    *,
+    final: bool = False,
+) -> None:
+    """Send the plain-text part of a filtered chunk, then any gallery cards.
+
+    Prose passes through ``dedupe`` so an image or download link the model
+    echoes after the middleware already surfaced it is shown only once.
+    """
     text, cards = filtered
+    text = dedupe.feed(text)
+    if final:
+        text += dedupe.flush()
     if text:
         await emitter.text(text)
     for card in cards:
@@ -283,16 +330,16 @@ async def _emit_filtered(emitter: Any, filtered: tuple[str, list[Any]]) -> None:
 
 
 # ──────────────────────────────────────────────
-# /reset
+# /clear
 # ──────────────────────────────────────────────
 
 
-def _is_reset_command(text: str) -> bool:
-    return text.strip().lower().rstrip(".!") == _RESET_COMMAND
+def _is_clear_command(text: str) -> bool:
+    return text.strip().lower().rstrip(".!") == _CLEAR_COMMAND
 
 
-async def _handle_reset(context: Any, state: Any, conversation_id: str | None) -> None:
-    """Start over: forget the transcript and hand out a fresh scene key.
+def _clear_conversation(state: Any) -> int:
+    """Forget the transcript and hand out a fresh scene key.
 
     Teams owns the conversation id and keeps it stable even after "Remove chat
     history", so the agent cannot tell that the user wanted a clean slate — the
@@ -307,13 +354,18 @@ async def _handle_reset(context: Any, state: Any, conversation_id: str | None) -
     """
     generation = _bump_scene_generation(state)
     _save_history(state, [])
+    return generation
+
+
+async def _handle_clear(context: Any, state: Any, conversation_id: str | None) -> None:
+    generation = _clear_conversation(state)
     logger.info(
-        "Activity /reset: conversation=%s new_generation=%d new_scene_key=%s",
+        "Activity /clear: conversation=%s new_generation=%d new_scene_key=%s",
         conversation_id,
         generation,
         _scene_key(conversation_id, generation) if conversation_id else None,
     )
-    await _safe_send(context, _RESET_TEXT)
+    await _safe_send(context, _CLEAR_TEXT)
 
 
 def _scene_generation(state: Any) -> int:
@@ -407,6 +459,105 @@ class _GalleryFilter:
                 self._buffer = ""
 
         return "".join(out), cards
+
+
+# ──────────────────────────────────────────────
+# Duplicate image / download-link suppression
+# ──────────────────────────────────────────────
+
+
+def _is_download_link(url: str) -> bool:
+    """Heuristic: does this URL point at a downloadable scene file?"""
+    path = url.split("?", 1)[0].split("#", 1)[0].lower()
+    return path.endswith(_DOWNLOAD_SUFFIXES)
+
+
+def _is_partial_media(text: str) -> bool:
+    """Whether ``text`` could still grow into a complete media token."""
+    i = 1 if text.startswith("!") else 0
+    if not text[i:].startswith("["):
+        return False
+    close = text.find("]", i + 1)
+    if close == -1:
+        return "\n" not in text[i + 1:]
+    if close + 1 >= len(text):
+        return True
+    if text[close + 1] != "(":
+        return False
+    rest = text[close + 2:]
+    # A ")" here means the regex already had its chance and did not match.
+    return "\n" not in rest and ")" not in rest
+
+
+class _MediaDedupeFilter:
+    """Drops repeated markdown images / download links within one reply.
+
+    The agent emits some media twice: ``ToolStatusMiddleware`` surfaces the
+    tool result early (so the render shows up the moment it exists) and the
+    model then echoes the same markdown in its prose. The web client hides the
+    second copy with ``dedupeMarkdownMedia()``; Teams and M365 Copilot render
+    whatever text we queue, so the same suppression has to happen here.
+
+    Unlike the client, which sees the finished message, this runs on the live
+    stream: a token can be split across chunks, so an incomplete one is held
+    back (up to ``_MAX_MEDIA_HOLD``) until it either completes or is proven not
+    to be media. State is per-turn and keyed on the URL — blob URLs carry a
+    unique timestamp + uuid, so distinct files never collide.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._seen: set[str] = set()
+
+    def feed(self, chunk: str) -> str:
+        self._buffer += chunk
+        return self._drain(final=False)
+
+    def flush(self) -> str:
+        return self._drain(final=True)
+
+    def _drain(self, *, final: bool) -> str:
+        buf = self._buffer
+        out: list[str] = []
+        emit_from = 0  # everything before this was already emitted or dropped
+        pos = 0
+
+        while True:
+            start = buf.find("[", pos)
+            if start == -1:
+                break
+            if start > 0 and buf[start - 1] == "!":
+                start -= 1
+
+            match = _MEDIA_RE.match(buf, start)
+            if match is None:
+                if (
+                    not final
+                    and len(buf) - start < _MAX_MEDIA_HOLD
+                    and _is_partial_media(buf[start:])
+                ):
+                    out.append(buf[emit_from:start])
+                    self._buffer = buf[start:]
+                    return "".join(out)
+                pos = start + (2 if buf[start] == "!" else 1)
+                continue
+
+            url = match.group(2)
+            if match.group(1) == "!" or _is_download_link(url):
+                if url in self._seen:
+                    out.append(buf[emit_from:start])
+                    emit_from = match.end()
+                    logger.debug("Dropped duplicate media for %s", url)
+                else:
+                    self._seen.add(url)
+            pos = match.end()
+
+        # A trailing "!" may be the start of an image whose "[" is in the next
+        # chunk; holding it keeps the token recognisable.
+        tail = 1 if not final and buf.endswith("!") else 0
+        out.append(buf[emit_from:len(buf) - tail])
+        self._buffer = buf[len(buf) - tail:] if tail else ""
+        return "".join(out)
 
 
 def _gallery_card(tag: str, body: str) -> Any | None:
@@ -663,10 +814,11 @@ def _scene_key(conversation_id: str, generation: int = 0) -> str:
     id as a new conversation and starts a fresh scene, so anything random or
     per-turn would silently discard the user's work on every message.
 
-    ``generation`` is bumped by /reset to deliberately produce a different key
-    and trigger exactly that reset. Generation 0 hashes the bare conversation
-    id so keys minted before /reset existed stay valid — otherwise upgrading
-    would wipe every live Teams scene once.
+    ``generation`` is bumped by /clear (and by install/uninstall) to
+    deliberately produce a different key and trigger exactly that reset.
+    Generation 0 hashes the bare conversation id so keys minted before /clear
+    existed stay valid — otherwise upgrading would wipe every live Teams scene
+    once.
     """
     seed = conversation_id if generation <= 0 else f"{conversation_id}#{generation}"
     digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]

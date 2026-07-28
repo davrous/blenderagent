@@ -625,18 +625,20 @@ Both the raw id and the derived key are logged at turn start so they can be corr
 
 `StreamingResponse` silently drops informative updates on channels that don't support streaming, and the M365 Agents SDK **explicitly disables streaming for agentic requests** — which is the M365 Copilot path. On those channels the bridge sends each status as its own message activity instead. Chattier than a live status line, but it is the only way the custom waiting text reaches the user today. Teams (non-agentic) gets the streaming experience.
 
-### `/reset` — starting a genuinely new scene
+### `/clear` — starting a genuinely new scene
 
-Teams owns the conversation id and keeps it **stable even after "Remove chat history"**, so a user who clears the chat and starts talking again silently resumes the previous Blender scene — the persisted `scene.blend` is restored as usual.
+Teams owns the conversation id and keeps it **stable even after "Remove chat history"**, so a user who clears the chat and starts talking again silently resumes the previous Blender scene — the persisted `scene.blend` is restored as usual. Teams sends the bot **no event at all** for "Remove chat history", so it cannot be detected.
 
-Sending **`/reset`** fixes that. It is handled before the agent runs (no model call), and it:
+Sending **`/clear`** fixes that. (`/reset` is *not* used: Teams intercepts it as one of its own native chat commands, so it never reaches the agent.) It is handled before the agent runs (no model call), and it:
 
 1. clears the stored conversation history, and
 2. bumps a `blender_scene_generation` counter in the M365 conversation state, which is folded into the scene key.
 
 The next message therefore presents a **different** scene key to `SceneIsolationMiddleware`, which is precisely the signal the web chat's Reset button produces by rotating its conversation UUID: `SceneManager.is_conversation_reset` sees an id that differs from the one recorded by the last `save_scene` and resets Blender to a clean scene instead of loading the saved file. No changes to `SceneManager` or [main.py](main.py) were needed.
 
-The reset lands on the **next** message, which is what the confirmation says. Generation `0` hashes the bare conversation id, so scene keys minted before `/reset` existed stay valid — upgrading does not wipe live scenes.
+The reset lands on the **next** message, which is what the confirmation says. Generation `0` hashes the bare conversation id, so scene keys minted before `/clear` existed stay valid — upgrading does not wipe live scenes.
+
+The same clearing logic also runs, silently, on the `installationUpdate` activity (`action` = `add` / `remove`) — the only app-lifecycle event a bot receives, and the one Microsoft documents for dropping stored user data on uninstall. Uninstalling and reinstalling the app therefore also yields a clean scene. Nothing is sent back on that activity: messages after an uninstall are rejected with `403`, and on install the `membersAdded` welcome already greets the user.
 
 ### Adaptive Card galleries
 
@@ -750,7 +752,7 @@ Both are fully exercisable in the Playground before deploying:
 | Feature | How to check |
 |---|---|
 | Adaptive Card gallery | Ask *"find me a chair"*. Instead of a JSON block you should get a card with thumbnails; tapping a row sends the model back as `activity.value` and the agent imports it. |
-| `/reset` | Build something, send `/reset`, then ask *"what's in the scene?"* — it should be empty. The logs show `Activity /reset: … new_generation=1 new_scene_key=…` followed by `activate_scene: conversation id changed … discarding saved scene` on the next turn. |
+| `/clear` | Build something, send `/clear`, then ask *"what's in the scene?"* — it should be empty. The logs show `Activity /clear: … new_generation=1 new_scene_key=…` followed by `activate_scene: conversation id changed … discarding saved scene` on the next turn. |
 
 
 > **Do not expose port 8088 publicly.** Inbound authentication is enforced by the Foundry platform in front of the container (the `BotServiceRbac` authorization scheme on the agent endpoint), not by the container itself — same posture as the existing `/responses` endpoint.
