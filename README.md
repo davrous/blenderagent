@@ -4,35 +4,61 @@ An AI agent that creates and manipulates 3D scenes in a headless Blender instanc
 
 ## Architecture
 
+The container speaks **three protocols at once** — `responses` (web chat),
+`activity` (Teams / M365 Copilot) and `invocations_ws` (voice) — from a single
+Starlette app on port 8088. All three funnel into the *same* agent, middleware
+stack, tools and Blender scene; only the transport and the response formatting
+differ.
+
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  Docker Container                                                │
-│                                                                  │
-│  ┌──────────┐    ┌──────────────────┐    ┌──────────────────┐    │
-│  │  Xvfb    │◄───│  Blender 4.2     │    │  Python Agent    │    │
-│  │ :99      │    │  (background)    │◄──►│  Server          │    │
-│  │ virtual  │    │                  │TCP │                  │    │
-│  │ display  │    │  blender_startup │9876│  main.py  :8088  │    │
-│  └──────────┘    │  .py (socket     │    │  (Responses API) │    │
-│                  │   server)        │    │                  │    │
-│                  │                  │    │  voice_pipeline  │    │
-│                  │                  │    │  .py      :8089  │    │
-│                  └──────────────────┘    │  (voice WS)      │    │
-│                                          └────┬────────┬────┘    │
-│                                               │        │         │
-└───────────────────────────────────────────────┼────────┼─────────┘
-                                          HTTPS │        │  STT/TTS
-                                   ┌────────────▼────┐  ┌▼───────────────────┐
-                                   │  Azure AI       │  │  Azure Speech /    │
-                                   │  Foundry        │  │  AI Services       │
-                                   │  (GPT model)    │  │  (speech-in/out)   │
-                                   └─────────────────┘  └────────────────────┘
+        Web chat UI            Teams / M365 Copilot            Voice (mic)
+             │                          │                           │
+       HTTPS │            Bot Connector │                 WebSocket │
+             ▼                          ▼                           ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Docker container  (one Azure AI Foundry micro-VM per conversation)          │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  Python agent server — ONE Starlette app on :8088                      │  │
+│  │                                                                        │  │
+│  │   POST /responses      POST /activity/messages    WS /invocations_ws   │  │
+│  │   ResponsesHostServer  ActivityAgentServerHost    voice_pipeline.py    │  │
+│  │   (main.py)            (activity_bridge.py)       (also :8089 locally) │  │
+│  │            └────────────────────┴───────────────────────┘              │  │
+│  │                                 ▼                                      │  │
+│  │        SceneIsolationMiddleware ─► ToolStatusMiddleware ─► Agent       │  │
+│  │            (shared tools, shared per-VM Blender scene)                 │  │
+│  └───────────────────────────────┬─────────────────────┬──────────────────┘  │
+│                                  │ TCP 9876            │                     │
+│  ┌──────────┐   ┌────────────────▼─────────────────┐   │                     │
+│  │  Xvfb    │◄──│  Blender 4.4 (background)        │   │                     │
+│  │  :99     │   │  blender_startup.py socket server│   │                     │
+│  └──────────┘   └──────────────────────────────────┘   │                     │
+└────────────────────────────────────────────┬───────────┼─────────────────────┘
+                                       HTTPS │           │ STT/TTS
+                                ┌────────────▼────┐  ┌───▼────────────────┐
+                                │  Azure AI       │  │  Azure Speech /    │
+                                │  Foundry        │  │  AI Services       │
+                                │  (GPT model)    │  │  (speech-in/out)   │
+                                └─────────────────┘  └────────────────────┘
 ```
 
-The voice server is optional (see [Voice](#voice-speech-in--speech-out)): it
-transcribes microphone audio with Azure Speech, routes the transcript through the
-*same* agent turn as text (so voice and text share one server-side Blender scene),
-and streams the spoken reply back as 24 kHz PCM.
+Both extra protocols are optional and fail-safe. `activity_bridge.py` and
+`voice_pipeline.py` are imported inside `try` blocks and gated by
+`ENABLE_ACTIVITY` / `ENABLE_VOICE`, so if either is switched off or fails to
+import, the server degrades to a plain `responses`-only host instead of taking
+the agent down.
+
+The voice server (see [Voice](#voice-speech-in--speech-out)) transcribes
+microphone audio with Azure Speech, routes the transcript through the *same*
+agent turn as text (so voice and text share one server-side Blender scene), and
+streams the spoken reply back as 24 kHz PCM.
+
+The Activity bridge (see [Teams / M365 Copilot](#teams--m365-copilot-activity-protocol))
+composes `ActivityAgentServerHost` with `ResponsesHostServer` into one
+multi-protocol host, then translates the agent's streamed updates into native
+Teams constructs: middleware status messages become *informative updates*, and
+the ` ```models ` / ` ```textures ` gallery blocks become Adaptive Cards.
 
 ## Features
 
