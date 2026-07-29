@@ -128,10 +128,42 @@ _KEEPALIVE_FALLBACK_TEXT = "Working on your scene"
 
 # Teams enforces a hard two-minute lifetime on a streamed message and then
 # rejects everything further with 403 ContentStreamNotAllowed ("Content stream
-# finished due to exceeded streaming time"), which would lose the whole reply.
-# Close the stream before that and keep going with ordinary messages.
-_STREAM_MAX_SECONDS = float(os.environ.get("ACTIVITY_STREAM_MAX_SECONDS", "100"))
+# finished due to exceeded streaming time") — including the final message, so
+# the whole reply is lost. Close the stream before that and keep going with
+# ordinary messages. MUST stay below 120: a larger value disables the guard
+# entirely and hands the turn back to the failure it exists to prevent.
+_STREAM_MAX_SECONDS = min(
+    float(os.environ.get("ACTIVITY_STREAM_MAX_SECONDS", "90")), 110.0
+)
 _STREAM_CONTINUED_TEXT = "Still working on it — I'll send the rest right here."
+
+# ── Fast turns vs. slow turns ───────────────────────────────────────────────
+# The platform in front of the container gives up on the inbound request after
+# roughly 45s and shows an error in the client, even though the agent is still
+# working. Turns that pass this mark therefore stop replying *to the request*:
+# the live response is closed with a "this will take a while" note, the request
+# completes, and the result is delivered later as a proactive message.
+# Set to 0 to disable and always answer in-request.
+_PROACTIVE_AFTER_SECONDS = float(
+    os.environ.get("ACTIVITY_PROACTIVE_AFTER_SECONDS", "35")
+)
+_HANDOVER_TEXT = (
+    "\n\n⏳ This task requires time — I'll keep working on it in the "
+    "background and message you here as soon as it's ready."
+)
+
+# Statuses that mark the start of the slowest step. Once a turn has been
+# detached, reaching one of these flushes whatever is buffered (typically the
+# viewport screenshot the middleware surfaced) as an interim message, so the
+# user sees the scene instead of silence while the render runs.
+_PROGRESS_STATUS_PREFIXES = ("status-render_final", "status-render_preview")
+_PROGRESS_WITH_MEDIA_TEXT = (
+    "\n\nThat's the scene so far — I'm rendering the final image now and will "
+    "send it as soon as it's ready."
+)
+_PROGRESS_PLAIN_TEXT = (
+    "🎬 Rendering the final image now — I'll send it as soon as it's ready."
+)
 
 # Populated by the guarded import below; `activity_available()` reports on it.
 _IMPORT_ERROR: Exception | None = None
@@ -265,6 +297,7 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
     ]
 
     emitter = _StreamingEmitter(context) if streaming else _FallbackEmitter(context)
+    relay = _Relay(emitter)
     gallery = _GalleryFilter()
     dedupe = _MediaDedupeFilter()
     reply_parts: list[str] = []
@@ -276,63 +309,112 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
     # has a fixed name per micro-VM.
     options = {"user": scene_key} if scene_key else None
 
-    # Tool calls can run for minutes; without this the channel sees nothing
-    # between two status updates and gives up on the turn.
-    pump = asyncio.create_task(_keepalive_pump(emitter))
-
-    try:
-        async for update in agent.run(messages, stream=True, options=options):
-            for content in update.contents or []:
-                if content.type != "text" or not content.text:
-                    continue
-                message_id = update.message_id or ""
-                if message_id.startswith(_STATUS_PREFIXES):
-                    await emitter.status(_clean_status(content.text))
-                else:
-                    # Model prose, plus the tool images / download links that
-                    # ToolStatusMiddleware surfaces early (markdown, which
-                    # Teams renders) and the middleware's friendly error text.
-                    # Keep the RAW text for history so the model still knows
-                    # which gallery it offered; the user sees the filtered
-                    # version with the fenced JSON replaced by a card.
-                    reply_parts.append(content.text)
-                    await _emit_filtered(emitter, gallery.feed(content.text), dedupe)
-    except Exception:
-        # ToolStatusMiddleware already emitted user-facing error text before
-        # re-raising, so only add our own when nothing reached the user.
-        logger.error("Activity turn failed", exc_info=True)
-        if not reply_parts:
-            await emitter.text(_ERROR_TEXT)
-    finally:
-        # Stop the pump before finishing so a keep-alive can't land after (or
-        # interleave with) the final message.
-        pump.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await pump
+    async def _consume() -> None:
+        # Tool calls can run for minutes; without this the channel sees nothing
+        # between two status updates and gives up on the turn.
+        pump = asyncio.create_task(_keepalive_pump(relay))
         try:
-            await _emit_filtered(emitter, gallery.flush(), dedupe, final=True)
+            async for update in agent.run(messages, stream=True, options=options):
+                for content in update.contents or []:
+                    if content.type != "text" or not content.text:
+                        continue
+                    message_id = update.message_id or ""
+                    if message_id.startswith(_STATUS_PREFIXES):
+                        await relay.status(_clean_status(content.text))
+                        if message_id.startswith(_PROGRESS_STATUS_PREFIXES):
+                            await relay.progress()
+                    else:
+                        # Model prose, plus the tool images / download links that
+                        # ToolStatusMiddleware surfaces early (markdown, which
+                        # Teams renders) and the middleware's friendly error text.
+                        # Keep the RAW text for history so the model still knows
+                        # which gallery it offered; the user sees the filtered
+                        # version with the fenced JSON replaced by a card.
+                        reply_parts.append(content.text)
+                        await _emit_filtered(relay, gallery.feed(content.text), dedupe)
         except Exception:
-            logger.warning("Could not flush the gallery buffer", exc_info=True)
-        # The streaming queue drains in the background, so a Bot Connector
-        # delivery failure surfaces here rather than on the individual
-        # queue_* calls. Swallow it: an outbound failure must not become a
-        # 500 on the inbound webhook, or the connector retries the whole turn.
-        try:
-            await emitter.finish()
-        except Exception as exc:
-            logger.warning("Could not finish the activity response: %s", exc)
+            # ToolStatusMiddleware already emitted user-facing error text before
+            # re-raising, so only add our own when nothing reached the user.
+            logger.error("Activity turn failed", exc_info=True)
+            if not reply_parts:
+                await relay.text(_ERROR_TEXT)
+        finally:
+            # Stop the pump before finishing so a keep-alive can't land after
+            # (or interleave with) the final message.
+            pump.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pump
+            try:
+                await _emit_filtered(relay, gallery.flush(), dedupe, final=True)
+            except Exception:
+                logger.warning("Could not flush the gallery buffer", exc_info=True)
+            # The streaming queue drains in the background, so a Bot Connector
+            # delivery failure surfaces here rather than on the individual
+            # queue_* calls. Swallow it: an outbound failure must not become a
+            # 500 on the inbound webhook, or the connector retries the whole turn.
+            try:
+                await relay.finish()
+            except Exception as exc:
+                logger.warning("Could not finish the activity response: %s", exc)
 
-    reply = "".join(reply_parts).strip()
-    if reply:
-        _save_history(
-            state,
-            [
-                *history,
-                {"role": "user", "text": user_text},
-                {"role": "assistant", "text": reply},
-            ],
+        reply = "".join(reply_parts).strip()
+        if reply:
+            _save_history(
+                state,
+                [
+                    *history,
+                    {"role": "user", "text": user_text},
+                    {"role": "assistant", "text": reply},
+                ],
+            )
+            if relay.detached:
+                # The SDK persists TurnState right after the handler returns —
+                # which already happened — so this turn's history would be lost
+                # unless we write it ourselves. force=True because the SDK's
+                # change detection has already seen (and saved) this state.
+                try:
+                    await state.save(context, force=True)
+                except Exception:
+                    logger.warning("Could not persist detached turn state", exc_info=True)
+        logger.info(
+            "Activity turn finished: conversation=%s reply_chars=%d detached=%s elapsed=%.0fs",
+            conversation_id, len(reply), relay.detached, relay.elapsed,
         )
-    logger.info("Activity turn finished: conversation=%s reply_chars=%d", conversation_id, len(reply))
+
+    turn = asyncio.create_task(_consume())
+    turn.add_done_callback(_log_turn_result)
+    if _PROACTIVE_AFTER_SECONDS <= 0:
+        await turn
+        return
+
+    # Fast turns (asset searches, small scenes) finish here and keep the live
+    # streaming experience. Slow ones (a high-fidelity render) are handed over
+    # so the inbound request can complete before the platform's ~45s timeout
+    # turns into an error in the client.
+    done, _pending = await asyncio.wait({turn}, timeout=_PROACTIVE_AFTER_SECONDS)
+    if done:
+        return
+
+    logger.info(
+        "Activity turn exceeded %.0fs — detaching for proactive delivery "
+        "(conversation=%s)",
+        _PROACTIVE_AFTER_SECONDS, conversation_id,
+    )
+    try:
+        await relay.detach(context)
+    except Exception:
+        # If the handover fails, leave the turn attached: it still delivers
+        # through the original context for as long as the process lives.
+        logger.error("Could not detach the turn for proactive delivery", exc_info=True)
+
+
+def _log_turn_result(task: asyncio.Task) -> None:
+    if task.cancelled():
+        logger.warning("Activity turn was cancelled before delivery")
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Activity turn failed after delivery started: %s", exc, exc_info=exc)
 
 
 async def _emit_filtered(
@@ -732,12 +814,26 @@ class _Emitter:
     async def keepalive(self) -> None:  # pragma: no cover - overridden
         raise NotImplementedError
 
+    async def progress(self) -> None:
+        """Interim update at a slow step. Only detached turns need one — the
+        live emitters are already showing status as it happens."""
+        return None
+
+    async def tick(self) -> None:
+        """Called on every pump poll, whether or not anything is due."""
+        return None
+
 
 async def _keepalive_pump(emitter: _Emitter) -> None:
     """Nudge the channel while the agent is busy but silent."""
     try:
         while True:
             await asyncio.sleep(_KEEPALIVE_POLL_SECONDS)
+            # Deadlines are checked on every poll, not only when a keep-alive
+            # is due: with a 20s keep-alive interval, a quiet turn would
+            # otherwise notice the stream cap up to 20s late — long enough for
+            # Teams to have killed the stream first.
+            await emitter.tick()
             if emitter.idle >= _KEEPALIVE_SECONDS:
                 await emitter.keepalive()
     except asyncio.CancelledError:
@@ -801,6 +897,10 @@ class _StreamingEmitter(_Emitter):
         # cumulative, so it could not be taken back out.
         self._stream.queue_informative_update(self._keepalive_text())
         self._touch()
+
+    async def tick(self) -> None:
+        # Close the stream on time even if the turn has gone completely quiet.
+        await self._target()
 
     async def finish(self) -> None:
         if self._overflow is not None:
@@ -881,6 +981,297 @@ class _FallbackEmitter(_Emitter):
             self._context,
             Activity(type="message", text=body, attachments=self._attachments or []),
         )
+
+
+class _ProactiveEmitter(_Emitter):
+    """Delivers the rest of a detached turn as a proactive message.
+
+    Once the turn is detached the inbound request is already answered, so there
+    is no stream and no request context to reply on. Output is buffered and
+    sent as ONE message through ``ChannelServiceAdapter.continue_conversation``,
+    which builds a fresh turn context (and a fresh connector client, so tokens
+    are re-acquired) from the conversation reference captured on the way in.
+
+    Statuses and keep-alives are dropped on purpose: the user has just been
+    told the work continues in the background, so the next thing they should
+    see is the result.
+    """
+
+    def __init__(self, context: Any, previous: _Emitter) -> None:
+        super().__init__(context)
+        # Keep the original turn clock so logs and any elapsed text stay honest.
+        self._started = previous._started
+        self._last_status = previous._last_status
+        self._adapter = context.adapter
+        self._app_id = _agent_app_id(context)
+        # Everything needed to rebuild the inbound turn's connector client. The
+        # client itself cannot be reused: `process_activity` closes its aiohttp
+        # session as soon as the handler returns ("Session is closed").
+        self._identity = getattr(context, "identity", None)
+        self._factory = context.turn_state.get(
+            getattr(self._adapter, "CHANNEL_SERVICE_FACTORY_KEY", "")
+        )
+        self._audience = context.turn_state.get(
+            getattr(self._adapter, "OAUTH_SCOPE_KEY", "")
+        )
+        self._reference = context.activity.get_conversation_reference()
+        self._parts: list[str] = []
+        self._attachments: list[Any] = []
+
+    async def status(self, text: str) -> None:
+        self._last_status = text
+
+    async def text(self, chunk: str) -> None:
+        self._parts.append(chunk)
+
+    async def card(self, attachment: Any) -> None:
+        self._attachments.append(attachment)
+
+    async def keepalive(self) -> None:
+        return None
+
+    async def progress(self) -> None:
+        """Send what has been produced so far, ahead of the slow step.
+
+        Everything buffered is handed over now — typically the viewport
+        screenshot `ToolStatusMiddleware` surfaced — and the buffer is cleared
+        so the final message only carries the render and the wrap-up prose.
+        """
+        body = "".join(self._parts).strip()
+        attachments = self._attachments
+        if body or attachments:
+            note = _PROGRESS_WITH_MEDIA_TEXT if _MEDIA_RE.search(body) else ""
+            activity = Activity(
+                type="message",
+                text=f"{body}{note}".strip() or _PROGRESS_PLAIN_TEXT,
+                attachments=attachments or [],
+            )
+        else:
+            activity = Activity(type="message", text=_PROGRESS_PLAIN_TEXT)
+        self._parts = []
+        self._attachments = []
+        await self._send(activity)
+
+    async def finish(self) -> None:
+        body = "".join(self._parts).strip()
+        if not body and not self._attachments:
+            return
+        if not body:
+            body = _GALLERY_ONLY_TEXT
+        activity = Activity(
+            type="message", text=body, attachments=self._attachments or []
+        )
+        await self._send(activity)
+
+    async def _deliver_direct(self, activity: Any) -> bool:
+        """Post the activity with a connector client built like the inbound one.
+
+        This is the primary path because `continue_conversation*` cannot work
+        on this host: `process_proactive()` always builds a `UserTokenClient`
+        for the OAuth flow and — unlike `process_activity()` — never computes
+        the anonymous-auth flag or passes the token scopes, so it dies with
+        ``ManagedIdentityError: You shall specify one of the three parameters:
+        client_id, resource_id, object_id`` before it ever reaches the send.
+
+        Posting an activity needs no user token at all, so the OAuth machinery
+        is skipped and the inbound client's construction is mirrored instead —
+        same identity, audience, scopes and anonymous flag, which is what makes
+        this work both locally (anonymous) and in Foundry (managed identity).
+        """
+        scopes = self._identity.get_token_scope()
+        anonymous = (
+            not self._identity.is_authenticated
+            and self._identity.authentication_type == "Anonymous"
+        )
+        client = await self._factory.create_connector_client(
+            self._context,
+            self._identity,
+            self._reference.service_url,
+            self._audience,
+            scopes,
+            anonymous,
+        )
+        try:
+            activity.apply_conversation_reference(self._reference)
+            activity.id = None
+            conversation_id = self._reference.conversation.id
+            if activity.reply_to_id:
+                await client.conversations.reply_to_activity(
+                    conversation_id, activity.reply_to_id, activity
+                )
+            else:
+                await client.conversations.send_to_conversation(
+                    conversation_id, activity
+                )
+        finally:
+            with contextlib.suppress(Exception):
+                await client.close()
+        return True
+
+    def _continuation(self) -> Any:
+        activity = self._reference.get_continuation_activity()
+        # `TurnContext.send_activities` copies the *context* activity's id onto
+        # every outgoing message as `reply_to_id`, and the adapter then routes
+        # anything with a reply_to_id through `reply_to_activity`. Since
+        # `get_continuation_activity()` mints a fresh uuid, that would make the
+        # channel reply to a message that never existed. Clearing the id routes
+        # the message through `send_to_conversation` instead — which is what a
+        # proactive message actually is.
+        activity.id = None
+        return activity
+
+    async def _deliver_via(self, start: Any, activity: Any) -> bool:
+        delivered = False
+
+        async def _callback(turn_context: Any) -> None:
+            nonlocal delivered
+            await turn_context.send_activity(activity)
+            delivered = True
+
+        await start(_callback)
+        return delivered
+
+    async def _deliver_with_claims(self, activity: Any) -> bool:
+        return await self._deliver_via(
+            lambda callback: self._adapter.continue_conversation_with_claims(
+                claims_identity=self._identity,
+                continuation_activity=self._continuation(),
+                callback=callback,
+                audience=self._audience,
+            ),
+            activity,
+        )
+
+    async def _deliver_with_app_id(self, activity: Any) -> bool:
+        return await self._deliver_via(
+            lambda callback: self._adapter.continue_conversation(
+                agent_app_id=self._app_id,
+                continuation_activity=self._continuation(),
+                callback=callback,
+            ),
+            activity,
+        )
+
+    def _delivery_attempts(self) -> list[tuple[str, Any]]:
+        attempts: list[tuple[str, Any]] = []
+        if self._factory is not None and self._identity is not None and self._audience:
+            attempts.append(("a fresh connector client", self._deliver_direct))
+        if self._identity is not None:
+            attempts.append(("the inbound claims identity", self._deliver_with_claims))
+        if self._app_id:
+            attempts.append(("the agent app id", self._deliver_with_app_id))
+        return attempts
+
+    async def _send(self, activity: Any) -> None:
+        logger.info(
+            "Delivering proactive message: conversation=%s service_url=%s "
+            "audience=%s app_id=%s chars=%d attachments=%d",
+            getattr(self._reference.conversation, "id", None),
+            self._reference.service_url, self._audience, self._app_id,
+            len(activity.text or ""), len(activity.attachments or []),
+        )
+
+        for label, attempt in self._delivery_attempts():
+            try:
+                delivered = await attempt(activity)
+            except Exception as exc:
+                logger.warning("Proactive delivery via %s failed: %s", label, exc)
+                continue
+
+            if delivered:
+                logger.info(
+                    "Proactive message delivered via %s after %.0fs",
+                    label, self.elapsed,
+                )
+                return
+
+            # `ChannelAdapter.run_pipeline` hands callback errors to
+            # `on_turn_error` and returns normally, so a clean return does NOT
+            # mean the message went out. Without this check a failed delivery
+            # looks like a success and the user simply never hears back.
+            logger.warning(
+                "Proactive delivery via %s returned without sending anything "
+                "(the adapter's on_turn_error swallowed the failure)", label,
+            )
+
+        # Long shot: the request's own connector client is closed by
+        # `process_activity` as soon as the handler returns, so this usually
+        # fails with "Session is closed" — but it costs nothing.
+        logger.error("All proactive delivery attempts failed — trying the request context")
+        await _safe_send(self._context, activity)
+
+
+class _Relay:
+    """Indirection so a running turn can change where its output goes.
+
+    The consumer loop and the keep-alive pump both talk to the relay, which
+    forwards to the emitter that currently owns delivery. Handing a slow turn
+    over to proactive delivery is then a single swap, with no coordination
+    needed inside the loop.
+    """
+
+    def __init__(self, emitter: _Emitter) -> None:
+        self._inner = emitter
+        self._detached = False
+
+    @property
+    def detached(self) -> bool:
+        return self._detached
+
+    @property
+    def elapsed(self) -> float:
+        return self._inner.elapsed
+
+    @property
+    def idle(self) -> float:
+        return self._inner.idle
+
+    async def status(self, text: str) -> None:
+        await self._inner.status(text)
+
+    async def text(self, chunk: str) -> None:
+        await self._inner.text(chunk)
+
+    async def card(self, attachment: Any) -> None:
+        await self._inner.card(attachment)
+
+    async def keepalive(self) -> None:
+        await self._inner.keepalive()
+
+    async def progress(self) -> None:
+        await self._inner.progress()
+
+    async def tick(self) -> None:
+        await self._inner.tick()
+
+    async def finish(self) -> None:
+        await self._inner.finish()
+
+    async def detach(self, context: Any) -> None:
+        """Close out the live response and continue in the background."""
+        if self._detached:
+            return
+        previous = self._inner
+        proactive = _ProactiveEmitter(context, previous)
+        # Say so on the live response *before* swapping, so the notice lands on
+        # the stream the user is currently watching.
+        await previous.text(_HANDOVER_TEXT)
+        await previous.finish()
+        self._inner = proactive
+        self._detached = True
+
+
+def _agent_app_id(context: Any) -> str:
+    """The bot's Entra app id, needed to mint outbound (proactive) credentials.
+
+    Teams addresses the agent as ``28:<appId>`` in ``recipient.id``; the env
+    var is an escape hatch for channels that don't.
+    """
+    configured = os.environ.get("ACTIVITY_AGENT_APP_ID", "").strip()
+    if configured:
+        return configured
+    recipient_id = getattr(getattr(context.activity, "recipient", None), "id", "") or ""
+    return recipient_id.split(":", 1)[-1] if recipient_id else ""
 
 
 async def _safe_send(context: Any, message: Any) -> None:

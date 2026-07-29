@@ -79,7 +79,8 @@ the ` ```models ` / ` ```textures ` gallery blocks become Adaptive Cards.
 |------|---------|
 | `main.py` | Agent server with 13 tool functions, Azure AI Foundry client |
 | `voice_pipeline.py` | Optional voice server: Azure Speech STT/TTS over the `invocations_ws` WebSocket (port 8089), routing speech through the same agent turn as text |
-| `activity_bridge.py` | Optional Activity protocol bridge for Teams / M365 Copilot: composes the multi-protocol host and maps middleware status updates onto informative updates |
+| `activity_bridge.py` | Optional Activity protocol bridge for Teams / M365 Copilot: composes the multi-protocol host, maps middleware status updates onto informative updates, and delivers slow turns as proactive messages |
+| `samples/proactive_hello_world.py` | Standalone, dependency-light sample of the [proactive notification pattern](#proactive-notifications-surviving-slow-turns) — copy it into your own agent |
 | `blender_startup.py` | Blender addon (runs inside Blender) - TCP socket server on port 9876 |
 | `blender_connection.py` | TCP client module used by the agent to talk to Blender |
 | `scene_manager.py` | Single-scene-per-VM Blender persistence on `$HOME` |
@@ -634,9 +635,123 @@ Two independent limits bite on turns that take a while, and both are handled in 
 - Streaming channels get an informative update. Teams stops *rendering* those once real text has been streamed, but they still count as stream traffic, and by then the partial answer plus the typing indicator already show progress. Keep-alives are deliberately never queued as text chunks: streamed content is cumulative, so the noise could not be taken back out of the final message.
 - Non-streaming channels (M365 Copilot) get a short message activity — the same mechanism that already carries the per-tool statuses there.
 
-**The two-minute stream cap.** Teams kills a streamed message after a hard two minutes and rejects everything further with `403 ContentStreamNotAllowed` (*"Content stream finished due to exceeded streaming time"*), which would lose the entire reply. `_StreamingEmitter` closes the stream itself at `ACTIVITY_STREAM_MAX_SECONDS` (default 100 s) and hands over to the plain-message emitter, so a long render finishes as ordinary messages instead of a dead stream. Everything already streamed stays on screen.
+**The two-minute stream cap.** Teams kills a streamed message after a hard two minutes and rejects everything further with `403 ContentStreamNotAllowed` (*"Content stream finished due to exceeded streaming time"*) — **including the final message**, so the whole reply is lost. `_StreamingEmitter` closes the stream itself at `ACTIVITY_STREAM_MAX_SECONDS` (default 90, clamped to 110 because anything at or above 120 disables the guard) and hands over to the plain-message emitter. The deadline is re-checked on every pump poll, not only when a keep-alive is due — otherwise a silent render would notice it up to a keep-alive interval late, which is exactly long enough to miss it.
 
-Note that neither knob can extend the *inbound* timeout of the platform in front of the container: if the gateway gives up, it surfaces an error in the client while the container keeps working and delivers the reply out-of-band a moment later. Keeping traffic flowing is what avoids that, which is exactly what the pump does.
+## Proactive notifications (surviving slow turns)
+
+> **Just want the recipe?** [`samples/proactive_hello_world.py`](samples/proactive_hello_world.py) is a self-contained ~150-line agent that demonstrates this whole pattern with no Blender, no `agent_framework` and no knowledge of this repository. Run it against the Agents Playground and say *"slow"*.
+
+### The 45-second problem
+
+Keeping traffic flowing is not enough on its own: the platform in front of the container abandons the **inbound request** after roughly 45 s and shows an error in the client, even though the agent is still working and will deliver its answer moments later. A high-fidelity render alone takes 30–50 s, and the whole turn (model → code → screenshot → render → wrap-up) routinely runs past two minutes.
+
+So a slow turn must stop trying to answer *the request* and instead answer *the conversation*, later.
+
+### The shape of a slow turn
+
+The bridge runs the turn as a task and waits on it for `ACTIVITY_PROACTIVE_AFTER_SECONDS` (default 35):
+
+- **Under the mark** — asset searches, small scenes — nothing changes: the turn finishes in-request with live streaming.
+- **Over it**, the turn is *detached*. `_Relay.detach()` writes *"⏳ This task requires time — I'll keep working on it in the background and message you here as soon as it's ready"* onto the live response, closes it, and swaps the emitter for a `_ProactiveEmitter`. The handler returns, so the request completes well inside the platform's window. The task keeps running.
+
+```mermaid
+sequenceDiagram
+    participant U as User (Teams)
+    participant H as Activity handler
+    participant T as Turn task
+    U->>H: "create a cabin and render it"
+    H->>T: start (detached after 35s)
+    H-->>U: 1. ⏳ This task requires time… (in-request, stream closed)
+    Note over H: HTTP request completes — no client timeout
+    T-->>U: 2. 🖼️ viewport screenshot (proactive)
+    Note over T: render_final runs (~40s)
+    T-->>U: 3. ✅ final render + summary (proactive)
+```
+
+`_Relay` exists so the swap is a single operation: the consumer loop and the keep-alive pump talk to the relay, never to an emitter directly, so nothing inside the loop needs to know delivery moved.
+
+### Two proactive messages for a render, not one
+
+A detached turn would otherwise be silent from the handover until the render lands — a minute of nothing after a promise. So a render produces **two** proactive messages:
+
+| # | When | What it carries | Why |
+|---|---|---|---|
+| 1 | The `status-render_final` / `status-render_preview` update arrives | The viewport screenshot the middleware surfaced, plus *"That's the scene so far — I'm rendering the final image now and will send it as soon as it's ready"* | The user gets something to look at, and confirmation that the promised work actually started |
+| 2 | The turn finishes | The final render and the model's wrap-up prose | The result |
+
+`_ProactiveEmitter.progress()` implements the first one: it flushes everything buffered so far and then **clears the buffer**, so the final message carries only the render — the screenshot is never sent twice. The system prompt asks the model to take one viewport screenshot immediately before the first `render_final()` so there is always something to show (the one documented exception to its "no intermediate screenshots" rule). If there is no screenshot, message 1 degrades to a plain *"🎬 Rendering the final image now…"*.
+
+`progress()` is a no-op on the live emitters, which are already showing status as it happens — fast turns are completely unaffected.
+
+### How a proactive message is actually sent
+
+Everything needed to message a conversation later is captured **while the turn is still live**, because the identity, the client factory and the conversation reference are only available then:
+
+```python
+adapter   = context.adapter
+factory   = context.turn_state[adapter.CHANNEL_SERVICE_FACTORY_KEY]
+audience  = context.turn_state[adapter.OAUTH_SCOPE_KEY]
+identity  = context.identity
+reference = context.activity.get_conversation_reference()
+```
+
+and the send rebuilds the **inbound turn's** connector client from exactly those pieces:
+
+```python
+anonymous = (not identity.is_authenticated
+             and identity.authentication_type == "Anonymous")
+client = await factory.create_connector_client(
+    context, identity, reference.service_url, audience,
+    identity.get_token_scope(), anonymous)
+
+activity = Activity(type="message", text=…)
+activity.apply_conversation_reference(reference)
+activity.id = None
+await client.conversations.reply_to_activity(
+    reference.conversation.id, activity.reply_to_id, activity)
+await client.close()
+```
+
+That is what makes it work both locally (anonymous, via the Playground connector) and in Foundry (managed identity). Two things it deliberately does **not** do:
+
+- **It does not reuse the request's connector client.** `process_activity` closes its aiohttp session the moment the handler returns — a later send fails with `RuntimeError: Session is closed`. Building a fresh client is a bonus: credentials are acquired at send time rather than reused past their lifetime.
+- **It does not call `adapter.continue_conversation()`**, which is the documented API and the first thing everyone tries. It routes through `process_proactive()`, which always builds a `UserTokenClient` for the OAuth flow and — unlike `process_activity()` — never computes the anonymous-auth flag nor passes the token scopes, so it dies before it ever reaches the send:
+
+  ```
+  msal.managed_identity.ManagedIdentityError:
+    You shall specify one of the three parameters: client_id, resource_id, object_id
+    at process_proactive → create_user_token_client → get_access_token
+  ```
+
+  Posting an activity needs no user token at all.
+
+### Failure modes that are silent by default
+
+`continue_conversation_with_claims` and `continue_conversation` remain as fallbacks, and two SDK behaviours make *those* fail without a trace:
+
+- `ConversationReference.get_continuation_activity()` mints a **random uuid** as the activity id, and `TurnContext.send_activities` copies the context activity's id onto every outgoing message as `reply_to_id` — which the adapter then routes through `reply_to_activity`. The channel is asked to reply to a message that never existed. `_continuation()` clears the id.
+- `ChannelAdapter.run_pipeline` hands callback errors to `on_turn_error` and **returns normally**, so "no exception" does not mean "delivered". Each attempt sets a flag from inside the callback and is only treated as a success if the send actually ran.
+
+Every attempt is logged with the transport that was used, so a failure names itself:
+
+```
+Delivering proactive message: conversation=… service_url=… audience=… app_id=… chars=…
+Proactive message delivered via a fresh connector client after 149s
+```
+
+The app id (only needed by the fallbacks) comes from `activity.recipient.id` — Teams addresses the agent as `28:<appId>`; `ACTIVITY_AGENT_APP_ID` overrides it.
+
+### Two things to get right in your own agent
+
+- **The process must outlive the request.** This pattern only works because the container keeps running after the HTTP response; Foundry session VMs stay up for ~15 minutes of idle time, which comfortably covers a render. A host that freezes on response (some serverless models) will never deliver.
+- **Persist your own state.** After a detached turn the bridge saves `TurnState` itself with `force=True`: the SDK persists state right after the handler returns, which by then has already happened, so the turn's conversation history would otherwise be lost.
+
+## Teams / M365 Copilot — remaining behaviours
+
+
+Statuses and keep-alives are suppressed once detached — the user has just been told the work continues in the background, so the next thing they see is the result.
+
+> This relies on the container outliving the request. Foundry session VMs stay up for ~15 minutes of idle time, which comfortably covers a render; a turn that outlives the VM would not be delivered.
 
 ### `/clear` — starting a genuinely new scene
 

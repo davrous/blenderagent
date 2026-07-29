@@ -50,9 +50,15 @@ environment_variables:
   - name: ACTIVITY_KEEPALIVE_SECONDS
     value: "20"
   # Teams kills a streamed message after a hard 2 minutes; close it before that
-  # and continue with ordinary messages so a long render is never lost.
+  # and continue with ordinary messages so a long render is never lost. MUST
+  # stay below 120 (the code clamps it to 110 anyway).
   - name: ACTIVITY_STREAM_MAX_SECONDS
-    value: "100"
+    value: "90"
+  # Past this mark the turn stops answering the inbound request (which the
+  # platform abandons at ~45s) and finishes as a proactive message instead.
+  # Set to "0" to always answer in-request.
+  - name: ACTIVITY_PROACTIVE_AFTER_SECONDS
+    value: "35"
   # ── Voice (speech-in / speech-out) ──
   # Keyless Speech auth: grant this agent's Entra identity the
   # "Cognitive Services User" (or "Cognitive Services Speech User") role on the

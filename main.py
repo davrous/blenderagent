@@ -2353,6 +2353,7 @@ async def main():
 - Position objects thoughtfully — avoid overlapping, ensure proper scale (1 unit = 1 meter).
 - Rotation values are in degrees.
 - **Rendering workflow**:
+  0. A render takes a while, so ALWAYS call get_viewport_screenshot() ONCE immediately before the first render_final() call. It gives the user something to look at while the render runs, and it is the one exception to the "no intermediate screenshots" rule above.
   1. When the user asks for a high-fidelity render WITHOUT specifying a resolution (or at 640x480 or smaller): call render_final() ONCE at **640x480 with 32 samples**. Do NOT call render_preview() — a single render_final() call is sufficient. Include the render image from render_final() in your response.
   2. When the user asks for a high-fidelity render at a resolution HIGHER than 640x480 (e.g. 1920x1080): first call render_final() at **640x480 with 32 samples** as a quick preview, return that image to the user immediately, then ASK the user to confirm whether they want to generate the higher-resolution version. If confirmed, call render_final() again at the **requested resolution with 256 samples** and return that image.
 - NEVER set `collection.name` — it is read-only in this Blender environment. To organize objects, create new collections with `bpy.data.collections.new("Name")` and link them to the scene with `bpy.context.scene.collection.children.link(new_collection)` instead of renaming existing ones.
