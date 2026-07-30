@@ -270,9 +270,15 @@ def _build_storage() -> Any:
             self._flush()
 
         def _flush(self) -> None:
-            with self._lock:
-                snapshot = dict(self._memory)
-            _write_state_file(self._path, snapshot)
+            # Deliberately does NOT touch `MemoryStorage._lock`. That attribute
+            # is an `asyncio.Lock` in SDK 1.2.0 but a `threading.Lock` in older
+            # releases, so `with`/`async with` are not interchangeable and
+            # reaching for it couples us to a private detail that has already
+            # changed once. No lock is needed anyway: this runs synchronously
+            # (no await between the copy and the write), and asyncio cannot
+            # preempt a coroutine without an await point, so no other writer can
+            # interleave.
+            _write_state_file(self._path, dict(self._memory))
 
     path = os.path.join(os.path.expanduser("~"), ".blender_activity_state.json")
     try:
