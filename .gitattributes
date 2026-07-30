@@ -19,6 +19,8 @@ Dockerfile text eol=lf
 .gitattributes text eol=lf
 .editorconfig text eol=lf
 entrypoint.sh text eol=lf
+# Extensionless shell script — a CRLF shebang would break it on macOS/Linux.
+blenderagent text eol=lf
 
 # Binary files — do not touch
 *.jpg binary

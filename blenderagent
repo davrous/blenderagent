@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+#
+# blenderagent — build and run the Blender scene agent container.
+#
+# macOS / Linux counterpart of blenderagent.ps1 (and works in Git Bash on
+# Windows). Both accept the same verbs, so the muscle memory is identical on
+# either OS:
+#
+#     ./blenderagent rebuild     # docker build
+#     ./blenderagent start       # docker run
+#     ./blenderagent up          # rebuild, then start
+#     ./blenderagent playground  # M365 Agents Playground, pointed at the container
+#
+# Anything after the verb is passed straight through to docker, e.g.
+#
+#     ./blenderagent rebuild --no-cache
+#     ./blenderagent start -e LOG_LEVEL=DEBUG
+#
+set -euo pipefail
+
+IMAGE="blender-scene-agent"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# Where the Playground POSTs activities, and where the agent posts replies back.
+# `host.docker.internal` (not localhost) because the agent runs in the container:
+# localhost there is the container itself, so replies would never reach us.
+PLAYGROUND_ENDPOINT="http://localhost:8088/api/messages"
+PLAYGROUND_SERVICE_URL="http://host.docker.internal:56150/_connector"
+
+DIM="$(printf '\033[2m')"
+YELLOW="$(printf '\033[33m')"
+RESET="$(printf '\033[0m')"
+
+usage() {
+    cat <<EOF
+blenderagent — build and run the Blender scene agent container
+
+  ./blenderagent rebuild    [docker args]   Build the image ($IMAGE)
+  ./blenderagent start      [docker args]   Run it on http://localhost:8088
+  ./blenderagent up         [docker args]   Rebuild, then start
+  ./blenderagent playground [pg args]       Open the M365 Agents Playground
+  ./blenderagent help                       This message
+
+Examples
+  ./blenderagent rebuild --no-cache
+  ./blenderagent start -e LOG_LEVEL=DEBUG
+
+The container must already be running (in another terminal) before 'playground'.
+EOF
+}
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+assert_docker() {
+    command -v docker >/dev/null 2>&1 ||
+        die "docker was not found on PATH. Install Docker Desktop and make sure it is running."
+}
+
+run_docker() {
+    printf '%s> docker %s%s\n' "$DIM" "$*" "$RESET"
+    docker "$@"
+}
+
+rebuild() {
+    assert_docker
+    # --platform linux/amd64 is required: the image is built for the Foundry
+    # hosted-agent runtime, so an Apple Silicon host must cross-build rather
+    # than produce an arm64 image that will not run once deployed.
+    run_docker build --platform linux/amd64 -t "$IMAGE" "$@" .
+}
+
+start() {
+    assert_docker
+
+    [ -f "$ROOT/.env" ] ||
+        die ".env not found in $ROOT. Copy .env.example to .env and fill it in first."
+
+    # Mounted read-only so the container's DefaultAzureCredential can reuse the
+    # `az login` tokens from the host instead of needing its own sign-in.
+    if [ ! -d "$HOME/.azure" ]; then
+        printf '%swarning: %s/.azure does not exist — run "az login" first or the agent will fail to authenticate.%s\n' \
+            "$YELLOW" "$HOME" "$RESET" >&2
+    fi
+
+    run_docker run -it --rm \
+        -p 8088:8088 \
+        -p 8089:8089 \
+        --env-file .env \
+        -v "$HOME/.azure:/root/.azure:ro" \
+        "$@" "$IMAGE"
+}
+
+playground() {
+    command -v agentsplayground >/dev/null 2>&1 ||
+        die "agentsplayground was not found on PATH. Install it with 'winget install agentsplayground' (Windows) or see the M365 Agents Playground docs."
+
+    # The Playground only drives an already-running agent; it does not start one.
+    if ! curl -fsS -o /dev/null --max-time 2 "http://localhost:8088/api/messages" -X POST -d '{}' -H 'Content-Type: application/json' 2>/dev/null; then
+        printf '%swarning: nothing answered on http://localhost:8088 — run "./blenderagent start" in another terminal first.%s\n' \
+            "$YELLOW" "$RESET" >&2
+    fi
+
+    printf '%s> agentsplayground -e %s --service-url %s %s%s\n' \
+        "$DIM" "$PLAYGROUND_ENDPOINT" "$PLAYGROUND_SERVICE_URL" "$*" "$RESET"
+    agentsplayground -e "$PLAYGROUND_ENDPOINT" --service-url "$PLAYGROUND_SERVICE_URL" "$@"
+}
+
+cd "$ROOT"
+
+command="${1:-help}"
+[ $# -gt 0 ] && shift || true
+
+case "$command" in
+rebuild) rebuild "$@" ;;
+start) start "$@" ;;
+up)
+    rebuild "$@"
+    start "$@"
+    ;;
+playground) playground "$@" ;;
+help | -h | --help) usage ;;
+*)
+    printf 'error: unknown command %s\n\n' "$command" >&2
+    usage >&2
+    exit 1
+    ;;
+esac

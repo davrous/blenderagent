@@ -87,6 +87,7 @@ the ` ```models ` / ` ```textures ` gallery blocks become Adaptive Cards.
 | `entrypoint.sh` | Docker entrypoint: starts Xvfb, Blender, then Agent server |
 | `agent.yaml` | Agent metadata and environment variable declarations |
 | `Dockerfile` | Ubuntu 22.04 + Blender 4.2 + Python deps |
+| `blenderagent` / `blenderagent.ps1` | Developer shortcut for `rebuild` / `start` / `up` / `playground` — bash for macOS/Linux, PowerShell for Windows (see [Build & Run](#the-blenderagent-script-recommended)) |
 
 ## Prerequisites
 
@@ -250,6 +251,28 @@ variables are optional and documented inline in [`.env.example`](.env.example).
 > ```
 
 ## Build & Run
+
+### The `blenderagent` script (recommended)
+
+A small wrapper at the repo root wraps the `docker` and Playground commands below, so you don't have to remember the flags. Same verbs on both platforms:
+
+| | macOS / Linux / Git Bash | Windows PowerShell |
+| --- | --- | --- |
+| Build the image | `./blenderagent rebuild` | `.\blenderagent.ps1 rebuild` |
+| Run the container | `./blenderagent start` | `.\blenderagent.ps1 start` |
+| Both, in order | `./blenderagent up` | `.\blenderagent.ps1 up` |
+| Open the Agents Playground | `./blenderagent playground` | `.\blenderagent.ps1 playground` |
+
+It runs from its own directory (so it works from anywhere), checks that `docker`, `.env` and `~/.azure` are present before doing anything, prints each command before running it, and passes anything after the verb straight through:
+
+```bash
+./blenderagent rebuild --no-cache
+./blenderagent start -e LOG_LEVEL=DEBUG
+```
+
+`start` and `playground` are two separate long-running processes — run them in two terminals.
+
+Everything below documents the same commands **manually**, which is what you want when you need to vary the flags.
 
 ### Build the Docker image
 
@@ -825,29 +848,40 @@ The Azure Bot and Teams channel already exist and are reused. After deploying th
 
 The Activity endpoint accepts **unauthenticated** inbound requests when no Bot credentials are configured, so the whole Teams experience can be exercised against your local Docker container — no Azure Bot, no Teams app package, no deploy.
 
-Run the container exactly as documented in [Build & Run](#run-the-container) (port `8088` is all that's needed for text), then:
+Install the Playground once:
 
 ```powershell
 winget install agentsplayground
 ```
 
-The Activity protocol is **bidirectional**, and that matters when the agent runs in Docker:
+Then, in **two terminals**:
 
-- **Inbound** — the Playground POSTs the activity to the agent: `http://localhost:8088/api/messages`. Works out of the box, since `-p 8088:8088` publishes the port.
-- **Outbound** — the agent posts its replies back to the `serviceUrl` carried in the activity. The Playground defaults that to `http://localhost:56150/_connector`, and **inside the container `localhost` is the container itself**, so the reply fails with:
+```bash
+./blenderagent start        # terminal 1 — the container
+./blenderagent playground   # terminal 2 — the Playground, already pointed at it
+```
+
+(On Windows PowerShell: `.\blenderagent.ps1 start` and `.\blenderagent.ps1 playground`.)
+
+The rest of this section explains what the `playground` verb does for you, which is what you need if you want to run it by hand.
+
+Run the container exactly as documented in [Build & Run](#run-the-container) (port `8088` is all that's needed for text), then run the Playground manually:
+
+```powershell
+agentsplayground -e http://localhost:8088/api/messages --service-url http://host.docker.internal:56150/_connector
+```
+
+Both flags matter, because the Activity protocol is **bidirectional** and the agent runs in Docker:
+
+- **Inbound** (`-e`) — the Playground POSTs the activity to the agent: `http://localhost:8088/api/messages`. Works out of the box, since `-p 8088:8088` publishes the port.
+- **Outbound** (`--service-url`) — the agent posts its replies back to the `serviceUrl` carried in the activity. The Playground defaults that to `http://localhost:56150/_connector`, and **inside the container `localhost` is the container itself**, so without the flag the reply fails with:
 
   ```
   ClientConnectorError: Cannot connect to host localhost:56150
   ConnectionRefusedError: [Errno 111] Connect call failed ('127.0.0.1', 56150)
   ```
 
-  The agent turn actually ran fine (you'll see the tools execute in the logs) — only the reply was undeliverable, so the Playground shows nothing.
-
-Use `--service-url` to make the Playground advertise the host address instead:
-
-```powershell
-agentsplayground -e http://localhost:8088/api/messages --service-url http://host.docker.internal:56150/_connector
-```
+  The agent turn actually ran fine (you'll see the tools execute in the logs) — only the reply was undeliverable, so the Playground shows nothing. Pointing `--service-url` at `host.docker.internal` makes the Playground advertise the host address instead.
 
 `host.docker.internal` resolves to the host gateway from inside Docker Desktop containers with no extra flags. Verify it if replies still don't arrive:
 
