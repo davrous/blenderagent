@@ -510,7 +510,14 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
             # re-raising, so only add our own when nothing reached the user.
             logger.error("Activity turn failed", exc_info=True)
             if not reply_parts:
-                await relay.text(_ERROR_TEXT)
+                # Guarded: the original failure may BE the delivery channel
+                # dying, in which case this send raises too — turning a handled
+                # error into an unhandled one that escapes the turn and skips
+                # the cleanup in `finally` below.
+                try:
+                    await relay.text(_ERROR_TEXT)
+                except Exception as exc:
+                    logger.warning("Could not deliver the failure notice: %s", exc)
         finally:
             # Stop the pump before finishing so a keep-alive can't land after
             # (or interleave with) the final message.
@@ -1430,13 +1437,27 @@ class _Relay:
         if self._detached:
             return
         previous = self._inner
-        proactive = _ProactiveEmitter(context, previous)
-        # Say so on the live response *before* swapping, so the notice lands on
-        # the stream the user is currently watching.
-        await previous.text(_HANDOVER_TEXT)
-        await previous.finish()
-        self._inner = proactive
+        # Swap FIRST, before any await. `detach` runs on the request task while
+        # the turn task is still streaming, and closing the live response below
+        # takes a couple of network round trips. If the swap happened after
+        # those awaits, anything the turn emitted during that window would be
+        # routed to the emitter whose stream we are in the middle of closing,
+        # raising `RuntimeError: The stream has already ended` — killing the
+        # turn at the exact moment the handover exists to keep it alive.
+        #
+        # The proactive emitter only buffers, so output produced during the
+        # handover is safely held and goes out with the final message.
+        self._inner = _ProactiveEmitter(context, previous)
         self._detached = True
+        # Say so on the live response — still the one the user is watching, even
+        # though new output no longer goes there.
+        try:
+            await previous.text(_HANDOVER_TEXT)
+            await previous.finish()
+        except Exception as exc:
+            # The live response is being abandoned anyway; failing to close it
+            # cleanly must not abort the turn now running in the background.
+            logger.warning("Could not close the live response on handover: %s", exc)
 
 
 def _agent_app_id(context: Any) -> str:

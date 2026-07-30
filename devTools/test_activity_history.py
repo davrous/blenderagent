@@ -177,11 +177,94 @@ async def test_card_submit_transcript():
     _check("transcript kept the intent", stored, 'Add the 3D model "Oak Tree" to the scene.')
 
 
+async def test_detach_race():
+    """Output produced while the live response is closing must not kill the turn.
+
+    Regression for the production failure where a status update landed during
+    `_Relay.detach`'s two network round trips, hit the stream that was being
+    closed, and raised `RuntimeError: The stream has already ended` — aborting
+    the very turn the handover exists to keep alive.
+    """
+
+    class _Dying:
+        """A live stream that dies partway through `finish()`."""
+
+        def __init__(self) -> None:
+            self.ended = False
+            self.sent: list = []
+            self._started = 0.0
+            self._last_status = ""
+
+        def _guard(self) -> None:
+            if self.ended:
+                raise RuntimeError("The stream has already ended.")
+
+        async def status(self, text):
+            self._guard()
+            self.sent.append(("status", text))
+
+        async def text(self, chunk):
+            self._guard()
+            self.sent.append(("text", chunk))
+
+        async def finish(self):
+            # Mirrors the SDK: `end_stream()` marks the stream closed partway
+            # through and then keeps awaiting network I/O. The gap between the
+            # two is the window the turn task used to slip into — modelling the
+            # close as happening when finish() *returns* makes this test vacuous,
+            # because the pre-fix swap happened immediately after with no await
+            # in between.
+            await asyncio.sleep(0.02)
+            self.ended = True
+            await asyncio.sleep(0.05)
+
+    class _Proactive:
+        def __init__(self, _context, previous) -> None:
+            self.buffered: list = []
+            self._started = previous._started
+
+        async def status(self, text):
+            self.buffered.append(("status", text))
+
+        async def text(self, chunk):
+            self.buffered.append(("text", chunk))
+
+    original = ab._ProactiveEmitter
+    ab._ProactiveEmitter = _Proactive
+    try:
+        dying = _Dying()
+        relay = ab._Relay(dying)
+        detach = asyncio.create_task(relay.detach(object()))
+        await asyncio.sleep(0.04)  # after the stream closed, before finish() returns
+
+        error = None
+        try:
+            await relay.status("Rendering the final image…")
+        except Exception as exc:  # noqa: BLE001 - that is what we are asserting on
+            error = exc
+        await detach
+
+        _check("status during handover did not raise", error, None)
+        _check(
+            "it was buffered for proactive delivery",
+            relay._inner.buffered,
+            [("status", "Rendering the final image…")],
+        )
+        _check(
+            "handover notice still went to the live response",
+            dying.sent,
+            [("text", ab._HANDOVER_TEXT)],
+        )
+    finally:
+        ab._ProactiveEmitter = original
+
+
 async def main():
     _patch_framework()
     await test_serialised_turns()
     await test_clear_discards_inflight()
     await test_card_submit_transcript()
+    await test_detach_race()
     print("\nFAILURES PRESENT" if _check.failed else "\nall checks passed")
     return 1 if _check.failed else 0
 
