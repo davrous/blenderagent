@@ -71,7 +71,18 @@ _STATUS_PREFIXES = ("status-", "scene-status-")
 # their CLASS names (`ConversationState`, `UserState`; only `temp` is
 # lowercase), so "conversation.<key>" raises ValueError: Scope not found.
 _MAX_HISTORY_MESSAGES = 20
+# Second budget on top of the message count. Scene-building replies carry long
+# prose plus markdown image and download links, so 20 raw messages is unbounded
+# in tokens; ~4 chars/token puts this around 6k tokens of replayed transcript.
+_MAX_HISTORY_CHARS = 24_000
 _HISTORY_KEY = "blender_history"
+
+# Shown when a message arrives while the previous one is still being worked on.
+_QUEUED_STATUS_TEXT = "Finishing the previous request first…"
+
+# One VM serves one conversation in practice; the cap only stops a long-lived
+# container in a busy group chat from growing without bound.
+_MAX_TRACKED_CONVERSATIONS = 32
 
 # Bumped by /clear. Folded into the scene key so the next turn presents a NEW
 # id to SceneIsolationMiddleware, which is exactly the signal the web chat's
@@ -173,6 +184,7 @@ try:
     from agent_framework_foundry_hosting import ResponsesHostServer
     from azure.ai.agentserver.activity import ActivityAgentServerHost
     from microsoft_agents.activity import Activity, Attachment, Channels, DeliveryModes
+    from microsoft_agents.hosting.core.storage import MemoryStorage
 except Exception as exc:  # pragma: no cover - exercised only on broken installs
     _IMPORT_ERROR = exc
 
@@ -209,10 +221,98 @@ def build_multi_protocol_host(agent: Any) -> Any:
     class BlenderAgentHost(ActivityAgentServerHost, ResponsesHostServer):  # type: ignore[misc]
         """Serves /responses (web chat, voice loopback) and /activity/messages (Teams)."""
 
-    host = BlenderAgentHost(agent=agent)
+    # The host defaults to in-memory storage, which would make the transcript
+    # the ONLY part of a conversation that does not survive an idle/resume
+    # cycle — the scene itself is persisted to the same volume by
+    # `scene_manager`. A user coming back after an idle would find their scene
+    # intact but the agent with no memory of how it got there.
+    host = BlenderAgentHost(agent=agent, storage=_build_storage())
     paths = sorted({getattr(r, "path", str(r)) for r in host.router.routes})
     logger.info("Multi-protocol host routes: %s", paths)
     return host
+
+
+def _build_storage() -> Any:
+    """Conversation state backed by the platform's durable ``$HOME`` volume.
+
+    Falls back to plain in-memory storage when ``$HOME`` is not writable (some
+    local Docker setups), matching how ``scene_manager`` degrades to ``/tmp``.
+    """
+
+    class _FileStorage(MemoryStorage):  # type: ignore[misc]
+        """``MemoryStorage`` that mirrors itself to a JSON file after every change.
+
+        Subclassing rather than reimplementing keeps the SDK's ``StoreItem``
+        serialisation: ``MemoryStorage`` already holds its state as plain JSON,
+        so persisting is just dumping that dict.
+
+        Declared here, not at module scope, because ``MemoryStorage`` comes from
+        the guarded import above — a module-level base class would turn a
+        missing SDK into an ImportError for the whole module instead of the
+        clean ``activity_available() is False`` degradation main.py expects.
+
+        The state is small (a bounded transcript plus a scene generation
+        counter) and writes happen once per turn, so a full rewrite is cheaper
+        than any incremental scheme. Never raises on a write failure — losing
+        durability must not fail the turn.
+        """
+
+        def __init__(self, path: str) -> None:
+            self._path = path
+            super().__init__(_read_state_file(path))
+
+        async def write(self, changes: Any) -> None:
+            await super().write(changes)
+            self._flush()
+
+        async def delete(self, keys: Any) -> None:
+            await super().delete(keys)
+            self._flush()
+
+        def _flush(self) -> None:
+            with self._lock:
+                snapshot = dict(self._memory)
+            _write_state_file(self._path, snapshot)
+
+    path = os.path.join(os.path.expanduser("~"), ".blender_activity_state.json")
+    try:
+        storage = _FileStorage(path)
+    except OSError:
+        logger.warning(
+            "Could not open %s — Activity conversation state will not survive "
+            "an idle/resume cycle",
+            path, exc_info=True,
+        )
+        return MemoryStorage()
+    logger.info("Activity conversation state (persisted): %s", path)
+    return storage
+
+
+def _read_state_file(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Could not read %s — starting empty", path, exc_info=True)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_state_file(path: str, payload: dict) -> None:
+    try:
+        serialized = json.dumps(payload)
+    except (TypeError, ValueError):
+        logger.warning("Could not serialize Activity state", exc_info=True)
+        return
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(serialized)
+        os.replace(tmp, path)
+    except OSError:
+        logger.warning("Could not persist Activity state to %s", path, exc_info=True)
 
 
 def register_activity_handlers(host: Any, agent: Any) -> None:
@@ -244,7 +344,7 @@ def register_activity_handlers(host: Any, agent: Any) -> None:
         # (403), and on install the membersAdded welcome already greets the user.
         action = str(getattr(context.activity, "action", "") or "").lower()
         conversation_id = _conversation_id(context)
-        generation = _clear_conversation(state)
+        generation = _clear_conversation(state, _conversation_slot(conversation_id))
         logger.info(
             "Activity installationUpdate: action=%s conversation=%s new_generation=%d",
             action, conversation_id, generation,
@@ -271,12 +371,18 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
 
     # A tapped Adaptive Card arrives as a `message` activity with no text and
     # the card's Action.Submit payload in `activity.value`.
-    user_text = _card_submit_text(context) or _user_text(context)
+    submitted = _card_submit(context)
+    if submitted is not None:
+        user_text, history_text = submitted
+    else:
+        user_text = history_text = _user_text(context)
     if not user_text:
         return
 
+    slot = _conversation_slot(conversation_id)
+
     if _is_clear_command(user_text):
-        await _handle_clear(context, state, conversation_id)
+        await _handle_clear(context, state, slot, conversation_id)
         return
 
     generation = _scene_generation(state)
@@ -286,15 +392,6 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
         "Activity turn started: channel=%s conversation=%s generation=%d scene_key=%s streaming=%s",
         _channel(context), conversation_id, generation, scene_key, streaming,
     )
-
-    history = _load_history(state)
-    messages = [
-        *(
-            Message(role=entry["role"], contents=[Content.from_text(entry["text"])])
-            for entry in history
-        ),
-        Message(role="user", contents=[Content.from_text(user_text)]),
-    ]
 
     emitter = _StreamingEmitter(context) if streaming else _FallbackEmitter(context)
     relay = _Relay(emitter)
@@ -308,30 +405,95 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
     # used for logging / the persisted state file only — the scene file itself
     # has a fixed name per micro-VM.
     options = {"user": scene_key} if scene_key else None
+    reply_chars = 0
+
+    async def _persist(epoch: int, history: list[dict[str, str]]) -> None:
+        """Write this turn back into the transcript. Called INSIDE the lock."""
+        nonlocal reply_chars
+        reply = "".join(reply_parts).strip()
+        reply_chars = len(reply)
+        if not reply:
+            return
+        if slot.epoch != epoch:
+            # /clear landed while this turn was running: the user asked for a
+            # blank slate, so this exchange must not be replayed back into it.
+            logger.info(
+                "Discarding the transcript of a turn superseded by /clear: conversation=%s",
+                conversation_id,
+            )
+            return
+        _save_history(
+            state,
+            slot,
+            [
+                *history,
+                {"role": "user", "text": history_text},
+                {"role": "assistant", "text": reply},
+            ],
+        )
+        if relay.detached:
+            # The SDK persists TurnState right after the handler returns —
+            # which already happened — so this turn's history would be lost
+            # unless we write it ourselves. force=True because the SDK's
+            # change detection has already seen (and saved) this state.
+            try:
+                await state.save(context, force=True)
+            except Exception:
+                logger.warning("Could not persist detached turn state", exc_info=True)
 
     async def _consume() -> None:
         # Tool calls can run for minutes; without this the channel sees nothing
-        # between two status updates and gives up on the turn.
+        # between two status updates and gives up on the turn. The pump starts
+        # BEFORE the lock so a turn queued behind a long render keeps its own
+        # channel alive while it waits its turn.
         pump = asyncio.create_task(_keepalive_pump(relay))
         try:
-            async for update in agent.run(messages, stream=True, options=options):
-                for content in update.contents or []:
-                    if content.type != "text" or not content.text:
-                        continue
-                    message_id = update.message_id or ""
-                    if message_id.startswith(_STATUS_PREFIXES):
-                        await relay.status(_clean_status(content.text))
-                        if message_id.startswith(_PROGRESS_STATUS_PREFIXES):
-                            await relay.progress()
-                    else:
-                        # Model prose, plus the tool images / download links that
-                        # ToolStatusMiddleware surfaces early (markdown, which
-                        # Teams renders) and the middleware's friendly error text.
-                        # Keep the RAW text for history so the model still knows
-                        # which gallery it offered; the user sees the filtered
-                        # version with the fenced JSON replaced by a card.
-                        reply_parts.append(content.text)
-                        await _emit_filtered(relay, gallery.feed(content.text), dedupe)
+            if slot.lock.locked():
+                logger.info(
+                    "Activity turn queued behind a running turn: conversation=%s",
+                    conversation_id,
+                )
+                await relay.status(_QUEUED_STATUS_TEXT)
+            # Held for the WHOLE turn, including after a detach: the work keeps
+            # running against the shared Blender scene long after the inbound
+            # request completed, so releasing early would let the next message
+            # interleave with it.
+            async with slot.lock:
+                # Read the transcript inside the lock — `state` is a snapshot
+                # taken before the turn ahead of us saved, so only the
+                # in-process copy `_load_history` prefers is up to date.
+                epoch = slot.epoch
+                history = _load_history(state, slot)
+                messages = [
+                    *(
+                        Message(role=entry["role"], contents=[Content.from_text(entry["text"])])
+                        for entry in history
+                    ),
+                    Message(role="user", contents=[Content.from_text(user_text)]),
+                ]
+                try:
+                    async for update in agent.run(messages, stream=True, options=options):
+                        for content in update.contents or []:
+                            if content.type != "text" or not content.text:
+                                continue
+                            message_id = update.message_id or ""
+                            if message_id.startswith(_STATUS_PREFIXES):
+                                await relay.status(_clean_status(content.text))
+                                if message_id.startswith(_PROGRESS_STATUS_PREFIXES):
+                                    await relay.progress()
+                            else:
+                                # Model prose, plus the tool images / download links that
+                                # ToolStatusMiddleware surfaces early (markdown, which
+                                # Teams renders) and the middleware's friendly error text.
+                                # Keep the RAW text for history so the model still knows
+                                # which gallery it offered; the user sees the filtered
+                                # version with the fenced JSON replaced by a card.
+                                reply_parts.append(content.text)
+                                await _emit_filtered(relay, gallery.feed(content.text), dedupe)
+                finally:
+                    # Still inside the lock: the next turn must not read the
+                    # transcript before this one has written itself into it.
+                    await _persist(epoch, history)
         except Exception:
             # ToolStatusMiddleware already emitted user-facing error text before
             # re-raising, so only add our own when nothing reached the user.
@@ -357,28 +519,9 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
             except Exception as exc:
                 logger.warning("Could not finish the activity response: %s", exc)
 
-        reply = "".join(reply_parts).strip()
-        if reply:
-            _save_history(
-                state,
-                [
-                    *history,
-                    {"role": "user", "text": user_text},
-                    {"role": "assistant", "text": reply},
-                ],
-            )
-            if relay.detached:
-                # The SDK persists TurnState right after the handler returns —
-                # which already happened — so this turn's history would be lost
-                # unless we write it ourselves. force=True because the SDK's
-                # change detection has already seen (and saved) this state.
-                try:
-                    await state.save(context, force=True)
-                except Exception:
-                    logger.warning("Could not persist detached turn state", exc_info=True)
         logger.info(
             "Activity turn finished: conversation=%s reply_chars=%d detached=%s elapsed=%.0fs",
-            conversation_id, len(reply), relay.detached, relay.elapsed,
+            conversation_id, reply_chars, relay.detached, relay.elapsed,
         )
 
     turn = asyncio.create_task(_consume())
@@ -448,7 +591,7 @@ def _is_clear_command(text: str) -> bool:
     return text.strip().lower().rstrip(".!") == _CLEAR_COMMAND
 
 
-def _clear_conversation(state: Any) -> int:
+def _clear_conversation(state: Any, slot: _Conversation) -> int:
     """Forget the transcript and hand out a fresh scene key.
 
     Teams owns the conversation id and keeps it stable even after "Remove chat
@@ -461,14 +604,22 @@ def _clear_conversation(state: Any) -> int:
     recorded by the last ``save_scene`` and resets Blender to a clean scene
     instead of loading the saved file. The reset therefore lands on the NEXT
     message, which is why the confirmation says so.
+
+    Deliberately does NOT wait on ``slot.lock``: a render already in flight can
+    hold it for minutes, and /clear has to answer now. Bumping the epoch is what
+    makes that safe — the running turn checks it before writing its transcript
+    back and drops it instead.
     """
     generation = _bump_scene_generation(state)
-    _save_history(state, [])
+    slot.epoch += 1
+    _save_history(state, slot, [])
     return generation
 
 
-async def _handle_clear(context: Any, state: Any, conversation_id: str | None) -> None:
-    generation = _clear_conversation(state)
+async def _handle_clear(
+    context: Any, state: Any, slot: _Conversation, conversation_id: str | None
+) -> None:
+    generation = _clear_conversation(state, slot)
     logger.info(
         "Activity /clear: conversation=%s new_generation=%d new_scene_key=%s",
         conversation_id,
@@ -753,8 +904,22 @@ def _gallery_card(tag: str, body: str) -> Any | None:
     return Attachment(content_type=_ADAPTIVE_CARD_CONTENT_TYPE, content=card)
 
 
-def _card_submit_text(context: Any) -> str | None:
-    """Turn a tapped card into the user message the agent's tools expect."""
+def _card_submit(context: Any) -> tuple[str, str] | None:
+    """Turn a tapped card into ``(prompt, transcript_text)``.
+
+    The two differ on purpose. ``prompt`` carries the tool-directing
+    scaffolding the model needs *this turn*; ``transcript_text`` is the plain
+    thing the user actually did. Storing the scaffolding would replay tool
+    names and argument literals back as if the user had said them, teaching the
+    model that this is how requests look and burning budget on a URL it will
+    never need again.
+
+    Unlike the reference sample's to-do buttons, these actions are not
+    deterministic CRUD that can be applied directly: importing a model is
+    followed by a viewport screenshot, and a texture may need disambiguating
+    against the current scene. Both need the model's judgment, so the turn goes
+    through the agent rather than straight to the tool.
+    """
     value = getattr(context.activity, "value", None)
     if not isinstance(value, dict):
         return None
@@ -768,14 +933,16 @@ def _card_submit_text(context: Any) -> str | None:
             return (
                 f'I picked the 3D model "{name}". Import it by calling download_model with '
                 f'model_url="{model_url}" and a short descriptive name, then take ONE '
-                f"viewport screenshot so I can see it."
+                f"viewport screenshot so I can see it.",
+                f'Add the 3D model "{name}" to the scene.',
             )
     elif action == "apply_texture":
         asset_id = value.get("assetId")
         if isinstance(asset_id, str) and asset_id:
             return (
                 f'I picked the texture "{name}" (assetId "{asset_id}"). Apply it with '
-                f"apply_texture — if it is not obvious which object I mean, ask me first."
+                f"apply_texture — if it is not obvious which object I mean, ask me first.",
+                f'Apply the texture "{name}".',
             )
     return None
 
@@ -1363,23 +1530,110 @@ def _clean_status(text: str) -> str:
     return text.strip().strip("*").strip()
 
 
-def _load_history(state: Any) -> list[dict[str, str]]:
-    try:
-        history = state.conversation.get_value(_HISTORY_KEY)
-    except Exception:  # pragma: no cover - defensive
-        logger.warning("Could not read Activity conversation history", exc_info=True)
-        return []
+# ──────────────────────────────────────────────
+# Conversation registry — turn serialisation + transcript
+# ──────────────────────────────────────────────
+
+
+class _Conversation:
+    """Per-conversation turn lock and the authoritative transcript.
+
+    Two problems are solved here.
+
+    **Overlapping turns.** Teams and M365 Copilot deliver activities in bursts,
+    and nothing upstream serialises them. Two turns running at once would drive
+    the SINGLE shared Blender scene concurrently — one turn's ``clear_scene``
+    landing in the middle of another's render — and would clobber each other on
+    the read-modify-write of the transcript below.
+
+    **Stale snapshots.** ``TurnState`` is loaded from storage *before* the
+    handler runs, so a turn queued behind a long render holds a snapshot that
+    predates the previous turn's save and would replay a transcript missing the
+    last exchange. The in-process copy here is therefore the source of truth for
+    the life of the container, and ``TurnState`` is the durable write-through.
+    """
+
+    __slots__ = ("lock", "history", "loaded", "epoch")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.history: list[dict[str, str]] = []
+        self.loaded = False
+        # Bumped by /clear so a turn already in flight knows not to write its
+        # transcript back over the fresh slate it was cleared into.
+        self.epoch = 0
+
+
+_conversations: dict[str, _Conversation] = {}
+
+
+def _conversation_slot(conversation_id: str | None) -> _Conversation:
+    key = conversation_id or "__default__"
+    slot = _conversations.get(key)
+    if slot is not None:
+        return slot
+    for stale in list(_conversations):
+        if len(_conversations) < _MAX_TRACKED_CONVERSATIONS:
+            break
+        # Never evict a conversation with a turn in flight — its lock and
+        # transcript are still in use.
+        if not _conversations[stale].lock.locked():
+            del _conversations[stale]
+    slot = _Conversation()
+    _conversations[key] = slot
+    return slot
+
+
+def _sanitize_history(history: Any) -> list[dict[str, str]]:
     if not isinstance(history, list):
         return []
     return [
         entry
         for entry in history
-        if isinstance(entry, dict) and isinstance(entry.get("text"), str) and entry.get("role") in ("user", "assistant")
+        if isinstance(entry, dict)
+        and isinstance(entry.get("text"), str)
+        and entry.get("role") in ("user", "assistant")
     ]
 
 
-def _save_history(state: Any, history: list[dict[str, str]]) -> None:
+def _trim_history(history: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Keep the newest tail that fits both the message and the character budget.
+
+    The most recent exchange is always kept even when it alone blows the budget:
+    dropping it would leave the model answering with no idea what was just
+    asked, which is worse than one oversized turn.
+    """
+    budget = _MAX_HISTORY_CHARS
+    kept: list[dict[str, str]] = []
+    for entry in reversed(history[-_MAX_HISTORY_MESSAGES:]):
+        budget -= len(entry["text"])
+        if budget < 0 and kept:
+            break
+        kept.append(entry)
+    kept.reverse()
+    return kept
+
+
+def _load_history(state: Any, slot: _Conversation) -> list[dict[str, str]]:
+    """The transcript to replay. Call INSIDE ``slot.lock``."""
+    if slot.loaded:
+        return list(slot.history)
+    history: Any = None
     try:
-        state.conversation.set_value(_HISTORY_KEY, history[-_MAX_HISTORY_MESSAGES:])
+        history = state.conversation.get_value(_HISTORY_KEY)
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("Could not read Activity conversation history", exc_info=True)
+    slot.history = _trim_history(_sanitize_history(history))
+    slot.loaded = True
+    return list(slot.history)
+
+
+def _save_history(state: Any, slot: _Conversation, history: list[dict[str, str]]) -> None:
+    """Update the in-process transcript and write it through. Call INSIDE the lock."""
+    trimmed = _trim_history(_sanitize_history(history))
+    slot.history = trimmed
+    slot.loaded = True
+    try:
+        state.conversation.set_value(_HISTORY_KEY, trimmed)
     except Exception:  # pragma: no cover - defensive
         logger.warning("Could not persist Activity conversation history", exc_info=True)

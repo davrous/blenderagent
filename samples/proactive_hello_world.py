@@ -17,9 +17,20 @@ from a production Blender agent. Nothing here depends on that agent.
 
 Run it
 ------
-    pip install azure-ai-agentserver-activity microsoft-agents-hosting-core
-    python proactive_hello_world.py                  # serves :8088 (PORT env var)
-    npx @microsoft/m365agentsplayground -e http://localhost:8088/api/messages
+    pip install "azure-ai-agentserver-activity==1.0.0b1" \
+        microsoft-agents-hosting-core microsoft-agents-activity "aiohttp>=3.9.0"
+
+    python proactive_hello_world.py            # serves :8088 (PORT env var)
+
+    winget install agentsplayground            # one-off
+    agentsplayground -e http://localhost:8088/api/messages
+
+(``aiohttp`` is imported by the M365 connector but not declared by it, so it has
+to be installed explicitly — same note as the official samples' requirements.txt.
+If you run this agent inside Docker instead, the Playground also needs
+``--service-url http://host.docker.internal:56150/_connector``, because
+``localhost`` inside the container is the container itself and the proactive
+replies would never reach you.)
 
 Then say:
     "hi"    -> instant reply, nothing fancy (the fast path)
@@ -44,15 +55,35 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from azure.ai.agentserver.activity import ActivityAgentServerHost
-from microsoft_agents.activity import Activity, ActivityTypes
-from microsoft_agents.hosting.core import MemoryStorage
-
-logging.basicConfig(level=logging.INFO)
+# Configure logging BEFORE importing the host, as the official samples do: the
+# SDK installs its own handlers at import time, and basicConfig() is a no-op
+# once any handler exists on the root logger.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+)
 logger = logging.getLogger("proactive_hello_world")
+
+from azure.ai.agentserver.activity import ActivityAgentServerHost  # noqa: E402
+from microsoft_agents.activity import Activity, ActivityTypes  # noqa: E402
+from microsoft_agents.hosting.core import MemoryStorage  # noqa: E402
 
 PREVIEW_IMAGE = "https://raw.githubusercontent.com/microsoft/fluentui-emoji/main/assets/Hourglass%20not%20done/3D/hourglass_not_done_3d.png"
 RESULT_IMAGE = "https://raw.githubusercontent.com/microsoft/fluentui-emoji/main/assets/Party%20popper/3D/party_popper_3d.png"
+
+
+async def safe_send(context, message) -> None:
+    """Send on the live turn, logging — not raising — on failure.
+
+    Outbound delivery goes to the Bot Connector. Letting a transient failure
+    there escape would surface as a 500 on the *inbound* webhook, which makes
+    the connector retry the whole turn — so a hiccup delivering one message
+    turns into the user's request running twice.
+    """
+    try:
+        await context.send_activity(message)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning("Could not send activity: %s", exc)
 
 
 class ProactiveSender:
@@ -161,8 +192,9 @@ def register(app) -> None:
 
         if "slow" not in text:
             # Fast path: answer in-request, exactly like any normal bot.
-            await context.send_activity(
-                "👋 Hello! Say **slow** and I'll show you the proactive flow."
+            await safe_send(
+                context,
+                "👋 Hello! Say **slow** and I'll show you the proactive flow.",
             )
             return
 
@@ -170,9 +202,10 @@ def register(app) -> None:
         # moment the identity, factory and reference are all available.
         sender = ProactiveSender(context)
 
-        await context.send_activity(
+        await safe_send(
+            context,
             "⏳ This task requires time — I'll keep working on it in the "
-            "background and message you here as soon as it's ready."
+            "background and message you here as soon as it's ready.",
         )
 
         # Fire and forget: the handler returns immediately, the request
@@ -184,11 +217,34 @@ def register(app) -> None:
         _background.add(task)
         task.add_done_callback(_background.discard)
 
+    @app.activity("conversationUpdate")
+    async def on_members_added(context, _state) -> None:  # pyright: ignore[reportUnusedFunction]
+        """Greet new members, so the Playground shows something on connect."""
+        recipient_id = getattr(context.activity.recipient, "id", None)
+        for member in context.activity.members_added or []:
+            if getattr(member, "id", None) == recipient_id:
+                continue  # that's the agent itself joining
+            await safe_send(
+                context,
+                "👋 Hi! Say **slow** to see a long-running turn answered "
+                "proactively.",
+            )
+
+    @app.error
+    async def on_error(context, error) -> None:  # pyright: ignore[reportUnusedFunction]
+        """Last line of defence: never let an exception become a bare 500."""
+        logger.error("Handler error: %s", error, exc_info=True)
+        await safe_send(context, f"Sorry, something went wrong: {error}")
+
 
 _background: set[asyncio.Task] = set()
 
 
 def main() -> None:
+    # `storage=` is optional — the official samples call `ActivityAgentServerHost()`
+    # bare and get an in-memory default. It is passed explicitly here only to make
+    # the seam obvious: swap in a durable Storage and conversation state survives
+    # a restart. This sample keeps no state of its own.
     host = ActivityAgentServerHost(storage=MemoryStorage())
     register(host.agent_app)
     logger.info("POST /api/messages ready — point the Agents Playground at it.")
