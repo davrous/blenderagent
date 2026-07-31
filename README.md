@@ -2,6 +2,10 @@
 
 An AI agent that creates and manipulates 3D scenes in a headless Blender instance running inside Docker. Built with the **Microsoft Agent Framework** and **Azure AI Foundry**, it communicates with Blender via the [BlenderMCP](https://github.com/ahujasid/blender-mcp) TCP socket protocol.
 
+To see what the agent can do, watch this video:
+
+[![Watch the video](https://i.ytimg.com/vi_webp/tQ2BpvhCu2g/maxresdefault.webp)](https://youtu.be/tQ2BpvhCu2g?si=SOtc85sbMr8lIDNz)
+
 ## Architecture
 
 The container speaks **three protocols at once** — `responses` (web chat),
