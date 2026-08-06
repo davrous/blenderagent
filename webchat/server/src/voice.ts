@@ -3,9 +3,36 @@ import type { Server, IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
 import { config } from "./config.js";
 import { getBearerToken } from "./auth.js";
-import { getOrCreateSession } from "./sessions.js";
+import { getOrCreateConversation, getOrCreateSession } from "./sessions.js";
 
 const VOICE_PATH = "/api/voice";
+const TRACEPARENT_RE = /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/i;
+
+function firstHeader(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function safeForwardHeader(
+  value: string | string[] | undefined,
+  maxLength: number,
+): string | undefined {
+  const header = firstHeader(value);
+  if (!header || header.length > maxLength || /[\r\n]/.test(header)) return undefined;
+  return header;
+}
+
+export function buildTraceHeaders(req: IncomingMessage): Record<string, string> {
+  const incoming = firstHeader(req.headers.traceparent);
+  const headers: Record<string, string> = {};
+  if (incoming && TRACEPARENT_RE.test(incoming)) {
+    headers.traceparent = incoming;
+  }
+  const tracestate = safeForwardHeader(req.headers.tracestate, 512);
+  const baggage = safeForwardHeader(req.headers.baggage, 8192);
+  if (tracestate) headers.tracestate = tracestate;
+  if (baggage) headers.baggage = baggage;
+  return headers;
+}
 
 /**
  * Bidirectional relay between the browser voice WebSocket and the agent's
@@ -64,15 +91,23 @@ function injectSession(
   data: RawData,
   isBinary: boolean,
   foundryAgentSessionId: string | undefined,
+  foundryConversationId: string | undefined,
 ): { data: RawData; isBinary: boolean } {
-  if (isBinary || !foundryAgentSessionId) return { data, isBinary };
+  if (isBinary || (!foundryAgentSessionId && !foundryConversationId)) {
+    return { data, isBinary };
+  }
   try {
     const text = Array.isArray(data)
       ? Buffer.concat(data).toString("utf-8")
       : data.toString();
     const obj = JSON.parse(text);
     if (obj && typeof obj === "object" && typeof obj.type === "string") {
-      obj.foundry_agent_session_id = foundryAgentSessionId;
+      if (foundryAgentSessionId) {
+        obj.foundry_agent_session_id = foundryAgentSessionId;
+      }
+      if (foundryConversationId) {
+        obj.foundry_conversation_id = foundryConversationId;
+      }
       return { data: Buffer.from(JSON.stringify(obj)), isBinary: false };
     }
   } catch {
@@ -105,6 +140,7 @@ function buildFoundryVoiceWsUrl(routeSessionId: string): string {
 async function openUpstream(
   conversationId: string | undefined,
   foundryAgentSessionId?: string,
+  traceHeaders: Record<string, string> = {},
 ): Promise<WebSocket> {
   if (config.mode === "local") {
     return new WebSocket(config.localVoiceWsUrl);
@@ -118,7 +154,7 @@ async function openUpstream(
     throw new Error("sessionId (conversation UUID) is required for voice in foundry mode");
   }
   const token = await getBearerToken();
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...traceHeaders };
   if (token) headers.Authorization = `Bearer ${token}`;
   const routeSessionId = foundryAgentSessionId ?? conversationId;
   return new WebSocket(buildFoundryVoiceWsUrl(routeSessionId), { headers });
@@ -128,12 +164,18 @@ function relay(
   browser: WebSocket,
   upstream: WebSocket,
   foundryAgentSessionId?: string,
+  foundryConversationId?: string,
 ): void {
   const pending: Array<{ data: RawData; isBinary: boolean }> = [];
   let upstreamOpen = false;
 
   browser.on("message", (data: RawData, isBinary: boolean) => {
-    const out = injectSession(data, isBinary, foundryAgentSessionId);
+    const out = injectSession(
+      data,
+      isBinary,
+      foundryAgentSessionId,
+      foundryConversationId,
+    );
     if (upstreamOpen) sendTo(upstream, out.data, out.isBinary);
     else pending.push({ data: out.data, isBinary: out.isBinary });
   });
@@ -216,17 +258,36 @@ async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): 
   // the SAME agent_session_id. If it fails, voice still works via the
   // container's inline-history fallback (just not unified).
   let foundryAgentSessionId: string | undefined;
+  let foundryConversationId: string | undefined;
   if (config.mode === "foundry" && conversationId) {
-    try {
-      const { agentSessionId } = await getOrCreateSession(conversationId);
-      foundryAgentSessionId = agentSessionId;
+    const [sessionResult, conversationResult] = await Promise.allSettled([
+      getOrCreateSession(conversationId),
+      getOrCreateConversation(conversationId),
+    ]);
+    if (sessionResult.status === "fulfilled") {
+      foundryAgentSessionId = sessionResult.value.agentSessionId;
       console.log(
-        `[voice] threading into foundry session ${agentSessionId} (conversation=${conversationId})`,
+        `[voice] threading into foundry session ${foundryAgentSessionId} (conversation=${conversationId})`,
       );
-    } catch (err) {
+    } else {
       console.warn(
         "[voice] could not resolve foundry session; falling back to inline history:",
-        err instanceof Error ? err.message : err,
+        sessionResult.reason instanceof Error
+          ? sessionResult.reason.message
+          : sessionResult.reason,
+      );
+    }
+    if (conversationResult.status === "fulfilled") {
+      foundryConversationId = conversationResult.value;
+      console.log(
+        `[voice] sharing foundry conversation ${foundryConversationId} with typed chat`,
+      );
+    } else {
+      console.warn(
+        "[voice] could not resolve foundry conversation; using voice fallback history:",
+        conversationResult.reason instanceof Error
+          ? conversationResult.reason.message
+          : conversationResult.reason,
       );
     }
   }
@@ -236,7 +297,11 @@ async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): 
     console.log(
       `[voice] browser connected; opening upstream (conversation=${conversationId ?? "none"}, session=${foundryAgentSessionId ?? "none"}, mode=${config.mode})`,
     );
-    upstream = await openUpstream(conversationId, foundryAgentSessionId);
+    upstream = await openUpstream(
+      conversationId,
+      foundryAgentSessionId,
+      buildTraceHeaders(req),
+    );
   } catch (err) {
     console.error("[voice] failed to open upstream:", err instanceof Error ? err.message : err);
     sendTo(
@@ -253,7 +318,7 @@ async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): 
     return;
   }
 
-  relay(browser, upstream, foundryAgentSessionId);
+  relay(browser, upstream, foundryAgentSessionId, foundryConversationId);
 }
 
 /**

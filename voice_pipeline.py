@@ -38,6 +38,7 @@ Blender-specific behaviour
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -47,6 +48,77 @@ import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 logger = logging.getLogger("blender_agent.voice")
+
+try:
+    from opentelemetry import context as otel_context
+    from opentelemetry import metrics as otel_metrics
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.trace import Status, StatusCode
+
+    _tracer = otel_trace.get_tracer("blender_agent.voice")
+    _meter = otel_metrics.get_meter("blender_agent.voice")
+    _frames_received = _meter.create_counter("websocket.frames.received")
+    _frames_sent = _meter.create_counter("websocket.frames.sent")
+    _bytes_received = _meter.create_counter("websocket.frames.bytes_received")
+    _bytes_sent = _meter.create_counter("websocket.frames.bytes_sent")
+    _stage_failures = _meter.create_counter("voice.stage.failures")
+    _stt_duration = _meter.create_histogram("voice.stt.duration_ms", unit="ms")
+    _stt_finalize_duration = _meter.create_histogram(
+        "voice.stt.finalization.duration_ms", unit="ms"
+    )
+    _agent_duration = _meter.create_histogram("voice.agent.duration_ms", unit="ms")
+    _agent_first_delta = _meter.create_histogram(
+        "voice.agent.time_to_first_delta_ms", unit="ms"
+    )
+    _tts_duration = _meter.create_histogram("voice.tts.duration_ms", unit="ms")
+    _turn_duration = _meter.create_histogram("voice.turn.duration_ms", unit="ms")
+    _turn_first_audio = _meter.create_histogram(
+        "voice.turn.time_to_first_audio_ms", unit="ms"
+    )
+except ImportError:  # Local text-only environments may omit OTel.
+    otel_context = None
+    otel_trace = None
+    Status = StatusCode = None
+    _tracer = None
+    _frames_received = _frames_sent = None
+    _bytes_received = _bytes_sent = None
+    _stage_failures = None
+    _stt_duration = _stt_finalize_duration = None
+    _agent_duration = _agent_first_delta = None
+    _tts_duration = _turn_duration = _turn_first_audio = None
+
+
+def _span(name: str, attributes: Optional[dict[str, Any]] = None):
+    if _tracer is None:
+        return contextlib.nullcontext(None)
+    return _tracer.start_as_current_span(name, attributes=attributes or {})
+
+
+def _record(instrument: Any, value: float | int, attributes: Optional[dict[str, Any]] = None) -> None:
+    if instrument is not None:
+        instrument.record(value, attributes or {})
+
+
+def _count(instrument: Any, value: int, attributes: Optional[dict[str, Any]] = None) -> None:
+    if instrument is not None:
+        instrument.add(value, attributes or {})
+
+
+def _record_failure(stage: str, exc: BaseException | None = None, code: str | None = None) -> None:
+    attributes = {"voice.stage": stage}
+    if exc is not None:
+        attributes["error.type"] = type(exc).__name__
+    if code:
+        attributes["error.code"] = code[:80]
+    _count(_stage_failures, 1, attributes)
+
+
+def _set_span_error(span: Any, exc: BaseException | None = None, code: str | None = None) -> None:
+    if span is None or Status is None or StatusCode is None:
+        return
+    if exc is not None:
+        span.record_exception(exc)
+    span.set_status(Status(StatusCode.ERROR, code or (str(exc)[:200] if exc else "error")))
 
 # ── Audio format ──────────────────────────────────────────────────────────
 SAMPLE_RATE = 24000
@@ -74,6 +146,8 @@ PROGRESS_INTERVAL_MS = int(os.environ.get("VOICE_PROGRESS_INTERVAL_MS", "4500"))
 
 # ── Azure auth for Speech (keyless / AAD) ─────────────────────────────────
 SPEECH_AAD_SCOPE = "https://cognitiveservices.azure.com/.default"
+FOUNDRY_CALL_ID_HEADER = "x-agent-foundry-call-id"
+FOUNDRY_USER_ID_HEADER = "x-agent-user-id"
 
 # ── Agent local Responses endpoint (same container) ───────────────────────
 SERVER_PORT = int(os.environ.get("PORT", "8088"))
@@ -396,6 +470,7 @@ class VoiceSession:
         send_bytes: Callable[[bytes], Awaitable[None]],
         session_id: Optional[str] = None,
         call_id: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> None:
         self._agent = agent
         self._send_text_cb = send_text
@@ -404,17 +479,15 @@ class VoiceSession:
         # Continuity / scene key (owned by the browser, arrives on control frames).
         self._conversation_id: Optional[str] = session_id
         self._previous_response_id: Optional[str] = None
-        # Real Foundry `agent_session_id` (foundry mode only), injected by the
-        # relay in the control frames. When set, voice threads each turn into the
-        # SAME server-side session the TEXT path uses (the relay calls
-        # getOrCreateSession(conversation_id) for both), so voice + text share
-        # ONE Foundry conversation — portal traces + cross-modal memory. None in
-        # local dev (no gateway session exists).
+        # Foundry routing and Responses conversation ids injected by the relay.
+        # The session supplies sandbox affinity; the conversation supplies the
+        # persisted transcript shared by typed and voice turns.
         self._agent_session_id: Optional[str] = None
-        # Self-managed inline history — used ONLY in local mode. In foundry mode
-        # the shared `agent_session_id` carries history server-side (like text),
-        # so this stays unused. Capped to bound payload growth.
-        self._history: list[dict[str, str]] = []
+        self._foundry_conversation_id: Optional[str] = None
+        # Degradation only: if the web relay cannot resolve a Foundry
+        # conversation, retain voice-to-voice context for this socket. Normal
+        # hosted turns use `conversation`; local turns use previous_response_id.
+        self._fallback_history: list[dict[str, str]] = []
         self._history_max_messages = 8
         # Platform per-request call id (``x-agent-foundry-call-id``) captured from
         # the inbound WS upgrade. The hosted responses protocol v2.0.0 REQUIRES
@@ -422,21 +495,29 @@ class VoiceSession:
         # loopback call (otherwise the handler fails fast with "the hosted
         # environment is running on protocol 1.0.0").
         self._call_id: Optional[str] = call_id
+        self._user_id: Optional[str] = user_id
 
         # STT state.
         self._recognizer = None
         self._push_stream = None
         self._recognized_parts: list[str] = []
         self._capturing = False
+        self._stt_started_at: Optional[float] = None
+        self._stt_commit_at: Optional[float] = None
+        self._stt_audio_bytes = 0
+        self._stt_error_code: Optional[str] = None
+        self._stt_span = None
 
         # TTS worker state.
-        self._tts_queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
+        self._tts_queue: "asyncio.Queue[Optional[tuple[str, Any]]]" = asyncio.Queue()
         self._tts_task: Optional[asyncio.Task] = None
         self._speaking = False
 
         # Turn / barge-in state.
         self._turn_task: Optional[asyncio.Task] = None
         self._cancelled = False
+        self._turn_ready_at: Optional[float] = None
+        self._first_audio_sent = False
 
         # STT finalization signalling. Continuous recognition delivers the FINAL
         # `recognized` result asynchronously (after it drains trailing audio and
@@ -450,14 +531,28 @@ class VoiceSession:
     async def _send_text(self, obj: dict) -> None:
         try:
             await self._send_text_cb(obj)
+            size = len(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+            attrs = {"frame.type": "text"}
+            _count(_frames_sent, 1, attrs)
+            _count(_bytes_sent, size, attrs)
         except Exception:
             logger.debug("send_text failed", exc_info=True)
 
     async def _send_bytes(self, data: bytes) -> None:
         try:
             await self._send_bytes_cb(data)
+            attrs = {"frame.type": "binary"}
+            _count(_frames_sent, 1, attrs)
+            _count(_bytes_sent, len(data), attrs)
         except Exception:
             logger.debug("send_bytes failed", exc_info=True)
+
+    def record_received_frame(self, message: Any) -> None:
+        is_binary = isinstance(message, (bytes, bytearray))
+        size = len(message) if is_binary else len(str(message).encode("utf-8"))
+        attrs = {"frame.type": "binary" if is_binary else "text"}
+        _count(_frames_received, 1, attrs)
+        _count(_bytes_received, size, attrs)
 
     # -- control frames -----------------------------------------------------
     async def on_control(self, message: dict) -> None:
@@ -473,6 +568,9 @@ class VoiceSession:
         fsid = (message or {}).get("foundry_agent_session_id")
         if isinstance(fsid, str) and fsid:
             self._agent_session_id = fsid
+        fcid = (message or {}).get("foundry_conversation_id")
+        if isinstance(fcid, str) and fcid:
+            self._foundry_conversation_id = fcid
 
         if mtype == "start":
             await self._start_capture()
@@ -489,6 +587,7 @@ class VoiceSession:
     async def on_audio(self, chunk: bytes) -> None:
         if not self._capturing or not self._push_stream:
             return
+        self._stt_audio_bytes += len(chunk)
         try:
             self._push_stream.write(chunk)
         except Exception:
@@ -500,6 +599,23 @@ class VoiceSession:
             return
         # A new capture cancels any in-flight speech (barge-in).
         await self._barge_in()
+        self._stt_started_at = time.perf_counter()
+        self._stt_commit_at = None
+        self._stt_audio_bytes = 0
+        self._stt_error_code = None
+        self._stt_span = (
+            _tracer.start_span(
+                "voice.stt",
+                attributes={
+                    "voice.stt.provider": "azure_speech",
+                    "voice.stt.language": SPEECH_RECOGNITION_LANGUAGE,
+                    "audio.sample_rate": SAMPLE_RATE,
+                    "audio.channels": CHANNELS,
+                },
+            )
+            if _tracer is not None
+            else None
+        )
         try:
             import azure.cognitiveservices.speech as speechsdk
 
@@ -539,6 +655,7 @@ class VoiceSession:
                 # only — the SDK fires this on a background thread where we can't
                 # await an outbound frame.
                 try:
+                    self._stt_error_code = str(getattr(evt, "error_code", "canceled"))
                     logger.warning(
                         "STT canceled: reason=%s error_code=%s details=%s",
                         getattr(evt, "reason", "?"),
@@ -560,11 +677,55 @@ class VoiceSession:
             self._recognizer.start_continuous_recognition_async()
             self._capturing = True
             await self._send_text({"type": "listening"})
-        except Exception:
+        except Exception as exc:
             logger.warning("Failed to start STT capture.", exc_info=True)
+            self._finish_stt_span(exc=exc, error_code="start_failed")
             await self._send_text(
                 {"type": "error", "message": "Could not start speech recognition."}
             )
+
+    def _finish_stt_span(
+        self,
+        *,
+        transcript: str = "",
+        exc: BaseException | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        if self._stt_started_at is None:
+            return
+        finished_at = time.perf_counter()
+        duration_ms = (finished_at - self._stt_started_at) * 1000
+        finalize_ms = (
+            (finished_at - self._stt_commit_at) * 1000
+            if self._stt_commit_at is not None
+            else 0.0
+        )
+        audio_ms = self._stt_audio_bytes / (SAMPLE_RATE * CHANNELS * (BITS_PER_SAMPLE // 8)) * 1000
+        attributes = {
+            "voice.stt.language": SPEECH_RECOGNITION_LANGUAGE,
+            "voice.stt.empty": not bool(transcript),
+        }
+        _record(_stt_duration, duration_ms, attributes)
+        if self._stt_commit_at is not None:
+            _record(_stt_finalize_duration, finalize_ms, attributes)
+        span = self._stt_span
+        if span is not None:
+            span.set_attribute("voice.stt.duration_ms", duration_ms)
+            span.set_attribute("voice.stt.finalization.duration_ms", finalize_ms)
+            span.set_attribute("voice.stt.input_audio.duration_ms", audio_ms)
+            span.set_attribute("voice.stt.input_audio.bytes", self._stt_audio_bytes)
+            span.set_attribute("voice.stt.transcript.characters", len(transcript))
+            span.set_attribute("voice.stt.empty", not bool(transcript))
+            resolved_error = error_code or self._stt_error_code
+            if exc is not None or resolved_error:
+                _set_span_error(span, exc, resolved_error)
+            span.end()
+        resolved_error = error_code or self._stt_error_code
+        if exc is not None or resolved_error:
+            _record_failure("stt", exc, resolved_error)
+        self._stt_started_at = None
+        self._stt_commit_at = None
+        self._stt_span = None
 
     def _stop_capture(self) -> None:
         self._capturing = False
@@ -582,12 +743,14 @@ class VoiceSession:
                 rec.stop_continuous_recognition_async()
             except Exception:
                 pass
+        self._finish_stt_span(error_code="capture_closed")
 
     async def _commit_and_run(self) -> None:
         if not self._capturing:
             # Nothing was being captured; ignore stray commit.
             return
         self._capturing = False
+        self._stt_commit_at = time.perf_counter()
         # Signal end-of-audio and WAIT for the recognizer to finalize before
         # reading the transcript. Continuous recognition emits the final
         # `recognized` result only after it drains the trailing audio and
@@ -607,6 +770,7 @@ class VoiceSession:
             try:
                 await asyncio.wait_for(self._stt_done.wait(), timeout=8.0)
             except asyncio.TimeoutError:
+                self._stt_error_code = "finalize_timeout"
                 logger.info(
                     "STT finalize wait timed out (8s) — using whatever was recognized."
                 )
@@ -620,6 +784,7 @@ class VoiceSession:
                 pass
         transcript = " ".join(p for p in self._recognized_parts if p).strip()
         self._recognized_parts = []
+        self._finish_stt_span(transcript=transcript)
         logger.info("Voice commit: transcript=%r", transcript[:200])
         if not transcript:
             await self._send_text(
@@ -629,6 +794,8 @@ class VoiceSession:
             return
         await self._send_text({"type": "stt", "text": transcript, "final": True})
         self._cancelled = False
+        self._turn_ready_at = time.perf_counter()
+        self._first_audio_sent = False
         self._turn_task = asyncio.ensure_future(self._run_turn(transcript))
 
     # -- barge-in / cancel --------------------------------------------------
@@ -636,6 +803,11 @@ class VoiceSession:
         self._cancelled = True
         if self._turn_task and not self._turn_task.done():
             self._turn_task.cancel()
+        if self._tts_task and not self._tts_task.done():
+            self._tts_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._tts_task
+        self._tts_task = None
         # Drain the pending TTS queue.
         try:
             while True:
@@ -643,12 +815,35 @@ class VoiceSession:
                 self._tts_queue.task_done()
         except asyncio.QueueEmpty:
             pass
+        self._tts_queue = asyncio.Queue()
         if self._speaking:
             await self._send_text({"type": "speaking_end"})
             self._speaking = False
 
     # -- the agent turn -----------------------------------------------------
     async def _run_turn(self, transcript: str) -> None:
+        started_at = time.perf_counter()
+        attributes = {
+            "voice.turn.mode": "hosted" if _is_hosted() else "local",
+            "voice.turn.input.characters": len(transcript),
+        }
+        with _span("voice.turn", attributes) as span:
+            try:
+                await self._run_turn_inner(transcript)
+            except asyncio.CancelledError:
+                if span is not None:
+                    span.set_attribute("voice.turn.cancelled", True)
+                raise
+            except Exception as exc:
+                _record_failure("turn", exc)
+                raise
+            finally:
+                duration_ms = (time.perf_counter() - started_at) * 1000
+                _record(_turn_duration, duration_ms, {"voice.turn.mode": attributes["voice.turn.mode"]})
+                if span is not None:
+                    span.set_attribute("voice.turn.duration_ms", duration_ms)
+
+    async def _run_turn_inner(self, transcript: str) -> None:
         keyword = _extract_keyword(transcript)
         state = {"prose": 0, "kw": keyword}
         self._ensure_tts_worker()
@@ -670,16 +865,15 @@ class VoiceSession:
         if self._cancelled:
             return
 
-        # Record this exchange for INLINE replay next turn. invocations_ws voice
-        # is agent-managed (the platform stores no history and the loopback isn't
-        # gateway-threaded), so this is the ONLY thing that gives multi-turn
-        # voice its memory. Record even when `errored` is set (the reply text was
-        # still produced — typically only a terminal storage persist failed).
-        self._history.append({"role": "user", "content": transcript})
-        if reply:
-            self._history.append({"role": "assistant", "content": reply})
-        if len(self._history) > self._history_max_messages:
-            self._history = self._history[-self._history_max_messages:]
+        # Only the hosted degradation path needs inline replay. Normally the
+        # shared Foundry conversation (hosted) or response chain (local) owns
+        # history and is also visible to typed turns.
+        if _is_hosted() and not self._foundry_conversation_id:
+            self._fallback_history.append({"role": "user", "content": transcript})
+            if reply:
+                self._fallback_history.append({"role": "assistant", "content": reply})
+            if len(self._fallback_history) > self._history_max_messages:
+                self._fallback_history = self._fallback_history[-self._history_max_messages:]
 
         if errored:
             return
@@ -692,7 +886,7 @@ class VoiceSession:
         if state["prose"] == 0 and not has_image and not has_download:
             fallback = _normalize_for_speech(strip_media(reply)).strip()
             if fallback:
-                await self._tts_queue.put(fallback)
+                await self._queue_tts(fallback)
 
         # Always announce a visual result or a download (user cue requirement).
         if has_image:
@@ -703,62 +897,122 @@ class VoiceSession:
                 else random.choice(PROGRESS_CLOSERS_GENERIC)
             )
             await self._send_text({"type": "progress", "text": cue})
-            await self._tts_queue.put(cue)
+            await self._queue_tts(cue)
         elif has_download:
             cue = "Your download link is ready below."
             await self._send_text({"type": "progress", "text": cue})
-            await self._tts_queue.put(cue)
+            await self._queue_tts(cue)
 
-        # Report response_id=None: voice manages its own inline history, and the
-        # loopback's `caresp_...` id is NOT resolvable by the Foundry gateway.
-        # Feeding it back into the shared client `previousResponseId` would
-        # poison the next TEXT turn (the gateway would 404 on it), so we leave
-        # the client's chain untouched (voiceFinalizeTurn keeps it on null).
+        # The server's `done` event means all response audio has been emitted,
+        # not merely queued. This keeps status, metrics, and barge-in state in
+        # sync with the actual wire behavior.
+        await self._tts_queue.join()
+        if self._tts_task and not self._tts_task.done():
+            await self._tts_queue.put(None)
+            await self._tts_task
+        self._tts_task = None
+        if self._speaking:
+            await self._send_text({"type": "speaking_end"})
+            self._speaking = False
+
+        # Local mode can safely advance the same response chain used by typed
+        # chat. Hosted mode uses the shared conversation instead; its in-process
+        # response id is not a valid public-gateway continuation id.
         await self._send_text(
             {
                 "type": "done",
                 "reply": reply,
-                "response_id": None,
+                "response_id": None if _is_hosted() else self._previous_response_id,
             }
         )
 
     async def _stream_agent(self, transcript: str, state: dict) -> str:
+        started_at = time.perf_counter()
+        state["agent_started_at"] = started_at
+        state["agent_first_delta_recorded"] = False
+        attributes = {
+            "voice.agent.protocol": "responses",
+            "voice.agent.history_mode": (
+                "conversation"
+                if self._foundry_conversation_id
+                else "previous_response"
+                if self._previous_response_id
+                else "inline_fallback"
+                if self._fallback_history
+                else "new"
+            ),
+        }
+        with _span("voice.agent", attributes) as span:
+            try:
+                reply = await self._stream_agent_inner(transcript, state)
+                if span is not None:
+                    span.set_attribute("voice.agent.output.characters", len(reply))
+                return reply
+            except Exception as exc:
+                _record_failure("agent", exc)
+                raise
+            finally:
+                duration_ms = (time.perf_counter() - started_at) * 1000
+                _record(_agent_duration, duration_ms, attributes)
+                if span is not None:
+                    span.set_attribute("voice.agent.duration_ms", duration_ms)
+
+    def _build_agent_request(self, transcript: str) -> dict[str, Any]:
+        """Build the shared-conversation Responses payload for one voice turn."""
+        input_value: Any = transcript
+        if _is_hosted() and not self._foundry_conversation_id and self._fallback_history:
+            input_value = [
+                *self._fallback_history,
+                {"role": "user", "content": transcript},
+            ]
+        body: dict[str, Any] = {
+            "model": AGENT_MODEL,
+            "input": input_value,
+            "stream": True,
+        }
+        if self._foundry_conversation_id:
+            body["conversation"] = self._foundry_conversation_id
+        elif self._previous_response_id:
+            body["previous_response_id"] = self._previous_response_id
+        if self._agent_session_id:
+            body["agent_session_id"] = self._agent_session_id
+        elif not _is_hosted() and self._conversation_id:
+            body["agent_session_id"] = self._conversation_id
+        if self._conversation_id:
+            body["user"] = self._conversation_id
+            body["metadata"] = {"conversation_id": self._conversation_id}
+        return body
+
+    def _build_loopback_headers(self) -> dict[str, str]:
+        """Inject trace and hosted identity context into the local HTTP hop."""
+        headers = {"Accept": "text/event-stream"}
+        try:
+            from opentelemetry.propagate import inject
+
+            inject(headers)
+        except ImportError:
+            pass
+        if self._call_id:
+            headers[FOUNDRY_CALL_ID_HEADER] = self._call_id
+        if self._user_id:
+            headers[FOUNDRY_USER_ID_HEADER] = self._user_id
+        return headers
+
+    async def _stream_agent_inner(self, transcript: str, state: dict) -> str:
         """POST to the local /responses endpoint and stream the reply back."""
         import httpx
 
         streamer = _ProseSentenceStreamer()
         reply_parts: list[str] = []
 
-        # invocations_ws is AGENT-MANAGED history: per the Foundry hosted-agent
-        # protocol, the platform does NOT store or prepend conversation history
-        # for the voice (WebSocket) transport, and this in-container loopback to
-        # /responses is NOT gateway-threaded either. So multi-turn voice memory
-        # is OURS to keep — we ALWAYS replay recent turns INLINE as an `input`
-        # message array. (We tried relying on a shared `agent_session_id` for
-        # server-side history; the loopback never prepends it, so context was
-        # lost — hence inline is the reliable mechanism.)
-        #
-        # We also pass `user`/`metadata` (the browser conversation id) so
-        # SceneIsolationMiddleware keys the SAME Blender scene as the text path.
-        messages: list[dict[str, str]] = list(self._history)
-        messages.append({"role": "user", "content": transcript})
-        body: dict[str, Any] = {
-            "model": AGENT_MODEL,
-            "input": messages,
-            "stream": True,
-        }
-        if self._conversation_id:
-            body["user"] = self._conversation_id
-            body["metadata"] = {"conversation_id": self._conversation_id}
+        # Hosted mode passes the same Foundry Responses conversation used by
+        # typed chat. Local mode chains previous_response_id. If hosted
+        # conversation resolution failed, combine the last public typed chain
+        # (when available) with a small inline voice-only fallback.
+        body = self._build_agent_request(transcript)
 
         timeout = httpx.Timeout(600.0, connect=10.0)
-        headers = {"Accept": "text/event-stream"}
-        # Forward the platform per-request call id so the hosted responses
-        # protocol v2.0.0 accepts this in-container loopback call. Without it the
-        # handler raises "the hosted environment is running on protocol 1.0.0,
-        # but the agent requires protocol 2.0.0".
-        if self._call_id:
-            headers["x-agent-foundry-call-id"] = self._call_id
+        headers = self._build_loopback_headers()
         async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream(
                 "POST",
@@ -797,7 +1051,7 @@ class VoiceSession:
         # Flush any trailing prose to speech.
         for sentence in streamer.flush():
             state["prose"] += 1
-            await self._tts_queue.put(sentence)
+            await self._queue_tts(sentence)
 
         return "".join(reply_parts)
 
@@ -824,13 +1078,25 @@ class VoiceSession:
         elif etype == "response.output_text.delta":
             delta = payload.get("delta")
             if isinstance(delta, str) and delta:
+                if not state.get("agent_first_delta_recorded"):
+                    state["agent_first_delta_recorded"] = True
+                    latency_ms = (
+                        time.perf_counter() - state.get("agent_started_at", time.perf_counter())
+                    ) * 1000
+                    attrs = {"voice.agent.protocol": "responses"}
+                    _record(_agent_first_delta, latency_ms, attrs)
+                    if otel_trace is not None:
+                        current_span = otel_trace.get_current_span()
+                        current_span.set_attribute(
+                            "voice.agent.time_to_first_delta_ms", latency_ms
+                        )
                 reply_parts.append(delta)
                 # Forward the raw delta so the UI extracts *status* pills exactly
                 # like the typed path.
                 await self._send_text({"type": "delta", "text": delta})
                 for sentence in streamer.feed(delta):
                     state["prose"] += 1
-                    await self._tts_queue.put(sentence)
+                    await self._queue_tts(sentence)
         elif etype in ("response.completed", "response.incomplete"):
             rid = (payload.get("response") or {}).get("id")
             if rid:
@@ -879,7 +1145,7 @@ class VoiceSession:
             if state["prose"] == 0 and self._tts_queue.empty() and not self._speaking:
                 opener = random.choice(PROGRESS_OPENERS)
                 await self._send_text({"type": "progress", "text": opener})
-                await self._tts_queue.put(opener)
+                await self._queue_tts(opener)
             while not self._cancelled:
                 await asyncio.sleep(PROGRESS_INTERVAL_MS / 1000.0)
                 if self._cancelled:
@@ -892,7 +1158,7 @@ class VoiceSession:
                         else random.choice(PROGRESS_WORKING_GENERIC)
                     )
                     await self._send_text({"type": "progress", "text": line})
-                    await self._tts_queue.put(line)
+                    await self._queue_tts(line)
         except asyncio.CancelledError:
             pass
 
@@ -901,15 +1167,29 @@ class VoiceSession:
         if self._tts_task is None or self._tts_task.done():
             self._tts_task = asyncio.ensure_future(self._tts_worker_loop())
 
+    async def _queue_tts(self, sentence: str) -> None:
+        parent_context = otel_context.get_current() if otel_context is not None else None
+        await self._tts_queue.put((sentence, parent_context))
+
     async def _tts_worker_loop(self) -> None:
         while True:
-            sentence = await self._tts_queue.get()
+            item = await self._tts_queue.get()
             try:
-                if sentence is None:
+                if item is None:
                     return
+                sentence, parent_context = item
                 if self._cancelled or not sentence.strip():
                     continue
-                await self._synthesize_and_stream(sentence)
+                token = (
+                    otel_context.attach(parent_context)
+                    if otel_context is not None and parent_context is not None
+                    else None
+                )
+                try:
+                    await self._synthesize_and_stream(sentence)
+                finally:
+                    if otel_context is not None and token is not None:
+                        otel_context.detach(token)
             finally:
                 self._tts_queue.task_done()
 
@@ -928,11 +1208,13 @@ class VoiceSession:
     async def _synthesize_and_stream(self, sentence: str) -> None:
         import azure.cognitiveservices.speech as speechsdk
 
+        started_at = time.perf_counter()
+        attributes = {"voice.tts.provider": "azure_speech"}
         if not self._speaking:
             self._speaking = True
             await self._send_text({"type": "speaking_start"})
 
-        async def _run(voice_name: str) -> bool:
+        async def _run(voice_name: str) -> tuple[bool, int]:
             synth = self._make_synthesizer(voice_name)
             result = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: synth.speak_text_async(sentence).get()
@@ -942,9 +1224,17 @@ class VoiceSession:
                 data = result.audio_data or b""
                 for i in range(0, len(data), TTS_FRAME_BYTES):
                     if self._cancelled:
-                        return True
+                        return True, len(data)
+                    if not self._first_audio_sent and self._turn_ready_at is not None:
+                        self._first_audio_sent = True
+                        first_audio_ms = (time.perf_counter() - self._turn_ready_at) * 1000
+                        _record(_turn_first_audio, first_audio_ms)
+                        if otel_trace is not None:
+                            otel_trace.get_current_span().set_attribute(
+                                "voice.turn.time_to_first_audio_ms", first_audio_ms
+                            )
                     await self._send_bytes(data[i : i + TTS_FRAME_BYTES])
-                return True
+                return True, len(data)
             if result.reason == speechsdk.ResultReason.Canceled:
                 details = result.cancellation_details
                 logger.warning(
@@ -953,16 +1243,38 @@ class VoiceSession:
                     details.reason,
                     details.error_details,
                 )
-                return False
-            return False
+                return False, 0
+            return False, 0
 
-        try:
-            ok = await _run(SPEECH_VOICE_NAME)
-            if not ok and SPEECH_VOICE_FALLBACK and SPEECH_VOICE_FALLBACK != SPEECH_VOICE_NAME:
-                logger.info("Retrying TTS with fallback voice %s", SPEECH_VOICE_FALLBACK)
-                await _run(SPEECH_VOICE_FALLBACK)
-        except Exception:
-            logger.warning("TTS synthesis failed.", exc_info=True)
+        with _span("voice.tts", attributes) as span:
+            try:
+                voice_name = SPEECH_VOICE_NAME
+                ok, audio_bytes = await _run(voice_name)
+                used_fallback = False
+                if not ok and SPEECH_VOICE_FALLBACK and SPEECH_VOICE_FALLBACK != SPEECH_VOICE_NAME:
+                    used_fallback = True
+                    voice_name = SPEECH_VOICE_FALLBACK
+                    logger.info("Retrying TTS with fallback voice %s", voice_name)
+                    ok, audio_bytes = await _run(voice_name)
+                audio_ms = audio_bytes / (SAMPLE_RATE * CHANNELS * (BITS_PER_SAMPLE // 8)) * 1000
+                if span is not None:
+                    span.set_attribute("voice.tts.voice", voice_name)
+                    span.set_attribute("voice.tts.fallback", used_fallback)
+                    span.set_attribute("voice.tts.input.characters", len(sentence))
+                    span.set_attribute("voice.tts.output_audio.bytes", audio_bytes)
+                    span.set_attribute("voice.tts.output_audio.duration_ms", audio_ms)
+                if not ok:
+                    _record_failure("tts", code="synthesis_canceled")
+                    _set_span_error(span, code="synthesis_canceled")
+            except Exception as exc:
+                logger.warning("TTS synthesis failed.", exc_info=True)
+                _record_failure("tts", exc)
+                _set_span_error(span, exc)
+            finally:
+                duration_ms = (time.perf_counter() - started_at) * 1000
+                _record(_tts_duration, duration_ms, attributes)
+                if span is not None:
+                    span.set_attribute("voice.tts.duration_ms", duration_ms)
 
     # -- lifecycle ----------------------------------------------------------
     async def close(self) -> None:
@@ -971,7 +1283,9 @@ class VoiceSession:
         if self._turn_task and not self._turn_task.done():
             self._turn_task.cancel()
         if self._tts_task and not self._tts_task.done():
-            await self._tts_queue.put(None)
+            self._tts_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._tts_task
         if self._speaking:
             self._speaking = False
 
@@ -985,16 +1299,23 @@ async def drive_connection(
     incoming: AsyncIterator[Any],
     session_id: Optional[str] = None,
     call_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> None:
     """Drive one voice connection given an async iterator of inbound messages.
 
     ``incoming`` yields ``str`` (JSON control frames) or ``bytes`` (PCM audio).
     """
     session = VoiceSession(
-        agent, send_text, send_bytes, session_id=session_id, call_id=call_id
+        agent,
+        send_text,
+        send_bytes,
+        session_id=session_id,
+        call_id=call_id,
+        user_id=user_id,
     )
     try:
         async for message in incoming:
+            session.record_received_frame(message)
             if isinstance(message, (bytes, bytearray)):
                 await session.on_audio(bytes(message))
             elif isinstance(message, str):
@@ -1042,11 +1363,13 @@ async def run_ws_server(agent: Any, *, host: str = "0.0.0.0", port: Optional[int
         # Platform per-request call id (present on hosted protocol v2.0.0
         # upgrades; absent in local dev). Forwarded to the loopback /responses.
         call_id = None
+        user_id = None
         try:
             request = getattr(websocket, "request", None)
             hdrs = getattr(request, "headers", None)
             if hdrs is not None:
-                call_id = hdrs.get("x-agent-foundry-call-id")
+                call_id = hdrs.get(FOUNDRY_CALL_ID_HEADER)
+                user_id = hdrs.get(FOUNDRY_USER_ID_HEADER)
         except Exception:
             pass
 
@@ -1072,6 +1395,7 @@ async def run_ws_server(agent: Any, *, host: str = "0.0.0.0", port: Optional[int
                 incoming=incoming(),
                 session_id=session_id,
                 call_id=call_id,
+                user_id=user_id,
             )
         finally:
             logger.info("Voice WS connection closed.")
@@ -1086,7 +1410,7 @@ async def run_ws_server(agent: Any, *, host: str = "0.0.0.0", port: Optional[int
 
 
 def register_invocations_ws_route(agent: Any, host_server: Any) -> bool:
-    """Mount the ``/invocations_ws`` voice route on the agent's Starlette host.
+    """Register the voice handler through the Agent Server invocations SDK.
 
     The Foundry hosted-agent platform proxies **every** declared protocol
     (``responses`` *and* ``invocations_ws``) to the single agentserver port
@@ -1097,25 +1421,19 @@ def register_invocations_ws_route(agent: Any, host_server: Any) -> bool:
     through the Foundry gateway (which forwards the upgrade to the agentserver
     port and returns 403 when no ``/invocations_ws`` route exists there).
 
-    :class:`ResponsesHostServer` is a :class:`starlette.applications.Starlette`
-    subclass, so — exactly like the SDK's own ``_WSHandlerMixin`` — we append a
-    :class:`~starlette.routing.WebSocketRoute` to ``host_server.router.routes``
-    before the app starts serving. The Starlette WebSocket is adapted to the
-    ``send_text`` / ``send_bytes`` / ``incoming`` interface that
-    :func:`drive_connection` expects. Returns ``True`` when the route is
-    registered (voice available), ``False`` otherwise.
+    ``host_server`` composes :class:`InvocationAgentServerHost` with the
+    Responses and optional Activity hosts. Registering with ``ws_handler`` lets
+    the SDK own accept/close handling, keep-alive, the connection-scoped OTel
+    span, and structured lifecycle metrics. Returns ``True`` when registered.
     """
     if not voice_available():
         return False
 
-    from starlette.routing import WebSocketRoute
-    from starlette.websockets import WebSocket, WebSocketDisconnect
+    from starlette.websockets import WebSocket
 
     prewarm_speech_auth()
 
     async def endpoint(websocket: WebSocket) -> None:
-        await websocket.accept()
-
         session_id = websocket.query_params.get(
             "agent_session_id"
         ) or websocket.query_params.get("sessionId")
@@ -1123,7 +1441,8 @@ def register_invocations_ws_route(agent: Any, host_server: Any) -> bool:
         # Forwarded to the loopback /responses call so the hosted responses
         # handler accepts it. Logged present/ABSENT so we can tell whether the
         # platform injects it on invocations_ws upgrades.
-        call_id = websocket.headers.get("x-agent-foundry-call-id")
+        call_id = websocket.headers.get(FOUNDRY_CALL_ID_HEADER)
+        user_id = websocket.headers.get(FOUNDRY_USER_ID_HEADER)
 
         async def send_text(obj: dict) -> None:
             await websocket.send_text(json.dumps(obj))
@@ -1132,20 +1451,17 @@ def register_invocations_ws_route(agent: Any, host_server: Any) -> bool:
             await websocket.send_bytes(data)
 
         async def incoming() -> AsyncIterator[Any]:
-            try:
-                while True:
-                    message = await websocket.receive()
-                    if message.get("type") == "websocket.disconnect":
-                        break
-                    text = message.get("text")
-                    if text is not None:
-                        yield text
-                        continue
-                    data = message.get("bytes")
-                    if data is not None:
-                        yield data
-            except WebSocketDisconnect:
-                return
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+                text = message.get("text")
+                if text is not None:
+                    yield text
+                    continue
+                data = message.get("bytes")
+                if data is not None:
+                    yield data
 
         logger.info(
             "Voice WS connection opened on agentserver port (session_id=%s, foundry_call_id=%s).",
@@ -1159,27 +1475,18 @@ def register_invocations_ws_route(agent: Any, host_server: Any) -> bool:
                 incoming=incoming(),
                 session_id=session_id,
                 call_id=call_id,
+                user_id=user_id,
             )
         finally:
             logger.info("Voice WS connection closed (agentserver port).")
-            try:
-                await websocket.close()
-            except Exception:
-                pass
 
-    router = getattr(host_server, "router", None)
-    routes = getattr(router, "routes", None)
-    if routes is None:
+    ws_handler = getattr(host_server, "ws_handler", None)
+    if not callable(ws_handler):
         logger.warning(
-            "Cannot mount voice route: host server has no mutable router.routes."
+            "Cannot register voice route: host server has no ws_handler decorator."
         )
         return False
 
-    # Idempotent: skip if a WebSocketRoute for the path already exists.
-    for route in routes:
-        if isinstance(route, WebSocketRoute) and getattr(route, "path", None) == VOICE_WS_PATH:
-            return True
-
-    routes.append(WebSocketRoute(VOICE_WS_PATH, endpoint, name="invocations_ws"))
-    logger.info("Voice route mounted on agentserver port at %s.", VOICE_WS_PATH)
+    ws_handler(endpoint)
+    logger.info("Voice route registered through ws_handler at %s.", VOICE_WS_PATH)
     return True

@@ -151,8 +151,24 @@ class VoiceController {
       this.handlers?.onError("Voice connection error.");
       this.setStatus("error");
     };
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (this.ws === ws) this.ws = null;
+      const interrupted =
+        this.capturing ||
+        this._status === "connecting" ||
+        this._status === "listening" ||
+        this._status === "thinking" ||
+        this._status === "speaking";
+      if (!interrupted) return;
+      this.teardownCapture();
+      this.stopPlayback();
+      if (!this.prewarming) {
+        const detail = event.code === 1001
+          ? "The voice session expired. Press the microphone to reconnect."
+          : "The voice connection closed. Press the microphone to reconnect.";
+        this.handlers?.onError(detail);
+        this.setStatus("error");
+      }
     };
     await this.waitForOpen(ws);
     return ws;

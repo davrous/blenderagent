@@ -47,11 +47,20 @@ WORKDIR /app
 
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
+# Microsoft-managed development environments require packages to flow through
+# the approved feed proxy, which enforces package-age policy. The host's global
+# pip.conf is not copied into this Ubuntu image, so configure the same index
+# explicitly instead of falling through to blocked files.pythonhosted.org URLs.
+ARG PIP_INDEX_URL=https://packagefeedproxy.microsoft.io/pypi/simple/
+ENV PIP_INDEX_URL=$PIP_INDEX_URL \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-COPY requirements.txt .
-# `--pre` is required because agent-framework-foundry-hosting only ships
-# pre-release (alpha) versions today.
-RUN pip install --no-cache-dir --pre -r requirements.txt
+COPY requirements.txt requirements.lock ./
+# Required prereleases are pinned explicitly in requirements.txt. Do not use
+# global `--pre`: it also selects newly-published beta transitive dependencies.
+RUN pip install --no-cache-dir --retries "$PIP_RETRIES" --timeout "$PIP_DEFAULT_TIMEOUT" -r requirements.lock
 
 # ── 4. Copy application code ──
 COPY main.py .

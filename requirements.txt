@@ -1,14 +1,19 @@
 # Canonical hosted-agent stack (matches microsoft-foundry/foundry-samples
-# hosted-agents/agent-framework/responses/02-tools). We previously used
+# hosted-agents/agent-framework/responses/02-tools). Use the focused core and
+# Foundry distributions rather than the `agent-framework` meta-package, which
+# now installs every optional provider/framework integration. We previously used
 # `azure-ai-agentserver-agentframework`, but its `AzureAIClient`
 # unconditionally registers a `kind: prompt` agent in the Foundry project,
 # which collides with the hosted agent declared in agent.yaml and crashes
 # every turn with HTTP 400 "Agent kind mismatch".
 #
-# foundry-hosting still ships only pre-releases, so the Dockerfile must pass
-# `--pre` to pip (or this floor pins an alpha explicitly to opt in).
-agent-framework>=1.7.0
-agent-framework-foundry-hosting
+# Foundry hosting still ships only pre-releases. Pin those prereleases
+# explicitly so pip does not need a global `--pre` flag (which would also select
+# unrelated fresh beta/alpha dependencies). These versions were published by
+# 2026-07-23 and are compatible with Microsoft's package-age policy.
+agent-framework-core==1.12.1
+agent-framework-foundry==1.10.3
+agent-framework-foundry-hosting==1.0.0b260722
 python-dotenv>=1.2.2
 azure-identity>=1.25.3
 azure-storage-blob>=12.28.0
@@ -17,6 +22,10 @@ debugpy>=1.8.20
 # text-only if Speech is not configured — but always installed so the voice
 # WebSocket can start when ENABLE_VOICE + SPEECH_* are set.
 azure-cognitiveservices-speech>=1.40.0
+azure-ai-agentserver-core==2.0.0b9
+azure-ai-agentserver-invocations==1.0.0b7
+azure-ai-agentserver-responses==1.0.0b9
+opentelemetry-api>=1.27.0
 websockets>=13.0
 httpx>=0.27.0
 

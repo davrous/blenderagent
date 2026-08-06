@@ -11,9 +11,9 @@ plain text deltas, so Teams collapses them into a single generic "working on
 it" indicator.
 
 This module speaks the Activity protocol directly. It composes
-``ActivityAgentServerHost`` (from ``azure-ai-agentserver-activity``) with the
-existing ``ResponsesHostServer`` into ONE multi-protocol server, so a single
-container serves:
+``ActivityAgentServerHost`` (from ``azure-ai-agentserver-activity``),
+``InvocationAgentServerHost`` and the existing ``ResponsesHostServer`` into
+ONE multi-protocol server, so a single container serves:
 
     POST /responses         → the web chat + the voice loopback (unchanged)
     POST /activity/messages → Teams / M365 Copilot        (and /api/messages)
@@ -183,6 +183,7 @@ try:
     from agent_framework import Content, Message
     from agent_framework_foundry_hosting import ResponsesHostServer
     from azure.ai.agentserver.activity import ActivityAgentServerHost
+    from azure.ai.agentserver.invocations import InvocationAgentServerHost
     from microsoft_agents.activity import Activity, Attachment, Channels, DeliveryModes
     from microsoft_agents.hosting.core.storage import MemoryStorage
 except Exception as exc:  # pragma: no cover - exercised only on broken installs
@@ -218,8 +219,12 @@ def build_multi_protocol_host(agent: Any) -> Any:
     to ``ResponsesHostServer``.
     """
 
-    class BlenderAgentHost(ActivityAgentServerHost, ResponsesHostServer):  # type: ignore[misc]
-        """Serves /responses (web chat, voice loopback) and /activity/messages (Teams)."""
+    class BlenderAgentHost(  # type: ignore[misc]
+        ActivityAgentServerHost,
+        InvocationAgentServerHost,
+        ResponsesHostServer,
+    ):
+        """Serves Responses, Activity, and SDK-managed invocations_ws routes."""
 
     # The host defaults to in-memory storage, which would make the transcript
     # the ONLY part of a conversation that does not survive an idle/resume

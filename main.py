@@ -2498,7 +2498,19 @@ This environment runs **Blender 4.4**. The following Blender 3.x APIs were remov
         server = None
 
     if server is None:
-        server = ResponsesHostServer(agent)
+        try:
+            from azure.ai.agentserver.invocations import InvocationAgentServerHost
+
+            class BlenderVoiceHost(InvocationAgentServerHost, ResponsesHostServer):
+                """Responses plus the SDK-managed invocations_ws lifecycle."""
+
+            server = BlenderVoiceHost(agent=agent)
+        except Exception:
+            logger.warning(
+                "Invocations host unavailable; continuing with responses only.",
+                exc_info=True,
+            )
+            server = ResponsesHostServer(agent)
 
     # Serve the text Responses API. Optionally also serve the voice WebSocket
     # (speech-in / speech-out) alongside it when Speech is configured. The voice

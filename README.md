@@ -384,7 +384,7 @@ docker run -it --rm -p 8088:8088 -p 8089:8089 \
 
 ### Local development (without Docker)
 
-1. Install dependencies: `pip install -r requirements.txt`
+1. Install the audited dependency lock: `pip install -r requirements.lock`
 2. Start Blender with the socket server:
    ```bash
    blender --background --python blender_startup.py
@@ -393,6 +393,32 @@ docker run -it --rm -p 8088:8088 -p 8089:8089 \
    ```bash
    python main.py --port 8088
    ```
+
+### Microsoft package-age policy
+
+Microsoft-managed development environments route Python and npm packages
+through `packagefeedproxy.microsoft.io` and can block artifacts published too
+recently. The host machine receives that configuration globally, but a fresh
+Ubuntu Docker image does not. The Dockerfile therefore sets its Python index to
+the approved Microsoft feed explicitly.
+
+`requirements.txt` contains direct dependencies, while `requirements.lock`
+pins the complete Linux/Python 3.12 graph. `package-policy-constraints.txt`
+records packages that needed an older version for the 2026-07-30 policy
+snapshot. To refresh the lock after the policy window advances:
+
+```bash
+uv pip compile requirements.txt \
+  --constraint package-policy-constraints.txt \
+  --output-file requirements.lock \
+  --index-url https://packagefeedproxy.microsoft.io/pypi/simple/ \
+  --prerelease if-necessary-or-explicit \
+  --python-version 3.12 \
+  --python-platform x86_64-manylinux_2_28
+```
+
+Review and advance the dated constraints before regenerating; do not restore a
+global pip `--pre`, because it selects unrelated newly published betas.
 
 ## Environment Variables
 
@@ -413,12 +439,58 @@ docker run -it --rm -p 8088:8088 -p 8089:8089 \
 ### Voice (speech-in / speech-out)
 
 The agent optionally exposes a **voice WebSocket** (`invocations_ws` protocol,
-port `8089`) alongside the text Responses API. Microphone audio is transcribed
-with Azure Speech STT, sent through the *same* agent turn (so voice and text
-share one server-side Blender scene keyed by `conversation_id`), and the spoken
-reply is streamed back as 24 kHz PCM. Screenshots, renders, and download links
-are never read aloud — instead a short spoken cue announces them while the image
-or download button still renders in the web chat.
+port `8089`) alongside the text Responses API. In Foundry, the route is
+registered with the `azure-ai-agentserver-invocations` SDK's `ws_handler`; the
+SDK owns WebSocket accept/close handling, keep-alive, connection tracing, and
+structured lifecycle telemetry. The standalone `:8089` server remains for local
+Docker development.
+
+Microphone audio is transcribed with Azure Speech STT, sent through the *same*
+agent turn, and the spoken reply is streamed back as 24 kHz PCM. Screenshots,
+renders, and download links are never read aloud — instead a short spoken cue
+announces them while the image or download button still renders in the web
+chat.
+
+#### Voice and typed history
+
+The browser UUID ties together three distinct pieces of state:
+
+- The Foundry `agent_session_id` provides sandbox and Blender-scene affinity.
+- A Foundry Responses `conversation` (`conv_...`) owns the persisted transcript.
+- The client-visible message list renders typed and voice turns together.
+
+The web relay resolves the same session and conversation for both transports
+and injects both IDs into voice control frames. The voice pipeline passes the
+conversation into its in-container `/responses` call, so typed → voice and
+voice → typed turns now share model context and portal trace grouping. Locally,
+voice returns its real response ID and advances the same
+`previous_response_id` chain as typed chat. A bounded inline voice history is
+used only as a hosted degradation path if the relay cannot resolve the Foundry
+conversation.
+
+#### Voice observability
+
+The relay forwards a valid W3C `traceparent`/`tracestate`/`baggage` set when one
+arrives; otherwise the Agent Server SDK starts the connection's root span. The
+voice agent injects that active context into the local `/responses` request,
+producing this trace shape in Application Insights:
+
+```text
+websocket_session                     (Agent Server SDK)
+└── voice.turn
+  ├── voice.stt                     (Azure Speech recognition)
+  ├── voice.agent                   (Responses loopback)
+  │   └── invoke_agent/model/tools  (Agent Framework instrumentation)
+  └── voice.tts                     (one span per synthesized utterance)
+```
+
+Metrics cover WebSocket frame/byte counts, STT and finalization duration,
+agent duration and time to first text delta, TTS duration, total turn duration,
+time to first audio, and failures by stage/error type. Span attributes include
+sample rate, locale, audio byte/duration counts, and text character counts.
+They deliberately exclude raw PCM and transcript content. Playable recordings
+still require a separate consent, encrypted storage, retention, and
+trace-correlated artifact design.
 
 The voice path is **fully optional**: if `ENABLE_VOICE` is off or Speech is not
 configured, the agent runs text-only and the voice server never starts.
@@ -441,6 +513,14 @@ python main.py --port 8088
 
 Then start the web chat (`webchat/`) with `VOICE_ENABLED=true` and hold the 🎙️
 mic button to talk.
+
+**Run the dependency-light voice checks:**
+
+```bash
+python devTools/test_voice_pipeline.py
+cd webchat && npm --workspace server run build && cd ..
+node devTools/test_voice_relay.mjs
+```
 
 
 ## Agent Tools
