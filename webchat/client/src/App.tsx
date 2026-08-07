@@ -39,9 +39,14 @@ export function App() {
     });
     // Warm up the voice connection now so the hosted container cold-starts in
     // the background — otherwise the FIRST mic press is lost to invocations_ws
-    // cold-start and the user has to press twice.
-    void voice.prewarm();
-    return () => voice.dispose();
+    // cold-start and the user has to press twice. Defer one event-loop turn so
+    // React StrictMode's development-only mount → cleanup → mount probe cancels
+    // its throwaway effect before it can open a duplicate WebSocket.
+    const prewarmTimer = window.setTimeout(() => void voice.prewarm(), 0);
+    return () => {
+      window.clearTimeout(prewarmTimer);
+      voice.dispose();
+    };
   }, [voiceAvailable]);
 
   return (

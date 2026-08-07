@@ -28,6 +28,10 @@ interface SessionCacheEntry {
 
 let versionCache: VersionCacheEntry | null = null;
 const sessionCache = new Map<string, SessionCacheEntry>();
+const sessionCreations = new Map<
+  string,
+  Promise<{ agentSessionId: string; agentVersion: string }>
+>();
 // Foundry Responses `conversation` (conv_...) per browser conversation id. This
 // is DISTINCT from the hosted-agent session: the session gives compute/scene
 // affinity, while the conversation gives platform-managed history AND is what
@@ -35,6 +39,22 @@ const sessionCache = new Map<string, SessionCacheEntry>();
 // session leaves gen_ai.conversation.id empty, so webchat turns never show up
 // as a conversation in the portal / Monitor tab.
 const conversationCache = new Map<string, string>();
+const conversationCreations = new Map<string, Promise<string>>();
+
+export function runSingleFlight<Key, Value>(
+  inFlight: Map<Key, Promise<Value>>,
+  key: Key,
+  create: () => Promise<Value>,
+): Promise<Value> {
+  const existing = inFlight.get(key);
+  if (existing) return existing;
+
+  const pending = create().finally(() => {
+    if (inFlight.get(key) === pending) inFlight.delete(key);
+  });
+  inFlight.set(key, pending);
+  return pending;
+}
 
 function buildHeaders(token: string, contentType?: string): Record<string, string> {
   const h: Record<string, string> = {
@@ -110,55 +130,58 @@ export async function getOrCreateSession(
     };
   }
 
-  const agentVersion = await fetchLatestVersion();
-  const token = await ensureToken();
+  return runSingleFlight(sessionCreations, conversationId, async () => {
+    const agentVersion = await fetchLatestVersion();
+    const token = await ensureToken();
 
-  const url = withApiVersion(`${config.foundryAgentBase}/endpoint/sessions`);
-  const isolationKey = conversationId;
+    const url = withApiVersion(`${config.foundryAgentBase}/endpoint/sessions`);
+    const isolationKey = conversationId;
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      ...buildHeaders(token, "application/json"),
-      "x-session-isolation-key": isolationKey,
-    },
-    body: JSON.stringify({
-      version_indicator: {
-        type: "version_ref",
-        agent_version: agentVersion,
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        ...buildHeaders(token, "application/json"),
+        "x-session-isolation-key": isolationKey,
       },
-    }),
-  });
+      body: JSON.stringify({
+        version_indicator: {
+          type: "version_ref",
+          agent_version: agentVersion,
+        },
+      }),
+    });
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(
-      `Failed to create session: ${res.status} ${text.slice(0, 500)}`,
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(
+        `Failed to create session: ${res.status} ${text.slice(0, 500)}`,
+      );
+    }
+
+    const body = (await res.json()) as { agent_session_id?: string };
+    const agentSessionId = body.agent_session_id;
+    if (!agentSessionId) {
+      throw new Error("Session create response missing agent_session_id");
+    }
+
+    sessionCache.set(conversationId, {
+      agentSessionId,
+      isolationKey,
+      agentVersion,
+      createdAt: Date.now(),
+    });
+
+    console.log(
+      `[sessions] created agent_session_id=${agentSessionId} for conversation=${conversationId} (agentVersion=${agentVersion})`,
     );
-  }
 
-  const body = (await res.json()) as { agent_session_id?: string };
-  const agentSessionId = body.agent_session_id;
-  if (!agentSessionId) {
-    throw new Error("Session create response missing agent_session_id");
-  }
-
-  sessionCache.set(conversationId, {
-    agentSessionId,
-    isolationKey,
-    agentVersion,
-    createdAt: Date.now(),
+    return { agentSessionId, agentVersion };
   });
-
-  console.log(
-    `[sessions] created agent_session_id=${agentSessionId} for conversation=${conversationId} (agentVersion=${agentVersion})`,
-  );
-
-  return { agentSessionId, agentVersion };
 }
 
 export function evictSession(conversationId: string): void {
   sessionCache.delete(conversationId);
+  sessionCreations.delete(conversationId);
 }
 
 /**
@@ -173,39 +196,85 @@ export async function getOrCreateConversation(
   const cached = conversationCache.get(conversationId);
   if (cached) return cached;
 
-  const token = await ensureToken();
-  const url = withApiVersion(
-    `${config.foundryAgentBase}/endpoint/protocols/openai/conversations`,
-  );
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: buildHeaders(token, "application/json"),
-    body: JSON.stringify({ metadata: { webchat_conversation_id: conversationId } }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(
-      `Failed to create conversation: ${res.status} ${text.slice(0, 500)}`,
+  return runSingleFlight(conversationCreations, conversationId, async () => {
+    const token = await ensureToken();
+    const url = withApiVersion(
+      `${config.foundryAgentBase}/endpoint/protocols/openai/conversations`,
     );
-  }
 
-  const body = (await res.json()) as { id?: string };
-  const foundryConversationId = body.id;
-  if (!foundryConversationId) {
-    throw new Error("Conversation create response missing id");
-  }
+    const res = await fetch(url, {
+      method: "POST",
+      headers: buildHeaders(token, "application/json"),
+      body: JSON.stringify({ metadata: { webchat_conversation_id: conversationId } }),
+    });
 
-  conversationCache.set(conversationId, foundryConversationId);
-  console.log(
-    `[conversations] created ${foundryConversationId} for conversation=${conversationId}`,
-  );
-  return foundryConversationId;
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(
+        `Failed to create conversation: ${res.status} ${text.slice(0, 500)}`,
+      );
+    }
+
+    const body = (await res.json()) as { id?: string };
+    const foundryConversationId = body.id;
+    if (!foundryConversationId) {
+      throw new Error("Conversation create response missing id");
+    }
+
+    conversationCache.set(conversationId, foundryConversationId);
+    console.log(
+      `[conversations] created ${foundryConversationId} for conversation=${conversationId}`,
+    );
+    return foundryConversationId;
+  });
 }
 
 export function evictConversation(conversationId: string): void {
   conversationCache.delete(conversationId);
+  conversationCreations.delete(conversationId);
+}
+
+export interface ConversationMessageItem {
+  type: "message";
+  role: "user" | "assistant";
+  content: string | Array<Record<string, unknown>>;
+  status?: "completed";
+}
+
+/**
+ * Append items to an existing Foundry Responses conversation.
+ *
+ * Hosted voice turns read conversation history with `store:false`; after the
+ * turn succeeds, the authenticated relay commits the recognized user message
+ * and final assistant reply through this endpoint.
+ */
+export async function appendConversationItems(
+  conversationId: string,
+  items: ConversationMessageItem[],
+): Promise<void> {
+  if (config.mode !== "foundry" || items.length === 0) return;
+
+  const token = await ensureToken();
+  const url = withApiVersion(
+    `${config.foundryAgentBase}/endpoint/protocols/openai/conversations/${encodeURIComponent(conversationId)}/items`,
+  );
+
+  let lastError = "unknown error";
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: buildHeaders(token, "application/json"),
+      body: JSON.stringify({ items }),
+    });
+    if (res.ok) return;
+
+    const text = await res.text().catch(() => "");
+    lastError = `${res.status} ${text.slice(0, 500)}`;
+    if (res.status < 500 || attempt === 3) break;
+    await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
+  }
+
+  throw new Error(`Failed to append conversation items: ${lastError}`);
 }
 
 export async function deleteSession(conversationId: string): Promise<void> {

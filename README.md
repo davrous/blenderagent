@@ -468,6 +468,21 @@ voice returns its real response ID and advances the same
 used only as a hosted degradation path if the relay cannot resolve the Foundry
 conversation.
 
+Session and conversation creation are single-flight per browser UUID: concurrent
+voice prewarm, reconnect, and typed requests await the same pending create call
+instead of provisioning competing Foundry IDs. In development, voice prewarm is
+also deferred one event-loop turn so React StrictMode's throwaway effect cannot
+open a second WebSocket.
+
+Voice runs inside an `invocations_ws` connection and calls the container's
+Responses handler only for agent execution/history loading. That nested call uses
+`store:false`: trying to persist it through the WebSocket invocation's platform
+call context causes the Foundry `/storage/responses` endpoint to return HTTP 500.
+After a successful voice turn, the authenticated web relay appends exactly two
+items to the shared `conv_...` through the Conversation Items API: the recognized
+user message and final assistant text. Typed turns continue using normal
+Responses-managed persistence.
+
 #### Voice observability
 
 The relay forwards a valid W3C `traceparent`/`tracestate`/`baggage` set when one

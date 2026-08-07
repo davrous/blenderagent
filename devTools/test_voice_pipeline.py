@@ -101,6 +101,20 @@ def test_loopback_identity_headers():
     _check("user id forwarded", headers.get(vp.FOUNDRY_USER_ID_HEADER), "user-1")
 
 
+def test_hosted_conversation_disables_nested_storage():
+    session = _session()
+    session._foundry_conversation_id = "conv_shared"
+
+    original = vp._is_hosted
+    vp._is_hosted = lambda: True
+    try:
+        body = session._build_agent_request("voice turn")
+    finally:
+        vp._is_hosted = original
+
+    _check("hosted voice disables nested response storage", body.get("store"), False)
+
+
 async def test_tts_completion_order():
     frames = []
 
@@ -143,6 +157,7 @@ async def main():
     test_local_response_chain_payload()
     test_hosted_fallback_payload()
     test_loopback_identity_headers()
+    test_hosted_conversation_disables_nested_storage()
     await test_tts_completion_order()
     print("\nFAILURES PRESENT" if _check.failed else "\nall checks passed")
     return 1 if _check.failed else 0

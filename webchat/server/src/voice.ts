@@ -3,7 +3,12 @@ import type { Server, IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
 import { config } from "./config.js";
 import { getBearerToken } from "./auth.js";
-import { getOrCreateConversation, getOrCreateSession } from "./sessions.js";
+import {
+  appendConversationItems,
+  getOrCreateConversation,
+  getOrCreateSession,
+  type ConversationMessageItem,
+} from "./sessions.js";
 
 const VOICE_PATH = "/api/voice";
 const TRACEPARENT_RE = /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/i;
@@ -32,6 +37,39 @@ export function buildTraceHeaders(req: IncomingMessage): Record<string, string> 
   if (tracestate) headers.tracestate = tracestate;
   if (baggage) headers.baggage = baggage;
   return headers;
+}
+
+export function buildVoiceHistoryItems(
+  transcript: string,
+  reply: string,
+): ConversationMessageItem[] {
+  const items: ConversationMessageItem[] = [];
+  if (transcript.trim()) {
+    items.push({ type: "message", role: "user", content: transcript.trim() });
+  }
+  if (reply.trim()) {
+    items.push({
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      content: [
+        {
+          type: "output_text",
+          text: reply,
+          annotations: [],
+          logprobs: [],
+        },
+      ],
+    });
+  }
+  return items;
+}
+
+export function requiresVoiceHistoryCommit(frame: Record<string, unknown>): boolean {
+  return (
+    frame.type === "done" &&
+    (frame.history_commit_required === true || frame.history_persisted === false)
+  );
 }
 
 /**
@@ -167,6 +205,8 @@ function relay(
   foundryConversationId?: string,
 ): void {
   const pending: Array<{ data: RawData; isBinary: boolean }> = [];
+  const committedResponses = new Set<string>();
+  let finalTranscript = "";
   let upstreamOpen = false;
 
   browser.on("message", (data: RawData, isBinary: boolean) => {
@@ -197,11 +237,49 @@ function relay(
         const text = Array.isArray(data)
           ? Buffer.concat(data).toString("utf-8")
           : data.toString();
-        if (text.includes('"error"')) {
-          const obj = JSON.parse(text);
-          if (obj && obj.type === "error") {
-            console.error("[voice] agent error frame:", obj.message ?? text.slice(0, 400));
+        const obj = JSON.parse(text);
+        if (obj?.type === "stt" && obj.final && typeof obj.text === "string") {
+          finalTranscript = obj.text;
+        }
+        if (obj?.type === "error") {
+          console.error("[voice] agent error frame:", obj.message ?? text.slice(0, 400));
+        }
+        if (
+          obj &&
+          requiresVoiceHistoryCommit(obj) &&
+          foundryConversationId
+        ) {
+          const responseId = typeof obj.history_response_id === "string"
+            ? obj.history_response_id
+            : "unknown";
+          const commitKey = `${foundryConversationId}:${responseId}`;
+          if (committedResponses.has(commitKey)) {
+            sendTo(browser, data, false);
+            return;
           }
+
+          const items = buildVoiceHistoryItems(
+            finalTranscript,
+            typeof obj.reply === "string" ? obj.reply : "",
+          );
+          void (async () => {
+            try {
+              await appendConversationItems(foundryConversationId, items);
+              committedResponses.add(commitKey);
+              obj.history_committed = true;
+              console.log(
+                `[voice] committed ${items.length} conversation item(s) (conversation=${foundryConversationId}, response=${responseId})`,
+              );
+            } catch (err) {
+              obj.history_commit_failed = true;
+              console.error(
+                "[voice] conversation history commit failed:",
+                err instanceof Error ? err.message : err,
+              );
+            }
+            sendTo(browser, Buffer.from(JSON.stringify(obj)), false);
+          })();
+          return;
         }
       } catch {
         /* not JSON — ignore */

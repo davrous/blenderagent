@@ -923,6 +923,10 @@ class VoiceSession:
                 "type": "done",
                 "reply": reply,
                 "response_id": None if _is_hosted() else self._previous_response_id,
+                "history_response_id": self._previous_response_id,
+                "history_commit_required": bool(
+                    _is_hosted() and self._foundry_conversation_id
+                ),
             }
         )
 
@@ -972,6 +976,11 @@ class VoiceSession:
         }
         if self._foundry_conversation_id:
             body["conversation"] = self._foundry_conversation_id
+            # The WebSocket invocation's platform call context cannot reliably
+            # persist a nested Responses object (the terminal storage call
+            # returns 500). History is committed explicitly by the authenticated
+            # web relay after the successful voice turn instead.
+            body["store"] = False
         elif self._previous_response_id:
             body["previous_response_id"] = self._previous_response_id
         if self._agent_session_id:
