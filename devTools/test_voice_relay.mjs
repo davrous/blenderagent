@@ -3,6 +3,7 @@
 
 import assert from "node:assert/strict";
 import {
+  buildFoundryVoiceWsUrl,
   buildTraceHeaders,
   buildVoiceHistoryItems,
   requiresVoiceHistoryCommit,
@@ -26,6 +27,12 @@ assert.equal(forwarded.baggage, "conversation.kind=voice");
 
 const unsafe = buildTraceHeaders({ headers: { baggage: "safe=value\r\ninjected=yes" } });
 assert.equal(unsafe.baggage, undefined);
+
+const voiceUrl = new URL(
+  buildFoundryVoiceWsUrl("session-foundry", "conv_shared"),
+);
+assert.equal(voiceUrl.searchParams.get("agent_session_id"), "session-foundry");
+assert.equal(voiceUrl.searchParams.get("conversation_id"), "conv_shared");
 
 const historyItems = buildVoiceHistoryItems(" create four cubes ", "Done.");
 assert.deepEqual(historyItems[0], {

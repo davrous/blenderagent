@@ -13,6 +13,7 @@ from types import MethodType
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import voice_pipeline as vp  # noqa: E402
+from conversation_telemetry import FoundryConversationTelemetryAgent  # noqa: E402
 
 
 async def _noop(*_args, **_kwargs):
@@ -101,6 +102,56 @@ def test_loopback_identity_headers():
     _check("user id forwarded", headers.get(vp.FOUNDRY_USER_ID_HEADER), "user-1")
 
 
+def test_conversation_trace_attributes():
+    expected = {
+        "gen_ai.conversation.id": "conv_shared",
+        "azure.ai.agentserver.conversation_id": "conv_shared",
+    }
+    _check(
+        "voice spans carry Foundry conversation",
+        vp._conversation_span_attributes("conv_shared"),
+        expected,
+    )
+    _check(
+        "missing conversation adds no trace attributes",
+        vp._conversation_span_attributes(None),
+        {},
+    )
+
+
+def test_nested_agent_telemetry_conversation():
+    from azure.ai.agentserver.core import (
+        FoundryAgentRequestContext,
+        reset_request_context,
+        set_request_context,
+    )
+
+    agent = object.__new__(FoundryConversationTelemetryAgent)
+    agent.bind_telemetry_conversation("session-foundry", "conv_shared")
+    token = set_request_context(
+        FoundryAgentRequestContext(
+            call_id=None,
+            user_id=None,
+            session_id="session-foundry",
+        )
+    )
+    try:
+        _check(
+            "nested agent spans resolve Foundry conversation",
+            agent._get_otel_conversation_id(None),
+            "conv_shared",
+        )
+    finally:
+        reset_request_context(token)
+
+    agent.unbind_telemetry_conversation("session-foundry", "conv_shared")
+    _check(
+        "closed voice connection releases telemetry binding",
+        getattr(agent, "_telemetry_conversation_bindings", {}),
+        {},
+    )
+
+
 def test_hosted_conversation_disables_nested_storage():
     session = _session()
     session._foundry_conversation_id = "conv_shared"
@@ -157,6 +208,8 @@ async def main():
     test_local_response_chain_payload()
     test_hosted_fallback_payload()
     test_loopback_identity_headers()
+    test_conversation_trace_attributes()
+    test_nested_agent_telemetry_conversation()
     test_hosted_conversation_disables_nested_storage()
     await test_tts_completion_order()
     print("\nFAILURES PRESENT" if _check.failed else "\nall checks passed")

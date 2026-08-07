@@ -120,6 +120,23 @@ def _set_span_error(span: Any, exc: BaseException | None = None, code: str | Non
         span.record_exception(exc)
     span.set_status(Status(StatusCode.ERROR, code or (str(exc)[:200] if exc else "error")))
 
+
+def _conversation_span_attributes(conversation_id: Optional[str]) -> dict[str, str]:
+    if not conversation_id:
+        return {}
+    return {
+        "gen_ai.conversation.id": conversation_id,
+        "azure.ai.agentserver.conversation_id": conversation_id,
+    }
+
+
+def _stamp_current_conversation(conversation_id: Optional[str]) -> None:
+    if not conversation_id or otel_trace is None:
+        return
+    span = otel_trace.get_current_span()
+    for key, value in _conversation_span_attributes(conversation_id).items():
+        span.set_attribute(key, value)
+
 # ── Audio format ──────────────────────────────────────────────────────────
 SAMPLE_RATE = 24000
 BITS_PER_SAMPLE = 16
@@ -471,6 +488,7 @@ class VoiceSession:
         session_id: Optional[str] = None,
         call_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        foundry_conversation_id: Optional[str] = None,
     ) -> None:
         self._agent = agent
         self._send_text_cb = send_text
@@ -483,7 +501,7 @@ class VoiceSession:
         # The session supplies sandbox affinity; the conversation supplies the
         # persisted transcript shared by typed and voice turns.
         self._agent_session_id: Optional[str] = None
-        self._foundry_conversation_id: Optional[str] = None
+        self._foundry_conversation_id: Optional[str] = foundry_conversation_id
         # Degradation only: if the web relay cannot resolve a Foundry
         # conversation, retain voice-to-voice context for this socket. Normal
         # hosted turns use `conversation`; local turns use previous_response_id.
@@ -611,6 +629,9 @@ class VoiceSession:
                     "voice.stt.language": SPEECH_RECOGNITION_LANGUAGE,
                     "audio.sample_rate": SAMPLE_RATE,
                     "audio.channels": CHANNELS,
+                    **_conversation_span_attributes(
+                        self._foundry_conversation_id
+                    ),
                 },
             )
             if _tracer is not None
@@ -826,6 +847,7 @@ class VoiceSession:
         attributes = {
             "voice.turn.mode": "hosted" if _is_hosted() else "local",
             "voice.turn.input.characters": len(transcript),
+            **_conversation_span_attributes(self._foundry_conversation_id),
         }
         with _span("voice.turn", attributes) as span:
             try:
@@ -945,6 +967,7 @@ class VoiceSession:
                 if self._fallback_history
                 else "new"
             ),
+            **_conversation_span_attributes(self._foundry_conversation_id),
         }
         with _span("voice.agent", attributes) as span:
             try:
@@ -1218,7 +1241,10 @@ class VoiceSession:
         import azure.cognitiveservices.speech as speechsdk
 
         started_at = time.perf_counter()
-        attributes = {"voice.tts.provider": "azure_speech"}
+        attributes = {
+            "voice.tts.provider": "azure_speech",
+            **_conversation_span_attributes(self._foundry_conversation_id),
+        }
         if not self._speaking:
             self._speaking = True
             await self._send_text({"type": "speaking_start"})
@@ -1309,6 +1335,7 @@ async def drive_connection(
     session_id: Optional[str] = None,
     call_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    foundry_conversation_id: Optional[str] = None,
 ) -> None:
     """Drive one voice connection given an async iterator of inbound messages.
 
@@ -1321,6 +1348,7 @@ async def drive_connection(
         session_id=session_id,
         call_id=call_id,
         user_id=user_id,
+        foundry_conversation_id=foundry_conversation_id,
     )
     try:
         async for message in incoming:
@@ -1452,6 +1480,18 @@ def register_invocations_ws_route(agent: Any, host_server: Any) -> bool:
         # platform injects it on invocations_ws upgrades.
         call_id = websocket.headers.get(FOUNDRY_CALL_ID_HEADER)
         user_id = websocket.headers.get(FOUNDRY_USER_ID_HEADER)
+        foundry_conversation_id = websocket.query_params.get("conversation_id")
+        _stamp_current_conversation(foundry_conversation_id)
+        bind_telemetry = getattr(agent, "bind_telemetry_conversation", None)
+        unbind_telemetry = getattr(agent, "unbind_telemetry_conversation", None)
+        telemetry_bound = bool(
+            session_id
+            and foundry_conversation_id
+            and callable(bind_telemetry)
+            and callable(unbind_telemetry)
+        )
+        if telemetry_bound:
+            bind_telemetry(session_id, foundry_conversation_id)
 
         async def send_text(obj: dict) -> None:
             await websocket.send_text(json.dumps(obj))
@@ -1485,8 +1525,11 @@ def register_invocations_ws_route(agent: Any, host_server: Any) -> bool:
                 session_id=session_id,
                 call_id=call_id,
                 user_id=user_id,
+                foundry_conversation_id=foundry_conversation_id,
             )
         finally:
+            if telemetry_bound:
+                unbind_telemetry(session_id, foundry_conversation_id)
             logger.info("Voice WS connection closed (agentserver port).")
 
     ws_handler = getattr(host_server, "ws_handler", None)

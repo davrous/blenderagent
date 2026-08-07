@@ -38,6 +38,7 @@ from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSettings, generate_blob_sas
 
 from blender_connection import get_blender_connection, close_blender_connection, is_blender_socket_ready
+from conversation_telemetry import FoundryConversationTelemetryAgent
 from scene_manager import SceneManager
 
 # Module-level reference so _do_render can recover the scene after a Blender crash.
@@ -2328,7 +2329,7 @@ async def main():
     # `default_options={"store": False}` tells the model the service
     # manages history (per the sample). Our scene-isolation
     # middleware persists scene state out-of-band, so this is fine.
-    agent = Agent(
+    agent = FoundryConversationTelemetryAgent(
         client=chat_client,
         middleware=[SceneIsolationMiddleware(ToolStatusMiddleware(), scene_manager)],
         default_options={"store": False},

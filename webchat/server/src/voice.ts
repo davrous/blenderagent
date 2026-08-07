@@ -154,7 +154,10 @@ function injectSession(
   return { data, isBinary };
 }
 
-function buildFoundryVoiceWsUrl(routeSessionId: string): string {
+export function buildFoundryVoiceWsUrl(
+  routeSessionId: string,
+  foundryConversationId?: string,
+): string {
   // Per the `invocations_ws` protocol (Foundry voice-agent docs + foundry-
   // samples): the project and agent are PATH segments (mirroring the Responses
   // URL), `api-version` is REQUIRED, and `agent_session_id` is optional. The
@@ -172,12 +175,16 @@ function buildFoundryVoiceWsUrl(routeSessionId: string): string {
     "api-version": config.apiVersion,
     agent_session_id: routeSessionId,
   });
+  if (foundryConversationId) {
+    qs.set("conversation_id", foundryConversationId);
+  }
   return `${base}?${qs.toString()}`;
 }
 
 async function openUpstream(
   conversationId: string | undefined,
   foundryAgentSessionId?: string,
+  foundryConversationId?: string,
   traceHeaders: Record<string, string> = {},
 ): Promise<WebSocket> {
   if (config.mode === "local") {
@@ -195,7 +202,10 @@ async function openUpstream(
   const headers: Record<string, string> = { ...traceHeaders };
   if (token) headers.Authorization = `Bearer ${token}`;
   const routeSessionId = foundryAgentSessionId ?? conversationId;
-  return new WebSocket(buildFoundryVoiceWsUrl(routeSessionId), { headers });
+  return new WebSocket(
+    buildFoundryVoiceWsUrl(routeSessionId, foundryConversationId),
+    { headers },
+  );
 }
 
 function relay(
@@ -378,6 +388,7 @@ async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): 
     upstream = await openUpstream(
       conversationId,
       foundryAgentSessionId,
+      foundryConversationId,
       buildTraceHeaders(req),
     );
   } catch (err) {
