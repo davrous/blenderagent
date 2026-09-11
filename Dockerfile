@@ -66,6 +66,7 @@ RUN pip install --no-cache-dir --retries "$PIP_RETRIES" --timeout "$PIP_DEFAULT_
 COPY main.py .
 COPY voice_pipeline.py .
 COPY activity_bridge.py .
+COPY conversation_telemetry.py .
 COPY blender_startup.py .
 COPY blender_connection.py .
 COPY scene_manager.py .

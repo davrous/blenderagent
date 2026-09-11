@@ -78,6 +78,10 @@ start() {
     [ -f "$ROOT/.env" ] ||
         die ".env not found in $ROOT. Copy .env.example to .env and fill it in first."
 
+    # Local Docker has no Azure Instance Metadata Service. Keep tracing enabled,
+    # but omit the azure_vm resource detector that would probe 169.254.169.254.
+    local resource_detectors="${OTEL_EXPERIMENTAL_RESOURCE_DETECTORS:-otel,host,os,process,service_instance}"
+
     # Mounted read-only so the container's DefaultAzureCredential can reuse the
     # `az login` tokens from the host instead of needing its own sign-in.
     if [ ! -d "$HOME/.azure" ]; then
@@ -89,6 +93,8 @@ start() {
         -p 8088:8088 \
         -p 8089:8089 \
         --env-file .env \
+        -e "OTEL_EXPERIMENTAL_RESOURCE_DETECTORS=$resource_detectors" \
+        -e APPLICATIONINSIGHTS_STATSBEAT_DISABLED_ALL=true \
         -v "$HOME/.azure:/root/.azure:ro" \
         "$@" "$IMAGE"
 }

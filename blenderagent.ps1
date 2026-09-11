@@ -89,6 +89,15 @@ function Invoke-Start {
         throw ".env not found in $Root. Copy .env.example to .env and fill it in first."
     }
 
+    # Local Docker has no Azure Instance Metadata Service. Keep tracing enabled,
+    # but omit the azure_vm resource detector that would probe 169.254.169.254.
+    $resourceDetectors = if ($env:OTEL_EXPERIMENTAL_RESOURCE_DETECTORS) {
+        $env:OTEL_EXPERIMENTAL_RESOURCE_DETECTORS
+    }
+    else {
+        'otel,host,os,process,service_instance'
+    }
+
     # Mounted read-only so the container's DefaultAzureCredential can reuse the
     # `az login` tokens from the host instead of needing its own sign-in.
     $azureDir = Join-Path $HOME '.azure'
@@ -103,6 +112,8 @@ function Invoke-Start {
             '-p', '8088:8088',
             '-p', '8089:8089',
             '--env-file', '.env',
+            '-e', "OTEL_EXPERIMENTAL_RESOURCE_DETECTORS=$resourceDetectors",
+            '-e', 'APPLICATIONINSIGHTS_STATSBEAT_DISABLED_ALL=true',
             '-v', $azureMount
         ) + $DockerArgs + @($Image))
 }

@@ -371,16 +371,26 @@ the failed probe is printed as JSON. The agent still works — `DefaultAzureCred
 independently falls back to your mounted `~/.azure` CLI login. In Foundry, IMDS is
 reachable and App Insights is configured, so neither the error nor the console dump appears.
 
-To silence it for local runs, disable the OpenTelemetry SDK (telemetry only — **do not**
-put this in `agent.yaml`, since you want traces in Foundry):
+The `blenderagent` and `blenderagent.ps1` launchers automatically omit the
+`azure_vm` detector and disable Azure Monitor's separate Statsbeat self-telemetry
+for local Docker runs while keeping application tracing enabled. For a direct
+`docker run`, apply the same local-only settings (do **not** put them in
+`agent.yaml`, since the hosted runtime can supply useful Azure VM resource metadata
+and export Statsbeat normally):
 
 ```bash
 docker run -it --rm -p 8088:8088 -p 8089:8089 \
   --env-file .env \
   -v ~/.azure:/root/.azure:ro \
-  -e OTEL_SDK_DISABLED=true \
+  -e OTEL_EXPERIMENTAL_RESOURCE_DETECTORS=otel,host,os,process,service_instance \
+  -e APPLICATIONINSIGHTS_STATSBEAT_DISABLED_ALL=true \
   blender-scene-agent
 ```
+
+Some endpoint-discovery clients also send `HEAD` requests to the POST-only
+`/invocations` and `/responses` protocol routes. A `405 Method Not Allowed` response
+is expected and does not indicate an agent failure. Health checks should use
+`GET /readiness` instead.
 
 ### Local development (without Docker)
 
