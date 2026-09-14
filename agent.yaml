@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/microsoft/AgentSchema/refs/heads/main/schemas/v1.0/ContainerAgent.yaml
 
 kind: hosted
-name: new-fantasy-worlds-agent
+name: blender-agent
 description: >
   An AI agent that creates and manipulates 3D scenes in Blender.
   Communicates with a headless Blender instance via TCP socket to create
@@ -34,6 +34,8 @@ environment_variables:
     value: "{{PROJECT_ENDPOINT}}"
   - name: MODEL_DEPLOYMENT_NAME
     value: "{{MODEL_DEPLOYMENT_NAME}}"
+  - name: AUTH_DIAGNOSTICS_ENABLED
+    value: "true"
   - name: BLENDER_HOST
     value: "localhost"
   - name: BLENDER_PORT

@@ -63,15 +63,9 @@ COPY requirements.txt requirements.lock ./
 RUN pip install --no-cache-dir --retries "$PIP_RETRIES" --timeout "$PIP_DEFAULT_TIMEOUT" -r requirements.lock
 
 # ── 4. Copy application code ──
-COPY main.py .
-COPY voice_pipeline.py .
-COPY activity_bridge.py .
-COPY conversation_telemetry.py .
-COPY blender_startup.py .
-COPY blender_connection.py .
-COPY scene_manager.py .
-COPY entrypoint.sh .
-COPY agent.yaml .
+COPY main.py auth_diagnostics.py conversation_telemetry.py \
+    voice_pipeline.py activity_bridge.py blender_startup.py \
+    blender_connection.py scene_manager.py entrypoint.sh agent.yaml ./
 
 RUN chmod +x /app/entrypoint.sh
 

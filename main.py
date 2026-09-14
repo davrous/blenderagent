@@ -37,6 +37,7 @@ from agent_framework_foundry_hosting import ResponsesHostServer
 from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSettings, generate_blob_sas
 
+from auth_diagnostics import start_auth_diagnostics
 from blender_connection import get_blender_connection, close_blender_connection, is_blender_socket_ready
 from conversation_telemetry import FoundryConversationTelemetryAgent
 from scene_manager import SceneManager
@@ -2519,10 +2520,16 @@ This environment runs **Blender 4.4**. The following Blender 3.x APIs were remov
     # path is fully optional and isolated: if it is disabled or fails to start,
     # the text agent keeps running unaffected.
     tasks = [asyncio.ensure_future(server.run_async())]
+    speech_diagnostic_scope = None
+    speech_skip_reason = "voice_disabled_or_not_configured"
     try:
         import voice_pipeline
 
         if voice_pipeline.voice_available():
+            if os.environ.get("SPEECH_KEY"):
+                speech_skip_reason = "speech_uses_key"
+            else:
+                speech_diagnostic_scope = voice_pipeline.SPEECH_AAD_SCOPE
             logger.info(
                 "Voice path ENABLED — serving voice WebSocket on port %d.",
                 voice_pipeline.VOICE_WS_PORT,
@@ -2548,7 +2555,16 @@ This environment runs **Blender 4.4**. The following Blender 3.x APIs were remov
             exc_info=True,
         )
 
-    await asyncio.gather(*tasks)
+    diagnostic_task = start_auth_diagnostics(
+        speech_scope=speech_diagnostic_scope,
+        speech_skip_reason=speech_skip_reason,
+    )
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        if diagnostic_task is not None:
+            diagnostic_task.cancel()
+            await asyncio.gather(diagnostic_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

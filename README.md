@@ -64,6 +64,53 @@ multi-protocol host, then translates the agent's streamed updates into native
 Teams constructs: middleware status messages become *informative updates*, and
 the ` ```models ` / ` ```textures ` gallery blocks become Adaptive Cards.
 
+## Hosted Authentication Diagnostics
+
+The diagnostic configuration in `agent.yaml` enables
+`AUTH_DIAGNOSTICS_ENABLED=true`. Set it to `false` after investigation; the code
+defaults to disabled when the variable is absent. Rebuild the container image
+to include `auth_diagnostics.py` before deploying this configuration.
+
+Each process startup emits JSON records prefixed with `AUTH_DIAG` to the existing
+`$HOME/logs/agent.log` and console (also captured by the entrypoint log):
+
+- `runtime`: installed authentication/hosting package versions, SHA-256 hashes
+  of application sources and the dependency lockfile, environment-variable
+  presence, configured tenant/client GUIDs, and endpoint origins only.
+- `token_probe_result`: independent token acquisition for Foundry
+  (`https://ai.azure.com/.default`), Storage (`https://storage.azure.com/.default`)
+  and, when voice uses AAD, Speech (`https://cognitiveservices.azure.com/.default`).
+- Success: allowlisted principal/tenant/application IDs, audience/issuer origins,
+  and token timestamps. JWT claims are decoded for diagnostics only, not verified
+  or used for authorization.
+- Failure: exception type, known OAuth/AADSTS codes, Entra correlation/trace IDs
+  and Conditional Access policy IDs extracted without logging the raw exception.
+
+The probes use separate async `DefaultAzureCredential` instances. They do not
+replace the application's credentials, change Responses history, invoke a model,
+or access stored data. Token acquisition runs concurrently in the background,
+once per process, with a 10-second timeout per audience and a 2-second cleanup
+timeout. It generates additional identity requests/sign-in events. No hosted
+identity endpoint means no probes, so local developer credentials are not used.
+Raw SDK logs from probe tasks are suppressed without suppressing other requests.
+The pre-existing application/SDK logs are unchanged and may still contain SAS
+URLs or conversation content; review full logs before sharing them.
+
+To isolate Speech, first collect a typed-chat attempt with diagnostics enabled
+and the normal voice configuration. Then use the **same image** with
+`ENABLE_VOICE=false`, start a fresh session, and repeat the same typed request.
+Both the voice startup/prewarm and the diagnostic Speech probe are skipped in
+that configuration. Foundry and Storage probes still run. Compare `AUTH_DIAG`
+records by `run_id`, source hashes, package versions, and principal IDs.
+
+If Foundry still fails with `AADSTS53003` with voice disabled, Speech is not
+required to trigger that failure. Use the captured correlation ID and UTC log
+time in Entra sign-in logs to inspect the evaluated identity, target resource,
+and Conditional Access result. A successful probe establishes token issuance
+only, not service authorization or success of the real Responses request.
+
+Offline checks: `python devTools/test_auth_diagnostics.py`.
+
 ## Features
 
 - **Create 3D objects**: Cubes, spheres, cylinders, cones, torus, planes, monkeys
