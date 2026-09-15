@@ -102,7 +102,7 @@ _ADAPTIVE_CARD_CONTENT_TYPE = "application/vnd.microsoft.card.adaptive"
 # Markdown image `![alt](url)` or link `[text](url)`; group 1 is the leading
 # `!`, group 2 the url. Mirrors MEDIA_RE in the web client's parseMarkdown.ts.
 _MEDIA_RE = re.compile(r"(!?)\[[^\]\n]*\]\(([^)\s]+)(?:\s+[^)\n]*)?\)")
-_DOWNLOAD_SUFFIXES = (".blend", ".glb", ".gltf", ".fbx")
+_DOWNLOAD_SUFFIXES = (".blend", ".glb", ".gltf", ".fbx", ".mp4")
 # Cap on how much text may be held back waiting for a half-arrived media token,
 # so a stray "[" can never stall the stream for a whole turn.
 _MAX_MEDIA_HOLD = 4096
@@ -363,7 +363,7 @@ def register_activity_handlers(host: Any, agent: Any) -> None:
 
     @app.error
     async def on_error(context: Any, error: Exception) -> None:  # pyright: ignore[reportUnusedFunction]
-        logger.error("Activity handler error: %s", error, exc_info=True)
+        logger.error("Activity handler error (%s)", type(error).__name__)
         await _safe_send(context, _ERROR_TEXT)
 
     logger.info(
@@ -378,7 +378,19 @@ def register_activity_handlers(host: Any, agent: Any) -> None:
 
 
 async def _run_turn(agent: Any, context: Any, state: Any) -> None:
+    from teams_media import MediaError, attachment_specs
+
     conversation_id = _conversation_id(context)
+    attachments = getattr(context.activity, "attachments", None) or []
+    specs = []
+    if attachments:
+        try:
+            specs = attachment_specs(attachments)
+        except MediaError as error:
+            await _safe_send(context, str(error))
+            return
+    value = getattr(context.activity, "value", None)
+    video_action = value if isinstance(value, dict) and ("type" in value or "job_id" in value) else None
 
     # A tapped Adaptive Card arrives as a `message` activity with no text and
     # the card's Action.Submit payload in `activity.value`.
@@ -387,17 +399,26 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
         user_text, history_text = submitted
     else:
         user_text = history_text = _user_text(context)
-    if not user_text:
+    if not user_text and attachments:
+        user_text = history_text = "Analyze the attached reference and propose a Blender blockout."
+    if not user_text and video_action is None:
+        if value is not None:
+            await _safe_send(context, "Invalid card action. Use the original card's buttons.")
         return
 
     slot = _conversation_slot(conversation_id)
+    slot.generation = max(slot.generation, _scene_generation(state))
+    inbound_epoch = slot.epoch
 
     if _is_clear_command(user_text):
         await _handle_clear(context, state, slot, conversation_id)
         return
 
-    generation = _scene_generation(state)
+    generation = slot.generation
     scene_key = _scene_key(conversation_id, generation) if conversation_id else None
+    from artifact_storage import conversation_scope
+
+    scope = conversation_scope(scene_key) if scene_key else None
     streaming = _supports_streaming(context)
     logger.info(
         "Activity turn started: channel=%s conversation=%s generation=%d scene_key=%s streaming=%s",
@@ -406,7 +427,8 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
 
     emitter = _StreamingEmitter(context) if streaming else _FallbackEmitter(context)
     relay = _Relay(emitter)
-    gallery = _GalleryFilter()
+    notifier = _capture_video_notifier(context, emitter, slot, inbound_epoch, scope)
+    gallery = _GalleryFilter(scope)
     dedupe = _MediaDedupeFilter()
     reply_parts: list[str] = []
 
@@ -421,6 +443,7 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
     async def _persist(epoch: int, history: list[dict[str, str]]) -> None:
         """Write this turn back into the transcript. Called INSIDE the lock."""
         nonlocal reply_chars
+        state.conversation.set_value(_SCENE_GENERATION_KEY, slot.generation)
         reply = "".join(reply_parts).strip()
         reply_chars = len(reply)
         if not reply:
@@ -453,6 +476,7 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                 logger.warning("Could not persist detached turn state", exc_info=True)
 
     async def _consume() -> None:
+        nonlocal history_text
         # Tool calls can run for minutes; without this the channel sees nothing
         # between two status updates and gives up on the turn. The pump starts
         # BEFORE the lock so a turn queued behind a long render keeps its own
@@ -470,6 +494,39 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
             # request completed, so releasing early would let the next message
             # interleave with it.
             async with slot.lock:
+                if slot.epoch != inbound_epoch:
+                    state.conversation.set_value(_SCENE_GENERATION_KEY, slot.generation)
+                    await relay.text("This request was superseded by /clear. Send it again for the new scene.")
+                    return
+                from video_jobs import video_scope, video_notifier
+                from teams_media import run_video_action, store_references, video_attachments
+
+                current = lambda: slot.epoch == inbound_epoch
+                activity_id = getattr(context.activity, "id", None)
+                tracked_id = activity_id if (attachments or video_action is not None) and isinstance(activity_id, str) and 0 < len(activity_id) <= 256 else None
+                if tracked_id and tracked_id in slot.media_receipts:
+                    await relay.text("This media activity was already handled. Use Status on the video card for current results.")
+                    return
+                if video_action is not None:
+                    if attachments:
+                        raise MediaError("Submit video actions separately from reference attachments.")
+                    result = await run_video_action(context, video_action, scope, notifier, current)
+                    if current():
+                        for attachment in video_attachments(result, scope, Attachment):
+                            await relay.card(attachment)
+                        await relay.text("Video job updated.")
+                        if tracked_id:
+                            slot.media_receipts = [*slot.media_receipts[-63:], tracked_id]
+                    return
+                prompt_text = user_text
+                if specs:
+                    references = await store_references(context, specs, scope, current)
+                    if not current():
+                        raise MediaError("This upload was superseded by /clear. Send it again.")
+                    prompt_text += "\nStored reference IDs (analyze_reference_media before reconstruction):\n" + "\n".join(references)
+                    history_text = prompt_text
+                    if tracked_id:
+                        slot.media_receipts = [*slot.media_receipts[-63:], tracked_id]
                 # Read the transcript inside the lock — `state` is a snapshot
                 # taken before the turn ahead of us saved, so only the
                 # in-process copy `_load_history` prefers is up to date.
@@ -480,10 +537,14 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                         Message(role=entry["role"], contents=[Content.from_text(entry["text"])])
                         for entry in history
                     ),
-                    Message(role="user", contents=[Content.from_text(user_text)]),
+                    Message(role="user", contents=[Content.from_text(prompt_text)]),
                 ]
+                scope_token = video_scope.set(scope)
+                notifier_token = video_notifier.set(notifier)
                 try:
                     async for update in agent.run(messages, stream=True, options=options):
+                        if not current():
+                            break
                         for content in update.contents or []:
                             if content.type != "text" or not content.text:
                                 continue
@@ -502,13 +563,17 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                                 reply_parts.append(content.text)
                                 await _emit_filtered(relay, gallery.feed(content.text), dedupe)
                 finally:
+                    video_notifier.reset(notifier_token)
+                    video_scope.reset(scope_token)
                     # Still inside the lock: the next turn must not read the
                     # transcript before this one has written itself into it.
                     await _persist(epoch, history)
+        except MediaError as error:
+            await relay.text(str(error))
         except Exception:
             # ToolStatusMiddleware already emitted user-facing error text before
             # re-raising, so only add our own when nothing reached the user.
-            logger.error("Activity turn failed", exc_info=True)
+            logger.error("Activity turn failed; exception details omitted to protect media credentials")
             if not reply_parts:
                 # Guarded: the original failure may BE the delivery channel
                 # dying, in which case this send raises too — turning a handled
@@ -517,17 +582,19 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                 try:
                     await relay.text(_ERROR_TEXT)
                 except Exception as exc:
-                    logger.warning("Could not deliver the failure notice: %s", exc)
+                    logger.warning("Could not deliver the failure notice (%s)", type(exc).__name__)
         finally:
+            state.conversation.set_value(_SCENE_GENERATION_KEY, slot.generation)
             # Stop the pump before finishing so a keep-alive can't land after
             # (or interleave with) the final message.
             pump.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await pump
             try:
-                await _emit_filtered(relay, gallery.flush(), dedupe, final=True)
+                if slot.epoch == inbound_epoch:
+                    await _emit_filtered(relay, gallery.flush(), dedupe, final=True)
             except Exception:
-                logger.warning("Could not flush the gallery buffer", exc_info=True)
+                logger.warning("Could not flush the gallery buffer")
             # The streaming queue drains in the background, so a Bot Connector
             # delivery failure surfaces here rather than on the individual
             # queue_* calls. Swallow it: an outbound failure must not become a
@@ -535,7 +602,7 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
             try:
                 await relay.finish()
             except Exception as exc:
-                logger.warning("Could not finish the activity response: %s", exc)
+                logger.warning("Could not finish the activity response (%s)", type(exc).__name__)
 
         logger.info(
             "Activity turn finished: conversation=%s reply_chars=%d detached=%s elapsed=%.0fs",
@@ -566,7 +633,7 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
     except Exception:
         # If the handover fails, leave the turn attached: it still delivers
         # through the original context for as long as the process lives.
-        logger.error("Could not detach the turn for proactive delivery", exc_info=True)
+        logger.error("Could not detach the turn for proactive delivery")
 
 
 def _log_turn_result(task: asyncio.Task) -> None:
@@ -575,7 +642,7 @@ def _log_turn_result(task: asyncio.Task) -> None:
         return
     exc = task.exception()
     if exc is not None:
-        logger.error("Activity turn failed after delivery started: %s", exc, exc_info=exc)
+        logger.error("Activity turn failed after delivery started (%s)", type(exc).__name__)
 
 
 async def _emit_filtered(
@@ -597,7 +664,50 @@ async def _emit_filtered(
     if text:
         await emitter.text(text)
     for card in cards:
-        await emitter.card(card)
+        if isinstance(card, _VideoCard):
+            from teams_media import video_attachments
+            from video_jobs import get_video_jobs
+
+            try:
+                value = await asyncio.to_thread(get_video_jobs().status, card.scope, card.job_id)
+                for attachment in video_attachments(value, card.scope, Attachment):
+                    await emitter.card(attachment)
+            except Exception:
+                await emitter.text("The video job could not be loaded for this scene. Retry Status on the original card.")
+        else:
+            await emitter.card(card)
+
+
+def _capture_video_notifier(context, previous, slot, epoch, scope):
+    if scope is None:
+        return None
+    try:
+        sender = _ProactiveEmitter(context, previous)
+    except Exception:
+        logger.info("Video proactive capture unavailable; recover results using Status")
+        return None
+    sender._current = lambda: slot.epoch == epoch
+    seen = set()
+
+    async def notify(value):
+        from teams_media import video_attachments
+
+        async with slot.lock:
+            if not sender._current():
+                return
+            fingerprint = (value.get("id"), value.get("state"), value.get("progress"))
+            if fingerprint in seen:
+                return
+            try:
+                attachments = video_attachments(value, scope, Attachment)
+                async with asyncio.timeout(30):
+                    delivered = await sender._send(Activity(type="message", text="Video job update", attachments=attachments))
+                if delivered:
+                    seen.add(fingerprint)
+            except Exception:
+                logger.warning("Video notification failed; recover results using Status")
+
+    return asyncio.get_running_loop(), notify
 
 
 # ──────────────────────────────────────────────
@@ -628,7 +738,9 @@ def _clear_conversation(state: Any, slot: _Conversation) -> int:
     makes that safe — the running turn checks it before writing its transcript
     back and drops it instead.
     """
-    generation = _bump_scene_generation(state)
+    generation = max(slot.generation, _scene_generation(state)) + 1
+    slot.generation = generation
+    state.conversation.set_value(_SCENE_GENERATION_KEY, generation)
     slot.epoch += 1
     _save_history(state, slot, [])
     return generation
@@ -670,6 +782,12 @@ def _bump_scene_generation(state: Any) -> int:
 # ──────────────────────────────────────────────
 
 
+class _VideoCard:
+    def __init__(self, scope, job_id):
+        self.scope = scope
+        self.job_id = job_id
+
+
 class _GalleryFilter:
     """Splits the model's streamed text into prose and gallery Adaptive Cards.
 
@@ -685,8 +803,10 @@ class _GalleryFilter:
     emitted verbatim at flush time rather than swallowed.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, scope=None) -> None:
         self._buffer = ""
+        self._scope = scope
+        self._seen_video = set()
 
     def feed(self, chunk: str) -> tuple[str, list[Any]]:
         self._buffer += chunk
@@ -707,6 +827,9 @@ class _GalleryFilter:
             end = self._buffer.find("```", newline + 1) if newline != -1 else -1
             if newline == -1 or end == -1:
                 if final:
+                    if self._buffer[start + 3:].lstrip().lower().startswith("videojob"):
+                        out.append(self._buffer[:start] + "The video card was incomplete. Request the job status again.")
+                        self._buffer = ""
                     break  # unterminated fence — fall through and emit raw
                 # Hold the incomplete block; emit only what precedes it.
                 out.append(self._buffer[:start])
@@ -716,6 +839,19 @@ class _GalleryFilter:
             tag = self._buffer[start + 3:newline].strip().lower()
             body = self._buffer[newline + 1:end]
             out.append(self._buffer[:start])
+            if tag == "videojob":
+                try:
+                    value = json.loads(body)
+                    job_id = value.get("id") if isinstance(value, dict) else None
+                    if not self._scope or not isinstance(job_id, str) or not re.fullmatch(r"[a-f0-9]{32}", job_id):
+                        raise ValueError("Invalid video job")
+                    if job_id not in self._seen_video:
+                        cards.append(_VideoCard(self._scope, job_id))
+                        self._seen_video.add(job_id)
+                except (ValueError, TypeError):
+                    out.append("The video job card is invalid. Request the job status again.")
+                self._buffer = self._buffer[end + 3:]
+                continue
             card = _gallery_card(tag, body) if tag in _GALLERY_TAGS else None
             if card is not None:
                 cards.append(card)
@@ -826,7 +962,7 @@ class _MediaDedupeFilter:
                 if url in self._seen:
                     out.append(buf[emit_from:start])
                     emit_from = match.end()
-                    logger.debug("Dropped duplicate media for %s", url)
+                    logger.debug("Dropped duplicate media link")
                 else:
                     self._seen.add(url)
             pos = match.end()
@@ -1025,7 +1161,7 @@ async def _keepalive_pump(emitter: _Emitter) -> None:
         raise
     except Exception:  # pragma: no cover - defensive
         # A dead pump must never fail the turn; the answer still gets through.
-        logger.warning("Keep-alive pump stopped", exc_info=True)
+        logger.warning("Keep-alive pump stopped")
 
 
 class _StreamingEmitter(_Emitter):
@@ -1110,7 +1246,7 @@ class _StreamingEmitter(_Emitter):
             try:
                 await self._end_stream(_STREAM_CONTINUED_TEXT)
             except Exception as exc:  # pragma: no cover - network dependent
-                logger.warning("Could not close the stream cleanly: %s", exc)
+                logger.warning("Could not close the stream cleanly (%s)", type(exc).__name__)
             self._overflow = _FallbackEmitter(self._context)
             # Carry the turn clock over so the keep-alive keeps counting from
             # the user's message, not from the handover.
@@ -1202,6 +1338,7 @@ class _ProactiveEmitter(_Emitter):
         self._reference = context.activity.get_conversation_reference()
         self._parts: list[str] = []
         self._attachments: list[Any] = []
+        self._current = lambda: True
 
     async def status(self, text: str) -> None:
         self._last_status = text
@@ -1277,6 +1414,8 @@ class _ProactiveEmitter(_Emitter):
             anonymous,
         )
         try:
+            if not self._current():
+                return False
             activity.apply_conversation_reference(self._reference)
             activity.id = None
             conversation_id = self._reference.conversation.id
@@ -1310,6 +1449,8 @@ class _ProactiveEmitter(_Emitter):
 
         async def _callback(turn_context: Any) -> None:
             nonlocal delivered
+            if not self._current():
+                return
             await turn_context.send_activity(activity)
             delivered = True
 
@@ -1347,20 +1488,20 @@ class _ProactiveEmitter(_Emitter):
             attempts.append(("the agent app id", self._deliver_with_app_id))
         return attempts
 
-    async def _send(self, activity: Any) -> None:
+    async def _send(self, activity: Any) -> bool:
         logger.info(
-            "Delivering proactive message: conversation=%s service_url=%s "
-            "audience=%s app_id=%s chars=%d attachments=%d",
+            "Delivering proactive message: conversation=%s chars=%d attachments=%d",
             getattr(self._reference.conversation, "id", None),
-            self._reference.service_url, self._audience, self._app_id,
             len(activity.text or ""), len(activity.attachments or []),
         )
 
         for label, attempt in self._delivery_attempts():
+            if not self._current():
+                return False
             try:
                 delivered = await attempt(activity)
             except Exception as exc:
-                logger.warning("Proactive delivery via %s failed: %s", label, exc)
+                logger.warning("Proactive delivery via %s failed (%s)", label, type(exc).__name__)
                 continue
 
             if delivered:
@@ -1368,7 +1509,7 @@ class _ProactiveEmitter(_Emitter):
                     "Proactive message delivered via %s after %.0fs",
                     label, self.elapsed,
                 )
-                return
+                return True
 
             # `ChannelAdapter.run_pipeline` hands callback errors to
             # `on_turn_error` and returns normally, so a clean return does NOT
@@ -1382,8 +1523,14 @@ class _ProactiveEmitter(_Emitter):
         # Long shot: the request's own connector client is closed by
         # `process_activity` as soon as the handler returns, so this usually
         # fails with "Session is closed" — but it costs nothing.
+        fallback = _without_native_video(activity)
+        if fallback is not None and self._current():
+            logger.info("Retrying video delivery with Adaptive Card download links only")
+            return await self._send(fallback)
         logger.error("All proactive delivery attempts failed — trying the request context")
-        await _safe_send(self._context, activity)
+        if self._current():
+            return await _safe_send(self._context, activity)
+        return False
 
 
 class _Relay:
@@ -1457,7 +1604,7 @@ class _Relay:
         except Exception as exc:
             # The live response is being abandoned anyway; failing to close it
             # cleanly must not abort the turn now running in the background.
-            logger.warning("Could not close the live response on handover: %s", exc)
+            logger.warning("Could not close the live response on handover (%s)", type(exc).__name__)
 
 
 def _agent_app_id(context: Any) -> str:
@@ -1473,7 +1620,15 @@ def _agent_app_id(context: Any) -> str:
     return recipient_id.split(":", 1)[-1] if recipient_id else ""
 
 
-async def _safe_send(context: Any, message: Any) -> None:
+def _without_native_video(message):
+    attachments = getattr(message, "attachments", None) or []
+    if not any(getattr(attachment, "content_type", None) == "video/mp4" for attachment in attachments):
+        return None
+    return Activity(type="message", text=getattr(message, "text", "") or "Video job update",
+                    attachments=[attachment for attachment in attachments if getattr(attachment, "content_type", None) != "video/mp4"])
+
+
+async def _safe_send(context: Any, message: Any) -> bool:
     """Send an activity (or plain text), logging — not raising — on failure.
 
     Outbound delivery goes to the Bot Connector. A transient failure there must
@@ -1482,8 +1637,13 @@ async def _safe_send(context: Any, message: Any) -> None:
     """
     try:
         await context.send_activity(message)
+        return True
     except Exception as exc:  # pragma: no cover - network dependent
-        logger.warning("Could not send activity: %s", exc)
+        logger.warning("Could not send activity (%s)", type(exc).__name__)
+        fallback = _without_native_video(message)
+        if fallback is not None:
+            return await _safe_send(context, fallback)
+        return False
 
 
 # ──────────────────────────────────────────────
@@ -1585,7 +1745,7 @@ class _Conversation:
     the life of the container, and ``TurnState`` is the durable write-through.
     """
 
-    __slots__ = ("lock", "history", "loaded", "epoch")
+    __slots__ = ("lock", "history", "loaded", "epoch", "generation", "media_receipts")
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
@@ -1594,6 +1754,8 @@ class _Conversation:
         # Bumped by /clear so a turn already in flight knows not to write its
         # transcript back over the fresh slate it was cleared into.
         self.epoch = 0
+        self.generation = 0
+        self.media_receipts = []
 
 
 _conversations: dict[str, _Conversation] = {}

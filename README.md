@@ -1,3 +1,104 @@
+# Reference-to-Video Workflow
+
+Webchat and Teams support PNG/JPEG/WebP references and MP4 clips. The agent samples
+video frames, proposes coarse geometry and approximate camera motion, builds a
+Blender scene, and renders a camera animation. This is not photogrammetry, exact
+camera tracking, or reconstruction of hidden geometry or moving-object rigs.
+
+Use `analyze_reference_media`, `apply_camera_path`, and `start_animation_render`.
+Defaults are a 5-second, 24-fps, 480p preview. Standard mode uses Eevee with original
+materials; clay mode uses neutral Workbench shading in an isolated scene snapshot.
+Cycles is available within a smaller workload budget. Camera keys include time,
+position, look-at target and focal length; linear and Bezier interpolation are supported.
+
+## Configuration
+
+- Rebuild the container: it now includes ffmpeg/ffprobe and the video modules.
+- Set the same random `MEDIA_CONTROL_SECRET` (at least 32 characters) on the agent
+  and Webchat server. Webchat media controls remain disabled without it. Keep it
+  server-side and out of source control, logs, prompts, and browser bundles.
+- Set `AZURE_STORAGE_ACCOUNT_NAME` on both hosts. Reuse the existing private
+  `screenshots` container. Grant their managed/developer identities Storage Blob
+  Data Contributor on that container and the agent Storage Blob Delegator on the account.
+- For optional paid finishing, set `WAVESPEED_API_KEY` on the agent only. Inject
+  both secrets through the existing deployment configuration; the committed agent
+  manifest intentionally contains no secret values. No new Azure resources or
+  permissions are created automatically.
+- Install ffprobe on a separate Webchat host for pre-upload metadata checks. The
+  agent always fully decodes references with ffmpeg before vision analysis. Python
+  development can override `BLENDER_PATH`, `FFMPEG_PATH` and `FFPROBE_PATH`.
+
+## Approval and Limits
+
+Render a clay preview with `seedance=True` to expose the paid approval card. Inspect
+the MP4, enter the finishing prompt, review the resolution/audio/price and explicitly
+approve external processing. Model tool calls and ordinary chat text cannot approve
+a paid job. Teams defaults to 720p with audio off; Webchat exposes provider resolutions.
+The provider endpoint is WaveSpeed `bytedance/seedance-2.5/video-edit`.
+
+Estimates charge input plus output duration: rates used are $0.11/$0.22/$0.55/$1.10
+per second for 480p/720p/1080p/4k. A 5-second 720p input plus equal output is estimated
+at $2.20 USD. Actual provider pricing/output can differ. WaveSpeed documents seven-day
+input retention; obtain permission to send reference-derived content to that third
+party. Finished output is downloaded and rehosted in private Azure Blob storage.
+
+References are limited to 200 MiB each, four per turn, images up to 16 megapixels,
+and MP4 videos of 4-30 seconds up to 1080p. Blender output is 480p/720p, 12/24/30 fps,
+with at most 400 million frame-pixels (80 million for Cycles) and 1-32 samples.
+Two GiB of free temporary disk is required. `VIDEO_RENDER_TIMEOUT_SECONDS` defaults
+to 1800; the existing 180-second agent turn limit is unchanged.
+
+## Jobs and Recovery
+
+Job manifests use `video-jobs/{scope}/`, references use `references/{scope}/`, and
+videos/posters use `videos/{scope}/` in the existing container. Job writes use ETags
+and workers use renewable Blob leases. One isolated Blender process renders at a time;
+frames checkpoint under `$HOME/tmp/video-jobs` and completed frames are reused after
+restart. The local scene snapshot must remain on the persistent HOME filesystem until
+render completion. Loss of that filesystem requires creating a new preview.
+
+Webchat polls through the existing Responses protocol, without adding control turns
+to conversation history, and restores saved job IDs after reload. A signed HttpOnly
+cookie isolates browser ownership; it is not production user authentication. Protect
+the Webchat host with application authentication before exposing it publicly. Clearing
+cookies or rotating the control secret loses browser access to earlier jobs.
+
+Teams supports attachment-only messages, approval/status/cancel cards, proactive
+completion and a signed MP4 download fallback. Native playback varies by client.
+`/clear` invalidates old scene controls and suppresses stale notifications. A hosted VM
+can pause after inactivity: **background threads do not keep it alive**. Startup or a
+Status action resumes recoverable jobs. Teams proactive callbacks do not survive process
+termination; use Status to recover delivery. Unattended completion while no client is
+connected needs an external durable worker/wake-up service, which is not provisioned here.
+
+Paid submission is never automatically retried. If a restart/network error makes its
+outcome ambiguous, the job enters `submission_unknown`; reconcile it in WaveSpeed before
+starting another paid request. Cancel stops local work/result polling, but does not
+cancel provider billing after submission. Videos/posters have 24-hour read-only SAS links;
+Status refreshes them. Blob retention is controlled by your storage lifecycle policy,
+not by SAS expiration. Temporary frames and snapshots are deleted at terminal states.
+
+## Video Verification
+
+Offline checks use the repository virtual environment:
+
+```powershell
+.\.venv\Scripts\python.exe devTools/test_video_pipeline.py
+.\.venv\Scripts\python.exe devTools/test_activity_history.py
+.\.venv\Scripts\python.exe devTools/test_voice_pipeline.py
+.\.venv\Scripts\python.exe devTools/test_auth_diagnostics.py
+npm --prefix webchat run build
+node devTools/test_video_webchat.mjs
+node devTools/test_voice_relay.mjs
+```
+
+`devTools/test_blender_video.py` additionally exercises real clay/standard renders,
+material preservation, cancellation, H.264 encoding and ffprobe duration/fps. Run its
+`render <temporary-directory>` phase through Blender's `--python` entrypoint and its
+`encode <same-directory>` phase through Python with ffmpeg installed. Live Foundry,
+Teams delivery, Blob permissions and paid WaveSpeed processing require separate
+environment-specific smoke tests; offline tests do not establish those outcomes.
+
 # Blender Scene Agent
 
 An AI agent that creates and manipulates 3D scenes in a headless Blender instance running inside Docker. Built with the **Microsoft Agent Framework** and **Azure AI Foundry**, it communicates with Blender via the [BlenderMCP](https://github.com/ahujasid/blender-mcp) TCP socket protocol.

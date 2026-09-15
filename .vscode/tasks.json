@@ -12,7 +12,11 @@
         {
             "label": "Run Agent/Workflow HTTP Server",
             "type": "shell",
-            "command": "${command:python.interpreterPath} -m debugpy --listen 127.0.0.1:5679 -m agentdev run main.py --port 8088",
+            "command": "${workspaceFolder}/.venv/bin/python",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/python.exe"
+            },
+            "args": ["-m", "debugpy", "--listen", "127.0.0.1:5679", "${workspaceFolder}/main.py"],
             "isBackground": true,
             "options": {
                 "cwd": "${workspaceFolder}"

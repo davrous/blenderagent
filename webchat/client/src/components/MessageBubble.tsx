@@ -12,7 +12,11 @@ import {
   dedupeMarkdownMedia,
   extractGalleries,
   stripGalleryBlocks,
+  isVideoLink,
+  extractVideoJobIds,
+  stripVideoJobBlocks,
 } from "../lib/parseMarkdown";
+import { blobProxyUrl } from "../api/media";
 
 interface Props {
   message: Message;
@@ -27,13 +31,16 @@ function MessageBubbleImpl({ message }: Props) {
   if (message.role === "user") {
     return (
       <div className="msg msg-user">
-        <div className="msg-bubble">{message.text}</div>
+        <div className="msg-bubble">{message.text}{message.referenceNames?.map((name, index) => <div className="reference-name" key={`${name}-${index}`}>{name}</div>)}</div>
       </div>
     );
   }
 
   const galleries = extractGalleries(message.text);
-  const prose = dedupeMarkdownMedia(stripGalleryBlocks(message.text));
+  const jobIds = extractVideoJobIds(message.text);
+  const prose = dedupeMarkdownMedia(stripGalleryBlocks(stripVideoJobBlocks(message.text)));
+
+  if (jobIds.length && !prose && !galleries.length && message.status === "done") return null;
 
   return (
     <div className={clsx("msg msg-assistant", `msg-${message.status}`)}>
@@ -63,6 +70,7 @@ function MessageBubbleImpl({ message }: Props) {
                 );
               },
               a: ({ href, children }) => {
+                if (href && isVideoLink(href)) return <video className="inline-video" controls playsInline preload="metadata" src={blobProxyUrl(href)} />;
                 if (href && isDownloadLink(href)) {
                   const label =
                     typeof children === "string"
@@ -94,7 +102,7 @@ function MessageBubbleImpl({ message }: Props) {
           />
         ))}
 
-        {message.status === "streaming" && !prose && !galleries.length && !message.currentStatus && (
+        {message.status === "streaming" && !prose && !galleries.length && !jobIds.length && !message.currentStatus && (
           <div className="msg-thinking">
             <span className="dot" />
             <span className="dot" />
@@ -102,7 +110,7 @@ function MessageBubbleImpl({ message }: Props) {
           </div>
         )}
 
-        {message.status === "done" && !prose && !galleries.length && !message.errorText && (
+        {message.status === "done" && !prose && !galleries.length && !jobIds.length && !message.errorText && (
           <div className="msg-empty">
             <em>(no response)</em>
           </div>

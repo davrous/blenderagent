@@ -123,5 +123,107 @@ webchat/
 
 - No browser-side Entra sign-in: relies on `az login` host credentials. Adequate for dev/demo; for multi-user production, layer Entra ID on top.
 - The visible browser message list is not persisted across page reloads. Foundry model history is persisted in its Responses conversation while the proxy retains the browser UUID → `conv_...` mapping; production multi-replica proxies should move that mapping to shared storage.
-- No file upload to the agent.
+- References and video job controls are Webchat-only; voice and Teams attachments are unchanged.
 - No syntax highlighting for code blocks.
+
+## Reference uploads and video jobs
+
+Set `MEDIA_CONTROL_SECRET` to the **same secret of at least 32 characters** on
+the Webchat server and Python agent. Do not expose it in `VITE_*` variables.
+When missing or shorter, Webchat visibly disables media and keeps plain text
+chat working. Set `CLIENT_ORIGIN` to the exact public browser origin (default
+`http://localhost:5173`); chat, upload, approval, cancellation and reset writes
+reject missing or different Origin headers. Use the Vite `/api` proxy, not
+cross-origin browser requests to the server port.
+
+Set `AZURE_STORAGE_ACCOUNT_NAME` to the agent's storage account. Uploads use
+`DefaultAzureCredential` and the existing **private** `screenshots` container;
+the Webchat identity needs blob read/write/delete permissions on that container.
+The server refuses public containers and does not create containers or SAS tokens.
+Dependencies `busboy`, `@azure/storage-blob`, `@types/busboy` and `lucide-react`
+are installed through the configured approved npm feed.
+
+Each upload streams one nonempty PNG/JPEG/WebP/MP4 file, at most 200 MiB, to a
+private temporary file, checks magic bytes against the declared MIME type, and
+uploads it under `references/{scope}/{uuid32}.{png|jpg|webp|mp4}`. Multipart fields
+and extra files are rejected. At most four owned blob names can accompany a turn;
+URLs and references from another browser/conversation are rejected. Temporary
+files are removed on success, rejection and disconnection. Failed Blob writes
+attempt deletion; if Azure is unavailable, uncommitted blocks or orphaned blobs
+can remain. Removing a successfully uploaded attachment only removes it from
+the draft; configure storage lifecycle retention for unused references.
+
+Install `ffprobe` on the **Webchat host**, not only in the agent container, for
+server metadata checks: images <=16,000,000 pixels; video <=1920x1080 and 4-30
+seconds. Probe failures reject the file. If the executable is absent, only file
+size, declared type and magic bytes are checked on Webchat; the upload reports
+`metadata_validated:false` and the composer displays validation pending. Magic
+bytes and ffprobe metadata are not full decode validation. **The Python backend
+must decode/ffprobe and reject invalid media before analysis** in either case.
+Uploads time out after three minutes; individual probes after twenty seconds.
+
+### Backend contract and security
+
+- Every media-enabled chat input is a string
+  `BLENDER_MEDIA_V1:<base64url UTF8 JSON>.<lowercase hex HMAC-SHA256>`; the MAC
+  covers the base64url part. JSON is `{scope,text,references?,action?}`.
+- Scope is `sha256(browserKey + ':' + lowercaseConversationUUID).slice(0,32)`.
+  The opaque random browser key is in a one-year HttpOnly SameSite=Strict cookie,
+  signed using the shared secret with a separate `browser:` domain prefix.
+  HTTPS origins use Secure cookies. Scope is never accepted from the browser.
+  Cookies/scopes survive server restarts with the same secret; clearing cookies
+  or rotating the secret loses access to old references/jobs. This is browser
+  ownership isolation, not a replacement for production user authentication.
+- Browser text resembling an envelope is nested safely as `text` in a new signed
+  envelope, never forwarded as a control. With media disabled such prefixes are
+  rejected. The agent must unwrap once and must never interpret the unwrapped
+  text or model-generated instructions as authorized control actions.
+- `GET /api/video-jobs/:id?conversation_id=...` sends a signed status action;
+  POST `.../approve` sends `{conversation_id,prompt,resolution,generate_audio}`
+  after an explicit user click; POST `.../cancel` takes `{conversation_id}`.
+  Before a mutation, the server obtains live status under the same job lock.
+  Approval requires `awaiting_seedance_approval` and `seedance_enabled:true`.
+  Python must independently enforce scope ownership, current state, atomic
+  approval/idempotency and cancellation. No manifest or arbitrary URL is read
+  by these control routes, and approval requests are never automatically retried.
+- Controls use the existing local/Foundry Responses builder with `stream:true`,
+  `store:false`, the same `agent_session_id`, and **no** `conversation` or
+  `previous_response_id`. Foundry `user`/`metadata.conversation_id` are retained
+  for scene affinity, without creating a Responses conversation for controls.
+  The backend must return the requested descriptor in output_text.delta SSE
+  chunks as a closed `videojob` JSON fence, even when no model is involved.
+- Descriptor fields are `id,state,progress,mode,duration_seconds,fps,resolution,
+  seedance_enabled` plus optional `preview_url,poster_url,output_url,error,
+  estimate_usd`. IDs must be 32 lowercase hex. Known states are `queued`,
+  `rendering`, `encoding`, `awaiting_seedance_approval`, `wavespeed_uploading`,
+  `wavespeed_submitting`, `wavespeed_processing`, `submission_unknown`,
+  `completed`, `failed`, `cancelled`. Progress is a percentage from 0 to 100;
+  other numeric fields must be finite and nonnegative. Media URLs
+  must be HTTPS on configured Blob hosts, and are played through `/api/blob`
+  with Range support. The proxy rejects redirects. The backend must refresh
+  expired media URLs in live status replies.
+- Job IDs, not descriptors or control messages, are saved per conversation in
+  localStorage (most recent 100). Reload fetches live state; transcript and
+  previous-response state are not modified by polling. Polls are single-flight,
+  7.5 seconds after the preceding response, paused during typed/voice work, with
+  a 45-second server deadline. Errors stop polling and offer Retry status.
+  Completed/failed/cancelled/**submission_unknown** stop automatic polling;
+  unknown submission must be reconciled externally, never auto-resubmitted.
+- Paid processing defaults to 720p and no audio. Explicit consent covers external
+  WaveSpeed/Seedance processing and the estimate. Rates per **input + output**
+  second: 480p $0.11, 720p $0.22, 1080p $0.55, 4k $1.10. With no separate output
+  duration in the contract, the displayed estimate assumes output duration equals
+  `duration_seconds` of the input preview. Actual billing may differ.
+
+### Offline checks
+
+From the repository root:
+
+```powershell
+npm --prefix webchat run build
+node devTools/test_video_webchat.mjs
+node devTools/test_voice_relay.mjs
+```
+
+The media suite uses fake local Responses and Blob operations. It never invokes
+the real agent, uploads to Azure, deploys resources or submits paid video jobs.

@@ -1,9 +1,9 @@
-# Connect test-fantasy to Microsoft Teams
+# Connect blender-agent to Microsoft Teams
 
 `azd deploy` (or the Foundry extension) already did the Azure side for you:
 
-- Azure Bot: `test-fantasy-bot-ba85c04e` (Microsoft Teams channel enabled)
-- Bot ID (msaAppId): `20316876-efde-4133-9318-b2f2e5bc2262`  <- you will paste this as the bot id
+- Azure Bot: `blender-agent-bot-ba85c04e` (Microsoft Teams channel enabled)
+- Bot ID (msaAppId): `27d67f5b-b7cc-4935-b979-0fdb47ccf365`  <- you will paste this as the bot id
 
 Two manual steps remain: (A) create a Teams app package, then (B) upload it.
 They are the same for any activity-protocol agent.
@@ -17,7 +17,7 @@ Pick ONE of the two ways below.
 1. Open https://dev.teams.microsoft.com/apps and select **+ New app**; enter a name.
 2. Fill **Basic information** (short/long description, developer name and URLs).
 3. Left menu **App features** -> **Bot** -> **Select an existing bot** -> enter the
-   Bot ID `20316876-efde-4133-9318-b2f2e5bc2262`, tick the **Personal** scope, then **Save**.
+   Bot ID `27d67f5b-b7cc-4935-b979-0fdb47ccf365`, tick the **Personal** scope, then **Save**.
 4. **Publish** -> **Download the app package** — this gives you a ready-to-upload .zip.
 
 Developer Portal guide: https://learn.microsoft.com/microsoftteams/platform/concepts/build-and-test/teams-developer-portal
@@ -42,11 +42,11 @@ Put these three files in a folder and zip them at the **root** (not inside a sub
     "privacyUrl": "https://example.com/privacy",
     "termsOfUseUrl": "https://example.com/terms"
   },
-  "name": { "short": "test-fantasy", "full": "test-fantasy" },
-  "description": { "short": "test-fantasy agent", "full": "test-fantasy agent on Microsoft Teams" },
+  "name": { "short": "blender-agent", "full": "blender-agent" },
+  "description": { "short": "blender-agent agent", "full": "blender-agent agent on Microsoft Teams" },
   "icons": { "color": "color.png", "outline": "outline.png" },
   "accentColor": "#FFFFFF",
-  "bots": [{ "botId": "20316876-efde-4133-9318-b2f2e5bc2262", "scopes": ["personal"] }]
+  "bots": [{ "botId": "27d67f5b-b7cc-4935-b979-0fdb47ccf365", "scopes": ["personal"] }]
 }
 ```
 
@@ -80,10 +80,10 @@ Package: put the manifest.json from section A (its Bot ID is already filled in) 
 two icons, then zip the three files at the root:
 
 ```sh
-zip -j test-fantasy-teams-app.zip manifest.json color.png outline.png          # bash
+zip -j blender-agent-teams-app.zip manifest.json color.png outline.png          # bash
 ```
 ```powershell
-Compress-Archive manifest.json,color.png,outline.png test-fantasy-teams-app.zip # PowerShell
+Compress-Archive manifest.json,color.png,outline.png blender-agent-teams-app.zip # PowerShell
 ```
 
 Sideload for yourself with the Microsoft 365 Agents Toolkit CLI (atk). `--scope Personal` is a
@@ -92,7 +92,7 @@ per-user install and needs NO Teams admin:
 ```sh
 npm install -g @microsoft/m365agentstoolkit-cli          # one-time; requires Node.js
 atk auth login                                           # sign in with your M365 account
-atk install --file-path test-fantasy-teams-app.zip --scope Personal
+atk install --file-path blender-agent-teams-app.zip --scope Personal
 ```
 
 atk prints a TitleId and a Teams deep link you can open to launch the agent.

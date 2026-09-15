@@ -6,7 +6,8 @@ description: >
   An AI agent that creates and manipulates 3D scenes in Blender.
   Communicates with a headless Blender instance via TCP socket to create
   objects, apply materials, import ready-made 3D models from Microsoft's
-  model library, apply Poly Haven PBR textures, and return viewport screenshots.
+  model library, apply Poly Haven PBR textures, analyze reference images/videos,
+  and render standard or clay camera animations with optional approved Seedance finishing.
 metadata:
   authors:
     - Microsoft
@@ -42,6 +43,10 @@ environment_variables:
     value: "9876"
   - name: AZURE_STORAGE_ACCOUNT_NAME
     value: "{{AZURE_STORAGE_ACCOUNT_NAME}}"
+  - name: VIDEO_RENDER_TIMEOUT_SECONDS
+    value: "1800"
+  # Supply MEDIA_CONTROL_SECRET and optional WAVESPEED_API_KEY through your
+  # deployment's secret configuration, never as literal committed values.
   # ── Teams / M365 Copilot (Activity protocol) ──
   # Kill switch: set to "false" to drop back to a responses-only host without
   # rebuilding the image.

@@ -1,3 +1,24 @@
+import { JOB_ID_RE } from "../api/media";
+
+export function isVideoLink(href: string): boolean {
+  try { return new URL(href).pathname.toLowerCase().endsWith(".mp4"); } catch { return false; }
+}
+
+export function extractVideoJobIds(text: string): string[] {
+  const ids = new Set<string>();
+  for (const block of text.matchAll(/```videojob\s*\n([\s\S]*?)```/gi)) {
+    try {
+      const value = JSON.parse(block[1]);
+      if (typeof value?.id === "string" && JOB_ID_RE.test(value.id)) ids.add(value.id);
+    } catch {}
+  }
+  return [...ids];
+}
+
+export function stripVideoJobBlocks(text: string): string {
+  return text.replace(/```videojob\s*\n[\s\S]*?```/gi, "").replace(/```videojob\b[^]*$/i, "").trim();
+}
+
 /** Heuristic: does this URL look like a downloadable Blender scene file? */
 export function isDownloadLink(href: string): boolean {
   try {
@@ -53,7 +74,7 @@ export function dedupeMarkdownMedia(text: string): string {
     const isImage = match[1] === "!";
     const url = match[2];
     // Only consider media we actually render as cards/images.
-    if (!isImage && !isDownloadLink(url)) continue;
+    if (!isImage && !isDownloadLink(url) && !isVideoLink(url)) continue;
     const start = match.index ?? 0;
     if (seen.has(url)) {
       // Drop this duplicate occurrence; keep the text before it.

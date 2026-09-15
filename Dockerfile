@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Azure Speech SDK runtime dependency (ALSA) for the voice path
     libasound2t64 \
     # Utilities
-    wget netcat-openbsd curl ca-certificates xz-utils \
+    wget netcat-openbsd curl ca-certificates xz-utils ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # ── 1b. Azure CLI ──
@@ -65,7 +65,9 @@ RUN pip install --no-cache-dir --retries "$PIP_RETRIES" --timeout "$PIP_DEFAULT_
 # ── 4. Copy application code ──
 COPY main.py auth_diagnostics.py conversation_telemetry.py \
     voice_pipeline.py activity_bridge.py blender_startup.py \
-    blender_connection.py scene_manager.py entrypoint.sh agent.yaml ./
+    blender_connection.py scene_manager.py artifact_storage.py media_analysis.py \
+    media_control.py video_jobs.py wavespeed_client.py blender_video.py teams_media.py \
+    entrypoint.sh agent.yaml ./
 
 RUN chmod +x /app/entrypoint.sh
 

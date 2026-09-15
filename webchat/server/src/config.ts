@@ -44,6 +44,8 @@ export const config = {
   tokenScope: process.env.AGENT_TOKEN_SCOPE ?? "https://ai.azure.com/.default",
   modelName: process.env.MODEL_NAME ?? "BlenderSceneAgent",
   port: Number(process.env.PORT ?? 5174),
+  mediaControlSecret: process.env.MEDIA_CONTROL_SECRET ?? "",
+  storageAccountName: process.env.AZURE_STORAGE_ACCOUNT_NAME ?? "",
   // Vite dev server origin allowed for CORS
   clientOrigin: process.env.CLIENT_ORIGIN ?? "http://localhost:5173",
   // Hostname suffixes allowed for /api/blob proxy. Comma-separated.

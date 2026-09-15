@@ -28,6 +28,7 @@ azure-ai-agentserver-responses==1.0.0b9
 opentelemetry-api>=1.27.0
 websockets>=13.0
 httpx>=0.27.0
+pydantic==2.13.4
 
 # Activity protocol host (Teams / M365 Copilot). Composed with
 # ResponsesHostServer into a single multi-protocol server — see

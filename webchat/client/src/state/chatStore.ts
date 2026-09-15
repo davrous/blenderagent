@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { streamChat } from "../api/stream";
 import type { VoiceStatus } from "../api/voice";
+import type { ReferenceUpload } from "../api/media";
 
 export type Role = "user" | "assistant";
 export type Status = "streaming" | "done" | "error";
@@ -13,6 +14,7 @@ export interface Message {
   currentStatus: string | null;
   status: Status;
   errorText?: string;
+  referenceNames?: string[];
 }
 
 interface ChatState {
@@ -25,7 +27,7 @@ interface ChatState {
   voiceStatus: VoiceStatus;
   voiceActive: boolean;
   voiceHint: string | null;
-  send: (input: string) => Promise<void>;
+  send: (input: string, references?: ReferenceUpload[]) => Promise<void>;
   selectModel: (modelUrl: string, name: string) => Promise<void>;
   selectTexture: (assetId: string, name: string) => Promise<void>;
   reset: () => void;
@@ -166,10 +168,11 @@ export const useChatStore = create<ChatState>((set, get) => {
   const runAgentTurn = async (
     agentInput: string,
     userBubbleText: string | null,
+    references: ReferenceUpload[] = [],
   ): Promise<void> => {
     if (get().isStreaming || get().voiceActive) return;
     const trimmedInput = agentInput.trim();
-    if (!trimmedInput) return;
+    if (!trimmedInput && !references.length) return;
 
     const newMessages: Message[] = [];
     if (userBubbleText !== null) {
@@ -177,6 +180,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         id: newId(),
         role: "user",
         text: userBubbleText,
+        referenceNames: references.map((reference) => reference.name),
         rawBuffer: userBubbleText,
         currentStatus: null,
         status: "done",
@@ -269,6 +273,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           }
         },
         ac.signal,
+        references.map((reference) => reference.blob_name),
       );
       finalize("done");
     } catch (err) {
@@ -379,8 +384,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     }
   },
 
-  send: async (input) => {
-    await runAgentTurn(input, input.trim());
+  send: async (input, references = []) => {
+    await runAgentTurn(input, input.trim(), references);
   },
 
   // Clicking a model thumbnail in a gallery: send a silent note asking the agent

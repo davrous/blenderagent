@@ -16,12 +16,15 @@ import requests
 import tempfile
 import traceback
 import os
+import sys
 import shutil
 import zipfile
 import io
 from datetime import datetime
 from contextlib import redirect_stdout, suppress
 import logging
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Configure logger for BlenderMCP server
 logging.basicConfig(
@@ -201,6 +204,8 @@ class BlenderMCPServer:
             }
 
         handlers = {
+            "apply_camera_path": self.apply_camera_path,
+            "snapshot_animation": self.snapshot_animation,
             "get_scene_info": self.get_scene_info,
             "get_object_info": self.get_object_info,
             "get_viewport_screenshot": self.get_viewport_screenshot,
@@ -238,6 +243,29 @@ class BlenderMCPServer:
 
     # ──────────────────────────────────────────────
     # Core command handlers
+
+    def apply_camera_path(self, keys, fps, frames, interpolation):
+        from blender_video import apply_camera_keys
+        from media_analysis import validate_camera_path
+
+        validated = validate_camera_path([
+            {"time": 0 if key["frame"] == 1 else frames / fps if key["frame"] == frames else (key["frame"] - 1) / fps,
+             "position": key["position"], "target": key["target"], "lens": key["lens"]}
+            for key in keys
+        ], frames / fps, fps, interpolation)
+        return apply_camera_keys(validated, fps, frames, interpolation)
+
+    def snapshot_animation(self, path):
+        from pathlib import Path
+
+        destination = Path(path).resolve()
+        root = (Path.home() / "tmp" / "video-jobs").resolve()
+        if not destination.is_relative_to(root) or destination.name != "scene.blend":
+            raise ValueError("Invalid animation snapshot path")
+        if bpy.context.scene.camera is None:
+            raise ValueError("Apply a camera path before rendering")
+        bpy.ops.wm.save_as_mainfile(filepath=str(destination), check_existing=False, copy=True)
+        return {"saved": True}
     # ──────────────────────────────────────────────
 
     def get_scene_info(self):

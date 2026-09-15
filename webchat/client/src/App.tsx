@@ -3,17 +3,21 @@ import { useChatStore } from "./state/chatStore";
 import { ChatView } from "./components/ChatView";
 import { Composer } from "./components/Composer";
 import { voice } from "./api/voice";
+import { loadJobIds } from "./api/media";
 
 interface Health {
   mode: string;
   agentUrl: string;
   model: string;
   voiceEnabled?: boolean;
+  mediaEnabled?: boolean;
+  mediaDisabledReason?: string;
 }
 
 export function App() {
   const reset = useChatStore((s) => s.reset);
   const messages = useChatStore((s) => s.messages);
+  const conversationId = useChatStore((state) => state.conversationId);
   const [health, setHealth] = useState<Health | null>(null);
 
   useEffect(() => {
@@ -65,7 +69,7 @@ export function App() {
           <button
             className="reset-btn"
             onClick={reset}
-            disabled={messages.length === 0}
+            disabled={messages.length === 0 && loadJobIds(conversationId).length === 0}
             title="Start a new conversation"
           >
             Reset
@@ -73,10 +77,10 @@ export function App() {
         </div>
       </header>
       <main className="app-main">
-        <ChatView />
+        <ChatView mediaAvailable={!!health?.mediaEnabled} />
       </main>
       <footer className="app-footer">
-        <Composer voiceAvailable={voiceAvailable} />
+        <Composer key={conversationId} voiceAvailable={voiceAvailable} mediaAvailable={!!health?.mediaEnabled} mediaDisabledReason={health?.mediaDisabledReason} />
       </footer>
     </div>
   );

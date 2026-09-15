@@ -1,11 +1,16 @@
 import { useEffect, useRef } from "react";
 import { useChatStore } from "../state/chatStore";
 import { MessageBubble } from "./MessageBubble";
+import { VideoJobs } from "./VideoJobCard";
+import { extractVideoJobIds } from "../lib/parseMarkdown";
+import { loadJobIds } from "../api/media";
 
 const STICK_THRESHOLD_PX = 32;
 
-export function ChatView() {
+export function ChatView({ mediaAvailable = false }: { mediaAvailable?: boolean }) {
   const messages = useChatStore((s) => s.messages);
+  const conversationId = useChatStore((state) => state.conversationId);
+  const jobIds = [...new Set(messages.filter((message) => message.role === "assistant").flatMap((message) => extractVideoJobIds(message.text)))];
   const contentRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   const prevLenRef = useRef(messages.length);
@@ -70,7 +75,7 @@ export function ChatView() {
     };
   }, []);
 
-  if (messages.length === 0) {
+  if (messages.length === 0 && !loadJobIds(conversationId).length) {
     return (
       <div className="chat-view chat-view-empty" ref={contentRef}>
         <div className="chat-empty">
@@ -88,6 +93,7 @@ export function ChatView() {
       {messages.map((m) => (
         <MessageBubble key={m.id} message={m} />
       ))}
+      <VideoJobs key={conversationId} conversationId={conversationId} discoveredIds={jobIds} enabled={mediaAvailable} />
     </div>
   );
 }

@@ -2,7 +2,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug Local Workflow HTTP Server",
+            "name": "Debug Local Blender Agent",
             "type": "debugpy",
             "request": "attach",
             "connect": {

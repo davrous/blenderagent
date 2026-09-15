@@ -12,6 +12,8 @@ import {
   deleteSession,
 } from "./sessions.js";
 import { attachVoiceRelay } from "./voice.js";
+import { MEDIA_PREFIX, browserKey, isUuid, mediaEnabled, ownedReferences, requireOrigin, signEnvelope } from "./mediaSecurity.js";
+import { registerMediaRoutes, requestScope } from "./videoJobs.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -39,7 +41,9 @@ app.use(
   }),
 );
 
-app.get("/api/health", (_req, res) => {
+app.get("/api/health", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  if (mediaEnabled(config.mediaControlSecret)) browserKey(req, res, config.mediaControlSecret, new URL(config.clientOrigin).protocol === "https:");
   res.json({
     mode: config.mode,
     agentUrl: config.agentUrl,
@@ -47,6 +51,8 @@ app.get("/api/health", (_req, res) => {
     apiVersion: config.mode === "foundry" ? config.apiVersion : undefined,
     model: config.modelName,
     voiceEnabled: config.voiceEnabled,
+    mediaEnabled: mediaEnabled(config.mediaControlSecret),
+    mediaDisabledReason: mediaEnabled(config.mediaControlSecret) ? undefined : "Media disabled: MEDIA_CONTROL_SECRET must contain at least 32 characters on Webchat and the agent.",
   });
 });
 
@@ -91,6 +97,7 @@ app.get("/api/blob", async (req, res) => {
   try {
     upstream = await fetch(target, {
       method: "GET",
+      redirect: "error",
       headers: {
         // Forward Range for partial requests if the client uses them.
         ...(req.headers.range ? { Range: String(req.headers.range) } : {}),
@@ -152,20 +159,13 @@ interface ChatRequestBody {
   input?: string;
   previous_response_id?: string | null;
   conversation_id?: string;
-}
-
-function isUuid(v: unknown): v is string {
-  return (
-    typeof v === "string" &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-      v,
-    )
-  );
+  references?: unknown;
 }
 
 async function buildUpstreamRequest(
   body: ChatRequestBody,
   input: string,
+  control = false,
 ): Promise<{ url: string; headers: Record<string, string>; payload: Record<string, unknown>; conversationId?: string }> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -194,7 +194,8 @@ async function buildUpstreamRequest(
       // never saved to blob storage, so it cannot survive container recycle.
       agent_session_id: conversationId,
     };
-    if (body.previous_response_id) {
+    if (control) payload.store = false;
+    if (!control && body.previous_response_id) {
       payload.previous_response_id = body.previous_response_id;
     }
     console.log(
@@ -210,7 +211,7 @@ async function buildUpstreamRequest(
   // carry BOTH a session (compute/scene affinity) AND a conversation (history +
   // portal trace grouping). Without `conversation`, gen_ai.conversation.id is
   // empty, so turns never appear as a conversation in the portal / Monitor tab.
-  const foundryConversationId = await getOrCreateConversation(conversationId);
+  const foundryConversationId = control ? undefined : await getOrCreateConversation(conversationId);
 
   headers["Foundry-Features"] = config.foundryFeaturesHeader;
 
@@ -225,7 +226,7 @@ async function buildUpstreamRequest(
     agent_session_id: agentSessionId,
     // Group turns into one Foundry conversation so the portal traces / Monitor
     // tab record them and multi-turn history is platform-managed.
-    conversation: foundryConversationId,
+    ...(control ? { store: false } : { conversation: foundryConversationId }),
     // The Foundry `agent_session_id` is a Foundry-internal session id that
     // does NOT propagate to `context.session.session_id` in the agent_framework
     // middleware. We therefore also pass the WebChat conversation UUID through
@@ -242,11 +243,26 @@ async function buildUpstreamRequest(
   return { url, headers, payload, conversationId };
 }
 
-app.post("/api/chat", async (req, res) => {
+registerMediaRoutes(app, buildUpstreamRequest);
+
+app.post("/api/chat", requireOrigin(config.clientOrigin), async (req, res) => {
   const body = req.body as ChatRequestBody;
-  const input = (body.input ?? "").toString();
-  if (!input.trim()) {
+  let input = typeof body?.input === "string" ? body.input : "";
+  if (!input.trim() && !(Array.isArray(body?.references) && body.references.length)) {
     res.status(400).json({ error: "input is required" });
+    return;
+  }
+
+  try {
+    if (!isUuid(body.conversation_id)) throw new Error("conversation_id (UUID) is required");
+    if (mediaEnabled(config.mediaControlSecret)) {
+      const scope = requestScope(req, res, body.conversation_id);
+      input = signEnvelope(config.mediaControlSecret, scope, input, ownedReferences(body.references, scope));
+    } else if (body.references !== undefined || input.trimStart().startsWith(MEDIA_PREFIX)) {
+      throw new Error("Media is disabled; reference IDs and media envelopes are not accepted");
+    }
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : "Invalid media input" });
     return;
   }
 
@@ -361,7 +377,7 @@ app.post("/api/chat", async (req, res) => {
  * Reset endpoint: deletes the foundry session bound to this conversation_id.
  * No-op (200) in local mode.
  */
-app.post("/api/reset", async (req, res) => {
+app.post("/api/reset", requireOrigin(config.clientOrigin), async (req, res) => {
   const body = req.body as { conversation_id?: string };
   if (config.mode !== "foundry") {
     res.json({ ok: true, mode: config.mode });
