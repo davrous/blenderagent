@@ -35,7 +35,15 @@ def authenticated(context):
 
 
 def attachment_specs(attachments):
-    if not isinstance(attachments, list) or not 1 <= len(attachments) <= 4:
+    if not isinstance(attachments, list) or not attachments:
+        raise MediaError("Send between one and four reference attachments (200 MiB maximum each).")
+    attachments = [attachment for attachment in attachments if not (
+        field(attachment, "content_type", "contentType") == "text/html"
+        and not field(attachment, "name")
+        and not field(attachment, "content_url", "contentUrl")
+        and isinstance(field(attachment, "content"), str)
+    )]
+    if len(attachments) > 4:
         raise MediaError("Send between one and four reference attachments (200 MiB maximum each).")
     specs = []
     for attachment in attachments:

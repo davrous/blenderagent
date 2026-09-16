@@ -1,6 +1,7 @@
 """Offline video pipeline contracts: .venv/Scripts/python devTools/test_video_pipeline.py."""
 
 import json
+import asyncio
 import os
 import sys
 import unittest
@@ -36,6 +37,62 @@ class ControlTests(unittest.TestCase):
             decode_envelope(encode(value), "wrong-secret" * 4)
         with self.assertRaises(ValueError):
             decode_envelope(encode(dict(value, scope="c" * 32)), secret)
+
+
+class NotificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_progress_throttled_and_final_ordered(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = VideoJobs(storage=SimpleNamespace(), root=temporary)
+            entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            values = []
+
+            async def notify(value):
+                values.append(value)
+                if len(values) == 1:
+                    entered.set()
+                    await release.wait()
+                if value["state"] == "completed":
+                    finished.set()
+
+            notify.live_progress = True
+            jobs._notifications["job"] = (asyncio.get_running_loop(), notify)
+            document = {"id": "job", "state": "rendering", "progress": 10}
+            with patch.object(jobs, "describe", side_effect=lambda value: value), patch("video_jobs.time", SimpleNamespace(monotonic=lambda: 100)):
+                jobs._publish(document)
+                await asyncio.wait_for(entered.wait(), 2)
+                document["progress"] = 20
+                jobs._publish(document)
+                self.assertEqual(values[0]["progress"], 10)
+                release.set()
+                await asyncio.wrap_future(jobs._notification_sends["job"][2])
+                jobs._publish(document)
+                self.assertEqual(len(values), 1)
+                with patch("video_jobs.time", SimpleNamespace(monotonic=lambda: 111)):
+                    jobs._publish(document)
+                    jobs._publish({**document, "state": "completed", "progress": 100}, final=True)
+                await asyncio.wait_for(finished.wait(), 2)
+            self.assertEqual([(value["state"], value["progress"]) for value in values],
+                             [("rendering", 10), ("rendering", 20), ("completed", 100)])
+            self.assertNotIn("job", jobs._notifications)
+            self.assertNotIn("job", jobs._notification_sends)
+
+    async def test_other_channels_receive_only_final_notification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = VideoJobs(storage=SimpleNamespace(), root=temporary)
+            finished = asyncio.Event()
+            values = []
+
+            async def notify(value):
+                values.append(value)
+                finished.set()
+
+            jobs._notifications["job"] = (asyncio.get_running_loop(), notify)
+            with patch.object(jobs, "describe", side_effect=lambda value: value):
+                jobs._publish({"id": "job", "state": "rendering", "progress": 10})
+                self.assertEqual(jobs._notification_sends, {})
+                jobs._publish({"id": "job", "state": "completed", "progress": 100}, final=True)
+                await asyncio.wait_for(finished.wait(), 2)
+            self.assertEqual([value["state"] for value in values], ["completed"])
 
 
 class JobTests(unittest.TestCase):

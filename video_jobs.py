@@ -84,6 +84,7 @@ class VideoJobs:
         self._guard = threading.Lock()
         self._render_lock = threading.Lock()
         self._notifications = {}
+        self._notification_sends = {}
 
     def resume_pending(self):
         for identity in self.root.glob("*/identity.json"):
@@ -140,12 +141,51 @@ class VideoJobs:
         if document["state"] not in FINAL_STATES:
             self.ensure(scope, job_id)
         directory = self.root / job_id
+        self._read_progress(document, directory)
+        return self.describe(document)
+
+    @staticmethod
+    def _read_progress(document, directory):
         if document["state"] == "rendering" and (directory / "progress").exists():
             try:
-                document["progress"] = min(90, int((directory / "progress").read_text()) * 90 // document["frames"])
+                with (directory / "progress").open() as progress:
+                    document["progress"] = max(0, min(90, int(progress.read(32)) * 90 // document["frames"]))
             except (OSError, ValueError):
                 pass
-        return self.describe(document)
+
+    def _publish(self, document, *, final=False):
+        job_id = document["id"]
+        notification = self._notifications.get(job_id)
+        if not notification:
+            return
+        loop, callback = notification
+        if loop.is_closed() or (not final and not getattr(callback, "live_progress", False)):
+            return
+        now = time.monotonic()
+        fingerprint = (document["state"], document["progress"])
+        previous = self._notification_sends.get(job_id)
+        if not final and previous and (
+            not previous[2].done() or now - previous[0] < 10 or fingerprint == previous[1]
+        ):
+            return
+
+        async def deliver():
+            if previous and not previous[2].done():
+                await asyncio.gather(asyncio.wrap_future(previous[2]), return_exceptions=True)
+            try:
+                value = await asyncio.to_thread(self.describe, dict(document))
+                await callback(value)
+            except Exception:
+                logger.warning("Video notification failed for %s; use Status to retrieve it", job_id)
+
+        snapshot = dict(document)
+        document = snapshot
+        future = asyncio.run_coroutine_threadsafe(deliver(), loop)
+        if final:
+            self._notifications.pop(job_id, None)
+            self._notification_sends.pop(job_id, None)
+        else:
+            self._notification_sends[job_id] = (now, fingerprint, future)
 
     def approve(self, scope, job_id, **settings):
         try:
@@ -241,14 +281,7 @@ class VideoJobs:
         (directory / "scene.blend").unlink(missing_ok=True)
         (directory / "preview.mp4").unlink(missing_ok=True)
         (directory / "final.mp4").unlink(missing_ok=True)
-        notification = self._notifications.pop(job_id, None)
-        if notification:
-            loop, callback = notification
-            future = asyncio.run_coroutine_threadsafe(callback(self.describe(document)), loop)
-            def delivered(result):
-                if result.cancelled() or result.exception() is not None:
-                    logger.warning("Video notification failed for %s; use Status to retrieve it", job_id)
-            future.add_done_callback(delivered)
+        self._publish(document, final=True)
 
     def _render(self, document, etag, directory, lost):
         if not (directory / "scene.blend").is_file():
@@ -266,6 +299,8 @@ class VideoJobs:
                     while process.poll() is None:
                         if lost.wait(1) or time.monotonic() > deadline or (directory / "cancel").exists():
                             raise ValueError("Render cancelled, lease lost or render deadline exceeded.")
+                        self._read_progress(document, directory)
+                        self._publish(document)
                     if process.returncode:
                         raise ValueError("Blender snapshot rendering failed.")
                 finally:
@@ -277,6 +312,7 @@ class VideoJobs:
                             process.kill()
                             process.wait()
             document, etag = self.repo.update(document, etag, "encoding", progress=90)
+            self._publish(document)
         if lost.is_set():
             raise ValueError("Job lease was lost.")
         ffmpeg = os.getenv("FFMPEG_PATH", "ffmpeg")
@@ -296,6 +332,7 @@ class VideoJobs:
         return self.repo.update(document, etag, state, **changes)
 
     def _finish(self, document, etag, directory, lost):
+        self._publish(document)
         if document["state"] == "wavespeed_submitting":
             return self.repo.update(document, etag, "submission_unknown", error="A restart interrupted submission. Reconcile in WaveSpeed; this job will not submit again.")
         client = WaveSpeedClient()
@@ -315,6 +352,7 @@ class VideoJobs:
             while time.time() < document["provider_deadline"]:
                 if lost.wait(delay) or (directory / "cancel").exists():
                     return document, etag
+                self._publish(document)
                 try:
                     result = client.poll(document["prediction_id"])
                 except ValueError:

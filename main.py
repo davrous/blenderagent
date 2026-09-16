@@ -195,12 +195,24 @@ MODEL_DEPLOYMENT_NAME = os.getenv("MODEL_DEPLOYMENT_NAME", "gpt-4.1")
 # ──────────────────────────────────────────────
 # Resilience knobs (overridable via env)
 # ──────────────────────────────────────────────
-# Time without any streaming chunk before we emit a "still working" heartbeat
-# to keep the client connection alive and reassure the user.
-HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("AGENT_HEARTBEAT_SECONDS", "30"))
-# Hard wall-clock cap for a single agent turn. Aborts cleanly with a friendly
-# message rather than letting the request hang indefinitely.
-TURN_TIMEOUT_SECONDS = float(os.getenv("AGENT_TURN_TIMEOUT_SECONDS", "180"))
+# Abort only when the upstream stream has made no progress for this long. A
+# separate absolute cap still bounds turns that remain active indefinitely.
+TURN_IDLE_TIMEOUT_SECONDS = float(os.getenv("AGENT_TURN_IDLE_TIMEOUT_SECONDS", "180"))
+TURN_TIMEOUT_SECONDS = float(os.getenv("AGENT_TURN_TIMEOUT_SECONDS", "900"))
+
+
+def _turn_timeout_reason(
+    turn_started: float,
+    last_progress: float,
+    now: float,
+    idle_timeout: float,
+    absolute_timeout: float,
+) -> str | None:
+    if now - turn_started >= absolute_timeout:
+        return "absolute"
+    if now - last_progress >= idle_timeout:
+        return "idle"
+    return None
 # User-facing message when the upstream model fails or the turn times out.
 _FRIENDLY_MODEL_ERROR_TEXT = (
     "\n\n⚠️ The model service hit a transient error and could not finish this "
@@ -1618,6 +1630,7 @@ class ToolStatusMiddleware(AgentMiddleware):
 
             # Resilience state for this turn
             turn_started = asyncio.get_running_loop().time()
+            last_progress = turn_started
             chunks_seen = 0
             session_id = (
                 getattr(context.session, "session_id", None)
@@ -1649,14 +1662,31 @@ class ToolStatusMiddleware(AgentMiddleware):
             # user-facing keep-alive during normal tool-execution gaps.
             consumer_task = asyncio.current_task()
             timed_out = False
+            timeout_reason = ""
 
             async def _watchdog():
-                nonlocal timed_out
+                nonlocal timed_out, timeout_reason
                 try:
-                    await asyncio.sleep(TURN_TIMEOUT_SECONDS)
-                    timed_out = True
-                    if consumer_task is not None:
-                        consumer_task.cancel()
+                    poll_seconds = max(
+                        0.1,
+                        min(5.0, TURN_IDLE_TIMEOUT_SECONDS, TURN_TIMEOUT_SECONDS),
+                    )
+                    while True:
+                        await asyncio.sleep(poll_seconds)
+                        now = asyncio.get_running_loop().time()
+                        timeout_reason = _turn_timeout_reason(
+                            turn_started,
+                            last_progress,
+                            now,
+                            TURN_IDLE_TIMEOUT_SECONDS,
+                            TURN_TIMEOUT_SECONDS,
+                        ) or ""
+                        if not timeout_reason:
+                            continue
+                        timed_out = True
+                        if consumer_task is not None:
+                            consumer_task.cancel()
+                        return
                 except asyncio.CancelledError:
                     pass
 
@@ -1664,6 +1694,7 @@ class ToolStatusMiddleware(AgentMiddleware):
 
             try:
                 async for update in original_stream:
+                    last_progress = asyncio.get_running_loop().time()
                     chunks_seen += 1
                     for content in (update.contents or []):
                         # ── Status messages before each tool call ──
@@ -1730,10 +1761,15 @@ class ToolStatusMiddleware(AgentMiddleware):
                 elapsed_ms = int(
                     (asyncio.get_running_loop().time() - turn_started) * 1000
                 )
+                idle_ms = int(
+                    (asyncio.get_running_loop().time() - last_progress) * 1000
+                )
                 logger.error(
-                    "Agent turn timed out: session_id=%s elapsed_ms=%d "
-                    "chunks_seen=%d cap_seconds=%.0f",
-                    session_id, elapsed_ms, chunks_seen, TURN_TIMEOUT_SECONDS,
+                    "Agent turn timed out: reason=%s session_id=%s elapsed_ms=%d "
+                    "idle_ms=%d chunks_seen=%d idle_cap_seconds=%.0f "
+                    "absolute_cap_seconds=%.0f",
+                    timeout_reason, session_id, elapsed_ms, idle_ms, chunks_seen,
+                    TURN_IDLE_TIMEOUT_SECONDS, TURN_TIMEOUT_SECONDS,
                 )
                 yield AgentResponseUpdate(
                     contents=[Content.from_text(_FRIENDLY_TIMEOUT_TEXT)],

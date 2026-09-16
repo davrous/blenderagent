@@ -399,7 +399,7 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
         user_text, history_text = submitted
     else:
         user_text = history_text = _user_text(context)
-    if not user_text and attachments:
+    if not user_text and specs:
         user_text = history_text = "Analyze the attached reference and propose a Blender blockout."
     if not user_text and video_action is None:
         if value is not None:
@@ -512,8 +512,15 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                         raise MediaError("Submit video actions separately from reference attachments.")
                     result = await run_video_action(context, video_action, scope, notifier, current)
                     if current():
-                        for attachment in video_attachments(result, scope, Attachment):
-                            await relay.card(attachment)
+                        if notifier and getattr(notifier[1], "live_progress", False):
+                            binding = slot.video_cards.setdefault((scope, result["id"]), _LiveVideoCard())
+                            reply_id = getattr(context.activity, "reply_to_id", None)
+                            if binding.activity_id is None and isinstance(reply_id, str) and reply_id:
+                                binding.activity_id = reply_id
+                            await notifier[1](result, refresh=True)
+                        else:
+                            for attachment in video_attachments(result, scope, Attachment):
+                                await relay.card(attachment)
                         await relay.text("Video job updated.")
                         if tracked_id:
                             slot.media_receipts = [*slot.media_receipts[-63:], tracked_id]
@@ -561,7 +568,7 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                                 # which gallery it offered; the user sees the filtered
                                 # version with the fenced JSON replaced by a card.
                                 reply_parts.append(content.text)
-                                await _emit_filtered(relay, gallery.feed(content.text), dedupe)
+                                await _emit_filtered(relay, gallery.feed(content.text), dedupe, notifier=notifier)
                 finally:
                     video_notifier.reset(notifier_token)
                     video_scope.reset(scope_token)
@@ -592,7 +599,7 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                 await pump
             try:
                 if slot.epoch == inbound_epoch:
-                    await _emit_filtered(relay, gallery.flush(), dedupe, final=True)
+                    await _emit_filtered(relay, gallery.flush(), dedupe, final=True, notifier=notifier)
             except Exception:
                 logger.warning("Could not flush the gallery buffer")
             # The streaming queue drains in the background, so a Bot Connector
@@ -651,6 +658,7 @@ async def _emit_filtered(
     dedupe: Any,
     *,
     final: bool = False,
+    notifier=None,
 ) -> None:
     """Send the plain-text part of a filtered chunk, then any gallery cards.
 
@@ -670,12 +678,26 @@ async def _emit_filtered(
 
             try:
                 value = await asyncio.to_thread(get_video_jobs().status, card.scope, card.job_id)
-                for attachment in video_attachments(value, card.scope, Attachment):
-                    await emitter.card(attachment)
+                if notifier and getattr(notifier[1], "live_progress", False):
+                    await notifier[1](value)
+                else:
+                    for attachment in video_attachments(value, card.scope, Attachment):
+                        await emitter.card(attachment)
             except Exception:
                 await emitter.text("The video job could not be loaded for this scene. Retry Status on the original card.")
         else:
             await emitter.card(card)
+
+
+class _LiveVideoCard:
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.activity_id = None
+        self.fingerprint = None
+        self.blocked = False
+        self.replaced = False
+        self.video_kind = None
+        self.retry_at = 0
 
 
 def _capture_video_notifier(context, previous, slot, epoch, scope):
@@ -688,10 +710,43 @@ def _capture_video_notifier(context, previous, slot, epoch, scope):
         return None
     sender._current = lambda: slot.epoch == epoch
     seen = set()
+    live = _channel(context) == Channels.ms_teams and _supports_streaming(context)
 
-    async def notify(value):
+    async def notify(value, refresh=False):
         from teams_media import video_attachments
 
+        if live:
+            if not sender._current():
+                return
+            binding = slot.video_cards.setdefault((scope, value["id"]), _LiveVideoCard())
+            async with binding.lock:
+                if refresh:
+                    binding.blocked = False
+                if not sender._current() or binding.blocked:
+                    return
+                states = ["queued", "rendering", "encoding", "awaiting_seedance_approval",
+                          "wavespeed_uploading", "wavespeed_submitting", "wavespeed_processing",
+                          "completed", "failed", "cancelled", "submission_unknown"]
+                fingerprint = (states.index(value["state"]), value["progress"])
+                if binding.fingerprint is not None:
+                    if fingerprint < binding.fingerprint or (fingerprint == binding.fingerprint and not refresh):
+                        return
+                    if binding.fingerprint[0] >= 7 and fingerprint != binding.fingerprint:
+                        return
+                attachments = video_attachments(value, scope, Attachment)
+                try:
+                    async with asyncio.timeout(90):
+                        delivered = await sender._update_video_card(binding, attachments[0])
+                    if delivered:
+                        binding.fingerprint = fingerprint
+                        video_kind = "output" if value.get("output_url") else "preview"
+                        if len(attachments) > 1 and video_kind != binding.video_kind and sender._current():
+                            async with asyncio.timeout(30):
+                                if await sender._send(Activity(type="message", attachments=attachments[1:])):
+                                    binding.video_kind = video_kind
+                except Exception:
+                    logger.warning("Live video card update failed; recover using Status")
+            return
         async with slot.lock:
             if not sender._current():
                 return
@@ -707,6 +762,7 @@ def _capture_video_notifier(context, previous, slot, epoch, scope):
             except Exception:
                 logger.warning("Video notification failed; recover results using Status")
 
+    notify.live_progress = live
     return asyncio.get_running_loop(), notify
 
 
@@ -742,6 +798,7 @@ def _clear_conversation(state: Any, slot: _Conversation) -> int:
     slot.generation = generation
     state.conversation.set_value(_SCENE_GENERATION_KEY, generation)
     slot.epoch += 1
+    slot.video_cards.clear()
     _save_history(state, slot, [])
     return generation
 
@@ -1385,6 +1442,69 @@ class _ProactiveEmitter(_Emitter):
         )
         await self._send(activity)
 
+    async def _update_video_card(self, binding, attachment):
+        if time.monotonic() < binding.retry_at:
+            return False
+        client = await self._factory.create_connector_client(
+            self._context, self._identity, self._reference.service_url,
+            self._audience, self._identity.get_token_scope(), False,
+        )
+        try:
+            for attempt in range(2):
+                if not self._current() or binding.blocked:
+                    return False
+                activity = Activity(type="message", attachments=[attachment])
+                activity.apply_conversation_reference(self._reference)
+                activity.reply_to_id = None
+                activity.id = binding.activity_id
+                try:
+                    if binding.activity_id:
+                        await client.conversations.update_activity(
+                            self._reference.conversation.id, binding.activity_id, activity,
+                        )
+                    else:
+                        response = await client.conversations.send_to_conversation(
+                            self._reference.conversation.id, activity,
+                        )
+                        binding.activity_id = getattr(response, "id", None)
+                        if not binding.activity_id:
+                            binding.blocked = True
+                            logger.warning("Teams returned no video card ID; automatic updates disabled")
+                    return True
+                except asyncio.CancelledError:
+                    if not binding.activity_id:
+                        binding.blocked = True
+                    raise
+                except Exception as error:
+                    response = getattr(error, "response", None)
+                    status = getattr(error, "status_code", None) or getattr(response, "status", None) or getattr(response, "status_code", None)
+                    if status in (401, 403):
+                        binding.blocked = True
+                    detail = getattr(error, "error", None)
+                    detail = getattr(detail, "error", detail)
+                    code = detail.get("code") if isinstance(detail, dict) else getattr(detail, "code", None)
+                    if status == 404 and code == "ActivityNotFound" and binding.activity_id and not binding.replaced:
+                        binding.activity_id = None
+                        binding.replaced = True
+                        continue
+                    if status == 429:
+                        headers = getattr(response, "headers", {}) or {}
+                        try:
+                            delay = max(1, float(headers.get("Retry-After", "10")))
+                        except (TypeError, ValueError):
+                            delay = 10
+                        binding.retry_at = time.monotonic() + delay
+                        if delay <= 60 and attempt == 0:
+                            await asyncio.sleep(delay)
+                            continue
+                    elif not binding.activity_id:
+                        binding.blocked = True
+                    raise
+            return False
+        finally:
+            with contextlib.suppress(Exception):
+                await client.close()
+
     async def _deliver_direct(self, activity: Any) -> bool:
         """Post the activity with a connector client built like the inbound one.
 
@@ -1745,7 +1865,7 @@ class _Conversation:
     the life of the container, and ``TurnState`` is the durable write-through.
     """
 
-    __slots__ = ("lock", "history", "loaded", "epoch", "generation", "media_receipts")
+    __slots__ = ("lock", "history", "loaded", "epoch", "generation", "media_receipts", "video_cards")
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
@@ -1756,6 +1876,7 @@ class _Conversation:
         self.epoch = 0
         self.generation = 0
         self.media_receipts = []
+        self.video_cards = {}
 
 
 _conversations: dict[str, _Conversation] = {}

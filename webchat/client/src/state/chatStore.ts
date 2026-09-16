@@ -39,6 +39,7 @@ interface ChatState {
 }
 
 const CONVERSATION_ID_STORAGE_KEY = "webchat.conversationId";
+const TURN_PROGRESS_INTERVAL_MS = 30_000;
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -203,6 +204,21 @@ export const useChatStore = create<ChatState>((set, get) => {
       abortController: ac,
     });
 
+    const turnStartedAt = Date.now();
+    const progressTimer = window.setInterval(() => {
+      const elapsedSeconds = Math.max(1, Math.floor((Date.now() - turnStartedAt) / 1000));
+      const elapsed = elapsedSeconds < 60
+        ? `${elapsedSeconds}s`
+        : `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`;
+      set((state) => ({
+        messages: state.messages.map((message) =>
+          message.id === assistantId && message.status === "streaming"
+            ? { ...message, currentStatus: `Still building this complex scene (${elapsed} elapsed)...` }
+            : message,
+        ),
+      }));
+    }, TURN_PROGRESS_INTERVAL_MS);
+
     const appendDelta = (delta: string) => {
       set((state) => ({
         messages: state.messages.map((m) =>
@@ -282,6 +298,8 @@ export const useChatStore = create<ChatState>((set, get) => {
         return;
       }
       finalize("error", err instanceof Error ? err.message : String(err));
+    } finally {
+      window.clearInterval(progressTimer);
     }
   };
 

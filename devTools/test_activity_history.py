@@ -25,6 +25,8 @@ import video_jobs as vj
 import media_analysis as ma
 from artifact_storage import conversation_scope
 
+_supports_streaming = ab._supports_streaming
+
 
 class _Activity(SimpleNamespace):
     def __init__(self, **values):
@@ -294,12 +296,16 @@ async def main():
     await test_card_submit_transcript()
     await test_detach_race()
     await test_attachment_only_rejected_explicitly()
+    await test_text_with_html_attachment()
     await test_reference_ingestion()
     await test_attachment_transport()
     await test_video_actions()
     await test_scoped_turn_and_reference_history()
     await test_video_cards()
     await test_video_notifications()
+    with patch.object(ab, "_supports_streaming", _supports_streaming):
+        await test_live_video_card_updates()
+        await test_live_video_card_failures()
     await test_video_delivery_fallback()
     await test_clear_queued_action()
     test_optional_imports()
@@ -314,6 +320,26 @@ async def test_attachment_only_rejected_explicitly():
     await ab._run_turn(agent, context, _State({}))
     _check("unsupported attachment does not invoke model", agent.seen, [])
     _check("attachment-only message gets actionable response", bool(context.sent), True)
+
+
+async def test_text_with_html_attachment():
+    for index, attachment in enumerate([
+        {"contentType": "text/html", "content": "<p>Hello</p>"},
+        SimpleNamespace(content_type="text/html", content="<p>Hello</p>"),
+    ]):
+        context = _Context(f"c-html-{index}", text="Hello")
+        context.activity.attachments = [attachment]
+        agent = _Agent()
+        with patch.object(tm, "store_references", AsyncMock()) as upload:
+            await ab._run_turn(agent, context, _State({}))
+        _check(f"HTML text attachment {index} reaches model", bool(agent.seen), True)
+        _check(f"HTML text attachment {index} is not uploaded", upload.await_count, 0)
+
+    context = _Context("c-html-empty", text="")
+    context.activity.attachments = [{"contentType": "text/html", "content": ""}]
+    agent = _Agent()
+    await ab._run_turn(agent, context, _State({}))
+    _check("HTML-only empty message does not invent a reference prompt", agent.seen, [])
 
 
 SCOPE = "a" * 32
@@ -377,9 +403,17 @@ async def _rejects(label, call):
 async def test_reference_ingestion():
     context = _Context("c-reference")
     valid = {"contentType": "image/png", "name": "reference.png", "contentUrl": "data:image/png;base64," + base64.b64encode(PNG).decode()}
+    html = {"contentType": "text/html", "content": "<p>Analyze these</p>"}
+    _check("HTML message body is not a reference", tm.attachment_specs([html]), [])
+    _check("HTML does not consume four-reference limit",
+           tm.attachment_specs([html] + [valid] * 4), tm.attachment_specs([valid] * 4))
     malformed = [([valid] * 5), [{**valid, "name": "../ref.png"}], [{**valid, "name": "ref.mp4"}],
                  [{**valid, "contentType": {}}], [{**valid, "contentUrl": 42}],
-                 [{"contentType": tm.FILE_INFO, "name": "ref.mp4", "content": {}}]]
+                 [{"contentType": tm.FILE_INFO, "name": "ref.mp4", "content": {}}],
+                 [{**html, "name": "page.html"}],
+                 [{**html, "contentUrl": "https://files.example/page.html"}],
+                 [html] + [valid] * 5,
+                 [html, {"contentType": "application/pdf"}]]
     for index, attachments in enumerate(malformed):
         try:
             tm.attachment_specs(attachments)
@@ -622,6 +656,130 @@ async def test_video_notifications():
     resume.set()
     await pending
     _check("clear during fresh-token await suppresses send", len(sent), 1)
+
+
+async def test_live_video_card_updates():
+    conversation = "c-live-video"
+    _reset(conversation)
+    context = _Context(conversation)
+    context.activity.channel_id = ab.Channels.ms_teams
+    context.activity.is_agentic_request = lambda: False
+    slot = ab._conversation_slot(conversation)
+    sends, updates = [], []
+
+    async def send(conversation_id, activity):
+        sends.append(activity)
+        return SimpleNamespace(id="card-1")
+
+    async def update(conversation_id, activity_id, activity):
+        updates.append((activity_id, activity))
+        return SimpleNamespace(id=activity_id)
+
+    client = SimpleNamespace(conversations=SimpleNamespace(send_to_conversation=send, update_activity=update), close=AsyncMock())
+    context.turn_state["factory"] = SimpleNamespace(create_connector_client=AsyncMock(return_value=client))
+    notifier = ab._capture_video_notifier(context, ab._FallbackEmitter(context), slot, slot.epoch, SCOPE)
+    _check("Teams opts into worker progress", notifier[1].live_progress, True)
+    result = {**_Jobs().describe(_Jobs().document), "state": "rendering", "progress": 10}
+    result.pop("preview_url")
+    result.pop("poster_url")
+    with patch.object(vj, "get_video_jobs", return_value=SimpleNamespace(status=lambda *args: result)):
+        await ab._emit_filtered(ab._FallbackEmitter(context), ("", [ab._VideoCard(SCOPE, JOB_ID)]),
+                                ab._MediaDedupeFilter(), notifier=notifier)
+    _check("initial live card sent once", len(sends), 1)
+    _check("live card is standalone without split text", sends[0].text, "")
+    await notifier[1]({**result, "progress": 40})
+    await notifier[1]({**result, "progress": 40})
+    _check("progress updates original card", [item[0] for item in updates], ["card-1"])
+    next_notifier = ab._capture_video_notifier(context, ab._FallbackEmitter(context), slot, slot.epoch, SCOPE)
+    await next_notifier[1]({**result, "state": "completed", "progress": 100})
+    await notifier[1]({**result, "progress": 60})
+    _check("card ID survives notifier recapture and stale progress is dropped", len(updates), 2)
+    _check("progress never sends another card", len(sends), 1)
+    await next_notifier[1]({**result, "state": "completed", "progress": 100}, refresh=True)
+    _check("explicit Status can refresh completed card links", len(updates), 3)
+    ab._clear_conversation(_State({}), slot)
+    await notifier[1]({**result, "progress": 80})
+    _check("clear stops live card edits", len(updates), 3)
+    _check("clear discards old card bindings", slot.video_cards, {})
+    recovery_context = _Context("c-live-recovery")
+    recovery_context.activity.channel_id = ab.Channels.ms_teams
+    recovery_context.activity.is_agentic_request = lambda: False
+    recovery_context.activity.reply_to_id = "existing-card"
+    recovery_context.turn_state["factory"] = context.turn_state["factory"]
+    recovery_scope = conversation_scope(ab._scene_key("c-live-recovery"))
+    recovery_context.activity.value = _action(scope=recovery_scope, action="status")
+    jobs = _Jobs(recovery_scope)
+    agent = _Agent()
+    with patch.object(vj, "get_video_jobs", return_value=jobs), patch.dict(sys.modules, {"media_control": SimpleNamespace(control_action=jobs.control)}):
+        await ab._run_turn(agent, recovery_context, _State({}))
+    _check("Status recovers existing card ID after registry loss", updates[-1][0], "existing-card")
+    _check("recovered Status does not invoke model", agent.seen, [])
+    _check("recovered Status registers live notifications", jobs._notifications[JOB_ID][1].live_progress, True)
+    context.activity.is_agentic_request = lambda: True
+    copilot = ab._capture_video_notifier(context, ab._FallbackEmitter(context), slot, slot.epoch, SCOPE)
+    _check("M365 Copilot keeps non-live delivery", copilot[1].live_progress, False)
+
+
+async def test_live_video_card_failures():
+    context = _Context("c-live-failures")
+    context.activity.channel_id = ab.Channels.ms_teams
+    context.activity.is_agentic_request = lambda: False
+    result = {**_Jobs().describe(_Jobs().document), "state": "rendering", "progress": 20}
+    attachment = tm.video_attachments(result, SCOPE, ab.Attachment)[0]
+    send = AsyncMock(return_value=SimpleNamespace(id="replacement"))
+    update = AsyncMock()
+    client = SimpleNamespace(conversations=SimpleNamespace(send_to_conversation=send, update_activity=update), close=AsyncMock())
+    factory = SimpleNamespace(create_connector_client=AsyncMock(return_value=client))
+    context.turn_state["factory"] = factory
+    sender = ab._ProactiveEmitter(context, ab._FallbackEmitter(context))
+    binding = ab._LiveVideoCard()
+    binding.activity_id = "original"
+    throttled = RuntimeError("throttled")
+    throttled.status_code = 429
+    throttled.response = SimpleNamespace(headers={"Retry-After": "0"})
+    update.side_effect = [throttled, None]
+    _check("429 retries existing activity", await sender._update_video_card(binding, attachment), True)
+    _check("429 does not create duplicate card", send.await_count, 0)
+    _check("429 uses same target twice", [call.args[1] for call in update.await_args_list], ["original", "original"])
+    missing = RuntimeError("missing activity")
+    missing.status_code = 404
+    update.side_effect = missing
+    try:
+        await sender._update_video_card(binding, attachment)
+    except RuntimeError:
+        pass
+    _check("generic 404 does not replace the card", send.await_count, 0)
+    missing.error = SimpleNamespace(code="ActivityNotFound")
+    update.side_effect = missing
+    _check("deleted card gets one replacement", await sender._update_video_card(binding, attachment), True)
+    _check("replacement ID retained", binding.activity_id, "replacement")
+    try:
+        await sender._update_video_card(binding, attachment)
+    except RuntimeError:
+        pass
+    _check("missing-card replacement is bounded", send.await_count, 1)
+    denied = RuntimeError("blocked bot")
+    denied.status_code = 403
+    update.side_effect = denied
+    try:
+        await sender._update_video_card(binding, attachment)
+    except RuntimeError:
+        pass
+    _check("403 stops automatic updates", binding.blocked, True)
+    _check("403 never posts a replacement", send.await_count, 1)
+    uncertain = ab._LiveVideoCard()
+    send.side_effect = TimeoutError("response lost")
+    try:
+        await sender._update_video_card(uncertain, attachment)
+    except TimeoutError:
+        pass
+    _check("ambiguous initial send stops duplicate creation", uncertain.blocked, True)
+    _check("ambiguous send is not automatically retried", await sender._update_video_card(uncertain, attachment), False)
+    binding.blocked = False
+    sender._current = lambda: False
+    update.reset_mock()
+    _check("clear during connector acquisition stops update", await sender._update_video_card(binding, attachment), False)
+    _check("stale connector never edits card", update.await_count, 0)
 
 
 async def test_video_delivery_fallback():

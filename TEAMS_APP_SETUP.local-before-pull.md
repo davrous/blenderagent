@@ -1,47 +1,28 @@
-# Connect blender-agent to Microsoft Teams
+# Connect new-fantasy-worlds-agent to Microsoft Teams
 
 `azd deploy` (or the Foundry extension) already did the Azure side for you:
 
-- Azure Bot: `blender-agent-bot-ba85c04e` (Microsoft Teams channel enabled)
-- Bot ID (msaAppId): `27d67f5b-b7cc-4935-b979-0fdb47ccf365`  <- you will paste this as the bot id
+- Azure Bot: `new-fantasy-worlds-agent67789` (Microsoft Teams channel enabled)
+- Bot ID (msaAppId): `020d1fb4-dee5-4d83-a95b-08ac93340924`  <- you will paste this as the bot id
 
 Two manual steps remain: (A) create a Teams app package, then (B) upload it.
 They are the same for any activity-protocol agent.
 
-Follow **A**, then **B**, for the recommended portal-based path. Manual packaging
-and command-line installation are optional alternatives at the end. The bot above
-belongs to this environment; substitute your deployed bot ID for another environment.
-
 ## A. Create the Teams app package
 
-Use the Developer Portal steps below. If you need to maintain the manifest yourself,
-use [manual packaging](#alternative-build-the-app-package-by-hand) instead, then return to step B.
+Pick ONE of the two ways below.
 
 ### Easiest — Teams Developer Portal (no files by hand)
 
 1. Open https://dev.teams.microsoft.com/apps and select **+ New app**; enter a name.
 2. Fill **Basic information** (short/long description, developer name and URLs).
 3. Left menu **App features** -> **Bot** -> **Select an existing bot** -> enter the
-   Bot ID `27d67f5b-b7cc-4935-b979-0fdb47ccf365`, tick the **Personal** scope, then **Save**.
+   Bot ID `020d1fb4-dee5-4d83-a95b-08ac93340924`, tick the **Personal** scope, then **Save**.
 4. **Publish** -> **Download the app package** — this gives you a ready-to-upload .zip.
 
 Developer Portal guide: https://learn.microsoft.com/microsoftteams/platform/concepts/build-and-test/teams-developer-portal
 
-## B. Upload (sideload) the app — just for yourself
-
-You do NOT need a Teams admin to try it yourself:
-
-1. In Teams, go to **Apps** -> **Manage your apps** -> **Upload an app**.
-2. Select **Upload a custom app**, choose your .zip, then **Add**.
-3. Select **Open**, then send a message to talk to your agent.
-
-Upload a custom app guide: https://learn.microsoft.com/microsoftteams/platform/concepts/deploy-and-publish/apps-upload
-
-If **Upload a custom app** is missing or greyed out, custom app upload is turned off for
-your tenant, or you want everyone in your org to get it from the org app catalog. Both need
-a Teams admin: https://learn.microsoft.com/microsoftteams/platform/concepts/build-and-test/prepare-your-o365-tenant
-
-## Alternative: Build the App Package by Hand
+### Or by hand — build the .zip yourself
 
 Put these three files in a folder and zip them at the **root** (not inside a subfolder):
 
@@ -61,16 +42,13 @@ Put these three files in a folder and zip them at the **root** (not inside a sub
     "privacyUrl": "https://example.com/privacy",
     "termsOfUseUrl": "https://example.com/terms"
   },
-  "name": { "short": "blender-agent", "full": "blender-agent" },
-  "description": { "short": "blender-agent agent", "full": "blender-agent agent on Microsoft Teams" },
+  "name": { "short": "new-fantasy-worlds-agent", "full": "new-fantasy-worlds-agent" },
+  "description": { "short": "new-fantasy-worlds-agent agent", "full": "new-fantasy-worlds-agent agent on Microsoft Teams" },
   "icons": { "color": "color.png", "outline": "outline.png" },
   "accentColor": "#FFFFFF",
-  "bots": [{ "botId": "27d67f5b-b7cc-4935-b979-0fdb47ccf365", "scopes": ["personal"] }]
+  "bots": [{ "botId": "020d1fb4-dee5-4d83-a95b-08ac93340924", "scopes": ["personal"] }]
 }
 ```
-
-After creating the ZIP, return to [step B](#b-upload-sideload-the-app--just-for-yourself)
-to install it, or use the optional command-line path below.
 
 Note: `id` is a NEW GUID for the app itself (generate one) — it is NOT the Bot ID.
 Only `bots[].botId` uses the Bot ID above.
@@ -79,19 +57,33 @@ Only `bots[].botId` uses the Bot ID above.
 - Manifest schema reference: https://learn.microsoft.com/microsoftteams/platform/resources/schema/manifest-schema
 - Validate your .zip before uploading: https://dev.teams.microsoft.com/tools/store-validation
 
+## B. Upload (sideload) the app — just for yourself
+
+You do NOT need a Teams admin to try it yourself:
+
+1. In Teams, go to **Apps** -> **Manage your apps** -> **Upload an app**.
+2. Select **Upload a custom app**, choose your .zip, then **Add**.
+3. Select **Open**, then send a message to talk to your agent.
+
+Upload a custom app guide: https://learn.microsoft.com/microsoftteams/platform/concepts/deploy-and-publish/apps-upload
+
+If **Upload a custom app** is missing or greyed out, custom app upload is turned off for
+your tenant, or you want everyone in your org to get it from the org app catalog. Both need
+a Teams admin: https://learn.microsoft.com/microsoftteams/platform/concepts/build-and-test/prepare-your-o365-tenant
+
 ## C. Optional — do both from the command line
 
 Steps A and B can be scripted. This is a convenience path for repeat runs; it needs extra
 tooling and does NOT bypass the tenant custom-app-upload setting above.
 
-Package: put the manifest.json from the manual-packaging section (with your bot ID) next to your
+Package: put the manifest.json from section A (its Bot ID is already filled in) next to your
 two icons, then zip the three files at the root:
 
 ```sh
-zip -j blender-agent-teams-app.zip manifest.json color.png outline.png          # bash
+zip -j new-fantasy-worlds-agent-teams-app.zip manifest.json color.png outline.png          # bash
 ```
 ```powershell
-Compress-Archive manifest.json,color.png,outline.png blender-agent-teams-app.zip # PowerShell
+Compress-Archive manifest.json,color.png,outline.png new-fantasy-worlds-agent-teams-app.zip # PowerShell
 ```
 
 Sideload for yourself with the Microsoft 365 Agents Toolkit CLI (atk). `--scope Personal` is a
@@ -100,7 +92,7 @@ per-user install and needs NO Teams admin:
 ```sh
 npm install -g @microsoft/m365agentstoolkit-cli          # one-time; requires Node.js
 atk auth login                                           # sign in with your M365 account
-atk install --file-path blender-agent-teams-app.zip --scope Personal
+atk install --file-path new-fantasy-worlds-agent-teams-app.zip --scope Personal
 ```
 
 atk prints a TitleId and a Teams deep link you can open to launch the agent.

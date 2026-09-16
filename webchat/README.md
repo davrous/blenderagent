@@ -101,7 +101,7 @@ webchat/
 ## How it works
 
 - **Streaming.** The proxy forwards the agent's native SSE (`response.created`, `response.output_text.delta`, `response.completed`, …) untouched. The client parses these frames manually and appends each `delta` to the active assistant message; `react-markdown` re-renders incrementally so images appear as soon as the closing `)` of their markdown lands.
-- **Multi-turn — local mode.** On `response.completed`, the client stores `response.id` and sends it as `previous_response_id` on the next request. The agent uses this to maintain `service_thread_id`, which the `SceneIsolationMiddleware` keys on for per-conversation Blender scene isolation.
+- **Multi-turn — local mode.** On `response.completed`, the client stores `response.id` and sends it as `previous_response_id` on the next request for response-history continuity. Blender still has one shared scene per container; the stable browser conversation identity supports reset detection, not separate per-user scene files.
 - **Multi-turn — foundry mode.** The client mints a UUID `conversation_id` per session and sends it on every request. The proxy lazily creates both a Foundry hosted-agent session (sandbox/scene affinity) and a Foundry Responses conversation (persisted model transcript and Monitor grouping). Both factories are single-flight per browser UUID, so overlapping voice prewarm/reconnect and typed requests await one pending create instead of producing competing IDs. Typed requests and voice control frames carry the same two IDs, so either modality sees turns produced by the other. `Reset` deletes the session, evicts resolved and pending mappings, and rotates the browser conversation id.
 - **Status pills.** The agent's `ToolStatusMiddleware` emits italic single-line markers like `*Rendering the final image…*`. The client extracts complete blocks of this shape from the streamed buffer and renders them as a pulsing badge above the message instead of inline italic text. The latest one replaces the previous; they disappear when the response completes.
 - **Inline images.** Tools like `get_viewport_screenshot`, `render_preview`, and `render_final` return their results as `![label](sas-url)`. The client's custom `img` renderer wraps them in a button that opens a full-screen lightbox (click backdrop or press `Esc` to close).
@@ -123,7 +123,7 @@ webchat/
 
 - No browser-side Entra sign-in: relies on `az login` host credentials. Adequate for dev/demo; for multi-user production, layer Entra ID on top.
 - The visible browser message list is not persisted across page reloads. Foundry model history is persisted in its Responses conversation while the proxy retains the browser UUID → `conv_...` mapping; production multi-replica proxies should move that mapping to shared storage.
-- References and video job controls are Webchat-only; voice and Teams attachments are unchanged.
+- Reference uploads and paid approval use visual controls. Voice can request video work in the same signed media scope but cannot approve payment. Teams also supports references and video cards, including in-place progress; see the [main video workflow](../README.md#reference-to-video-workflow).
 - No syntax highlighting for code blocks.
 
 ## Reference uploads and video jobs
