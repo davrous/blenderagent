@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, Download, RefreshCw, X } from "lucide-react";
 import { useChatStore } from "../state/chatStore";
-import { blobProxyUrl, loadJobIds, paidEstimate, requestVideoJob, RESOLUTION_RATES, saveJobIds, TERMINAL_JOB_STATES, type VideoJob, type VideoResolution } from "../api/media";
+import { blobProxyUrl, paidEstimate, requestVideoJob, RESOLUTION_RATES, TERMINAL_JOB_STATES, type VideoJob, type VideoResolution } from "../api/media";
 
 export function VideoJobCard({ id, conversationId, enabled }: { id: string; conversationId: string; enabled: boolean }) {
   const busy = useChatStore((state) => state.isStreaming || state.voiceActive);
@@ -94,24 +94,4 @@ export function VideoJobCard({ id, conversationId, enabled }: { id: string; conv
       {error && <p className="media-error" role="alert">{error} <button type="button" className="media-command secondary" disabled={!enabled || busy || loading || acting} onClick={retry}><RefreshCw size={15} /> Retry status</button></p>}
     </article>
   );
-}
-
-export function VideoJobs({ conversationId, discoveredIds, enabled }: { conversationId: string; discoveredIds: string[]; enabled: boolean }) {
-  const [ids, setIds] = useState(() => loadJobIds(conversationId));
-  const [storageError, setStorageError] = useState(false);
-  const discoveredKey = discoveredIds.join(",");
-  useEffect(() => {
-    setIds((previous) => {
-      const next = [...new Set([...previous, ...discoveredKey.split(",").filter(Boolean)])].slice(-100);
-      return next.join(",") === previous.join(",") ? previous : next;
-    });
-  }, [discoveredKey]);
-  useEffect(() => {
-    try { saveJobIds(conversationId, ids); setStorageError(false); } catch { setStorageError(true); }
-  }, [conversationId, ids]);
-  if (!ids.length) return null;
-  return <section className="video-jobs" aria-label="Video jobs">
-    {storageError && <p className="media-warning">Browser storage is unavailable. Job IDs will not survive a reload.</p>}
-    {ids.map((id) => <VideoJobCard key={id} id={id} conversationId={conversationId} enabled={enabled} />)}
-  </section>;
 }

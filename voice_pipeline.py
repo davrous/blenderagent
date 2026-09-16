@@ -502,6 +502,7 @@ class VoiceSession:
         # persisted transcript shared by typed and voice turns.
         self._agent_session_id: Optional[str] = None
         self._foundry_conversation_id: Optional[str] = foundry_conversation_id
+        self._media_context: Optional[str] = None
         # Degradation only: if the web relay cannot resolve a Foundry
         # conversation, retain voice-to-voice context for this socket. Normal
         # hosted turns use `conversation`; local turns use previous_response_id.
@@ -589,6 +590,9 @@ class VoiceSession:
         fcid = (message or {}).get("foundry_conversation_id")
         if isinstance(fcid, str) and fcid:
             self._foundry_conversation_id = fcid
+
+        media_context = (message or {}).get("media_context")
+        self._media_context = media_context if isinstance(media_context, str) else None
 
         if mtype == "start":
             await self._start_capture()
@@ -986,11 +990,18 @@ class VoiceSession:
 
     def _build_agent_request(self, transcript: str) -> dict[str, Any]:
         """Build the shared-conversation Responses payload for one voice turn."""
-        input_value: Any = transcript
+        input_text = transcript
+        if self._media_context:
+            from media_control import encode_voice_input
+
+            input_text = encode_voice_input(transcript, self._media_context)
+        elif transcript.startswith("BLENDER_MEDIA_V1:"):
+            raise ValueError("Media control envelopes cannot be submitted through voice.")
+        input_value: Any = input_text
         if _is_hosted() and not self._foundry_conversation_id and self._fallback_history:
             input_value = [
                 *self._fallback_history,
-                {"role": "user", "content": transcript},
+                {"role": "user", "content": input_text},
             ]
         body: dict[str, Any] = {
             "model": AGENT_MODEL,

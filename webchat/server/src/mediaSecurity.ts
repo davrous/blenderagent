@@ -59,6 +59,14 @@ export function signEnvelope(secret: string, scope: string, text: string, refere
   return `${MEDIA_PREFIX}${part}.${mac(part, secret)}`;
 }
 
+export function voiceMediaContext(cookieHeader: string | undefined, conversationId: string | undefined, secret: string): string | undefined {
+  if (!mediaEnabled(secret) || !isUuid(conversationId)) return undefined;
+  const cookie = (cookieHeader ?? "").split(";").map((part) => part.trim())
+    .find((part) => part.startsWith(`${COOKIE_NAME}=`))?.slice(COOKIE_NAME.length + 1) ?? "";
+  const key = verifyBrowserKey(cookie, secret);
+  return key ? signEnvelope(secret, scopeFor(key, conversationId), "Voice request follows.") : undefined;
+}
+
 export function ownedReferences(value: unknown, scope: string): string[] {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length > 4) throw new Error("At most four reference IDs are allowed");

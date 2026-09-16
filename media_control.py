@@ -46,6 +46,17 @@ def decode_envelope(text: str, secret: str | None = None) -> dict:
     return value
 
 
+def encode_voice_input(transcript: str, context: str) -> str:
+    secret = os.getenv("MEDIA_CONTROL_SECRET", "")
+    value = decode_envelope(context, secret)
+    if set(value) != {"scope", "text"} or value["text"] != "Voice request follows.":
+        raise ValueError("Invalid voice media context: only a conversation scope is allowed.")
+    payload = json.dumps({"scope": value["scope"], "text": transcript}).encode()
+    part = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    signature = hmac.new(secret.encode(), part.encode(), hashlib.sha256).hexdigest()
+    return f"{PREFIX}{part}.{signature}"
+
+
 def require_scope():
     scope = video_scope.get()
     if not scope:

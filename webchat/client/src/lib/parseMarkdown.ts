@@ -1,4 +1,5 @@
 import { JOB_ID_RE } from "../api/media";
+import type { Message } from "../state/chatStore";
 
 export function isVideoLink(href: string): boolean {
   try { return new URL(href).pathname.toLowerCase().endsWith(".mp4"); } catch { return false; }
@@ -13,6 +14,31 @@ export function extractVideoJobIds(text: string): string[] {
     } catch {}
   }
   return [...ids];
+}
+
+export type ChatTimelineEntry =
+  | { kind: "message"; message: Message }
+  | { kind: "video"; id: string };
+
+export function buildChatTimeline(messages: readonly Message[], recoveredIds: readonly string[] = []) {
+  const entries: ChatTimelineEntry[] = [];
+  const seen = new Set<string>();
+  const addJob = (id: string) => {
+    if (!JOB_ID_RE.test(id) || seen.has(id)) return;
+    seen.add(id);
+    entries.push({ kind: "video", id });
+  };
+  recoveredIds.forEach(addJob);
+  for (const message of messages) {
+    entries.push({ kind: "message", message });
+    if (message.role === "assistant") extractVideoJobIds(message.text).forEach(addJob);
+  }
+  const jobIds = [...seen].slice(-100);
+  const retained = new Set(jobIds);
+  return {
+    entries: entries.filter((entry) => entry.kind === "message" || retained.has(entry.id)),
+    jobIds,
+  };
 }
 
 export function stripVideoJobBlocks(text: string): string {

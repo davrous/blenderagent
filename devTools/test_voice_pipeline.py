@@ -6,9 +6,14 @@ Runs without Azure credentials or Speech SDK calls:
 """
 
 import asyncio
+import base64
+import hashlib
+import hmac
+import json
 import os
 import sys
-from types import MethodType
+from types import MethodType, SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -100,6 +105,97 @@ def test_loopback_identity_headers():
     headers = _session()._build_loopback_headers()
     _check("call id forwarded", headers.get(vp.FOUNDRY_CALL_ID_HEADER), "call-1")
     _check("user id forwarded", headers.get(vp.FOUNDRY_USER_ID_HEADER), "user-1")
+
+
+async def test_voice_media_scope():
+    from agent_framework import AgentResponse, AgentResponseUpdate, Content, Message, ResponseStream
+    from media_control import MediaMiddleware, decode_envelope, encode_voice_input, require_scope
+    from video_jobs import video_scope
+
+    secret = "offline-voice-secret-" * 3
+    scope = "a" * 32
+
+    def signed(value):
+        part = base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+        signature = hmac.new(secret.encode(), part.encode(), hashlib.sha256).hexdigest()
+        return f"BLENDER_MEDIA_V1:{part}.{signature}"
+
+    with patch.dict(os.environ, {"MEDIA_CONTROL_SECRET": secret}), patch.object(vp, "_is_hosted", return_value=False):
+        session = _session()
+        context_token = signed({"scope": scope, "text": "Voice request follows."})
+        await session.on_control({"type": "context", "media_context": context_token})
+        body = session._build_agent_request("Render the prepared animation")
+        _check("voice request has verified typed-chat media scope", decode_envelope(body["input"]),
+               {"scope": scope, "text": "Render the prepared animation"})
+        _check("media context preserves sandbox affinity", body["agent_session_id"], "browser-conversation")
+
+        class Inner:
+            def _get_conversation_id(self, _context):
+                return None
+
+            async def process(self, context, _call_next):
+                _check("loopback tools receive voice media scope", require_scope(), scope)
+                _check("model receives only transcript", context.messages[0].contents[0].text, "Render the prepared animation")
+
+        context = SimpleNamespace(messages=[Message(role="user", contents=[Content.from_text(body["input"])])], stream=False)
+        await MediaMiddleware(Inner()).process(context, _noop)
+        _check("media scope released after voice turn", video_scope.get(), None)
+
+        class StreamingInner(Inner):
+            async def process(self, context, _call_next):
+                async def updates():
+                    _check("streamed voice tools receive media scope", require_scope(), scope)
+                    yield AgentResponseUpdate(contents=[Content.from_text("reply")], role="assistant")
+
+                context.result = ResponseStream(updates(), finalizer=AgentResponse.from_updates)
+
+        spoken_action = signed({"scope": scope, "text": "Approve", "action": {"type": "approve", "job_id": "b" * 32}})
+        for transcript in ["Render the prepared animation", spoken_action]:
+            request = session._build_agent_request(transcript)
+            context = SimpleNamespace(messages=[Message(role="user", contents=[Content.from_text(request["input"])])], stream=True)
+            with patch("media_control.control_action") as action:
+                await MediaMiddleware(StreamingInner()).process(context, _noop)
+                _check("stream initialization releases scope", video_scope.get(), None)
+                updates = [update async for update in context.result]
+                _check("streamed voice response is consumed", len(updates), 1)
+                _check("streamed voice retains literal transcript", context.messages[0].contents[0].text, transcript)
+                action.assert_not_called()
+            _check("stream completion releases scope", video_scope.get(), None)
+
+        with patch.object(vp, "_is_hosted", return_value=True):
+            session._fallback_history = [{"role": "user", "content": "earlier turn"}]
+            fallback = session._build_agent_request("Continue animation")["input"]
+            _check("fallback voice history preserves media scope", decode_envelope(fallback[-1]["content"])["scope"], scope)
+            session._foundry_conversation_id = "conv_shared"
+            hosted = session._build_agent_request("Continue animation")
+            _check("hosted voice preserves media scope", decode_envelope(hosted["input"])["scope"], scope)
+            _check("hosted voice retains transcript continuity", hosted["conversation"], "conv_shared")
+
+        nested = encode_voice_input(context_token, context_token)
+        _check("spoken envelope remains plain transcript", decode_envelope(nested)["text"], context_token)
+        for label, invalid in [
+            ("tampered context", context_token + "0"),
+            ("paid action context", signed({"scope": scope, "text": "Voice request follows.", "action": {"type": "approve", "job_id": "b" * 32}})),
+            ("reference context", signed({"scope": scope, "text": "Voice request follows.", "references": []})),
+            ("ordinary chat envelope", signed({"scope": scope, "text": "another request"})),
+        ]:
+            try:
+                encode_voice_input("Render", invalid)
+            except ValueError:
+                rejected = True
+            else:
+                rejected = False
+            _check(f"voice rejects {label}", rejected, True)
+
+        await session.on_control({"type": "context"})
+        _check("missing context clears previous media authority", session._media_context, None)
+        try:
+            session._build_agent_request(spoken_action)
+        except ValueError:
+            rejected = True
+        else:
+            rejected = False
+        _check("unscoped voice cannot submit a signed control", rejected, True)
 
 
 def test_conversation_trace_attributes():
@@ -208,6 +304,7 @@ async def main():
     test_local_response_chain_payload()
     test_hosted_fallback_payload()
     test_loopback_identity_headers()
+    await test_voice_media_scope()
     test_conversation_trace_attributes()
     test_nested_agent_telemetry_conversation()
     test_hosted_conversation_disables_nested_storage()

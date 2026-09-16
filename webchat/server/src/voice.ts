@@ -3,6 +3,7 @@ import type { Server, IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
 import { config } from "./config.js";
 import { getBearerToken } from "./auth.js";
+import { voiceMediaContext } from "./mediaSecurity.js";
 import {
   appendConversationItems,
   getOrCreateConversation,
@@ -125,13 +126,14 @@ function sendTo(ws: WebSocket, data: RawData, isBinary: boolean): void {
  * session as the text path (unified conversation: portal traces + cross-modal
  * memory). Binary (audio) frames and non-JSON text pass through untouched.
  */
-function injectSession(
+export function injectSession(
   data: RawData,
   isBinary: boolean,
   foundryAgentSessionId: string | undefined,
   foundryConversationId: string | undefined,
+  mediaContext?: string,
 ): { data: RawData; isBinary: boolean } {
-  if (isBinary || (!foundryAgentSessionId && !foundryConversationId)) {
+  if (isBinary) {
     return { data, isBinary };
   }
   try {
@@ -139,7 +141,9 @@ function injectSession(
       ? Buffer.concat(data).toString("utf-8")
       : data.toString();
     const obj = JSON.parse(text);
-    if (obj && typeof obj === "object" && typeof obj.type === "string") {
+    if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+      delete obj.media_context;
+      if (mediaContext) obj.media_context = mediaContext;
       if (foundryAgentSessionId) {
         obj.foundry_agent_session_id = foundryAgentSessionId;
       }
@@ -213,6 +217,7 @@ function relay(
   upstream: WebSocket,
   foundryAgentSessionId?: string,
   foundryConversationId?: string,
+  mediaContext?: string,
 ): void {
   const pending: Array<{ data: RawData; isBinary: boolean }> = [];
   const committedResponses = new Set<string>();
@@ -225,6 +230,7 @@ function relay(
       isBinary,
       foundryAgentSessionId,
       foundryConversationId,
+      mediaContext,
     );
     if (upstreamOpen) sendTo(upstream, out.data, out.isBinary);
     else pending.push({ data: out.data, isBinary: out.isBinary });
@@ -407,7 +413,10 @@ async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): 
     return;
   }
 
-  relay(browser, upstream, foundryAgentSessionId, foundryConversationId);
+  const mediaContext = req.headers.origin === new URL(config.clientOrigin).origin
+    ? voiceMediaContext(req.headers.cookie, conversationId, config.mediaControlSecret)
+    : undefined;
+  relay(browser, upstream, foundryAgentSessionId, foundryConversationId, mediaContext);
 }
 
 /**

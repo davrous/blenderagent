@@ -1,19 +1,36 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useChatStore } from "../state/chatStore";
 import { MessageBubble } from "./MessageBubble";
-import { VideoJobs } from "./VideoJobCard";
-import { extractVideoJobIds } from "../lib/parseMarkdown";
-import { loadJobIds } from "../api/media";
+import { VideoJobCard } from "./VideoJobCard";
+import { buildChatTimeline } from "../lib/parseMarkdown";
+import { loadJobIds, saveJobIds } from "../api/media";
 
 const STICK_THRESHOLD_PX = 32;
 
 export function ChatView({ mediaAvailable = false }: { mediaAvailable?: boolean }) {
-  const messages = useChatStore((s) => s.messages);
   const conversationId = useChatStore((state) => state.conversationId);
-  const jobIds = [...new Set(messages.filter((message) => message.role === "assistant").flatMap((message) => extractVideoJobIds(message.text)))];
+  return <ChatTimeline key={conversationId} conversationId={conversationId} mediaAvailable={mediaAvailable} />;
+}
+
+function ChatTimeline({ conversationId, mediaAvailable }: { conversationId: string; mediaAvailable: boolean }) {
+  const messages = useChatStore((state) => state.messages);
+  const [recoveredIds] = useState(() => {
+    const visibleIds = new Set(buildChatTimeline(messages).jobIds);
+    return loadJobIds(conversationId).filter((id) => !visibleIds.has(id));
+  });
+  const [storageError, setStorageError] = useState(false);
+  const { entries, jobIds } = buildChatTimeline(messages, recoveredIds);
+  const jobKey = jobIds.join(",");
   const contentRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   const prevLenRef = useRef(messages.length);
+
+  useEffect(() => {
+    try {
+      saveJobIds(conversationId, jobKey ? jobKey.split(",") : []);
+      setStorageError(false);
+    } catch { setStorageError(true); }
+  }, [conversationId, jobKey]);
 
   // Force snap-to-bottom whenever a new user message is appended.
   if (messages.length > prevLenRef.current) {
@@ -75,7 +92,7 @@ export function ChatView({ mediaAvailable = false }: { mediaAvailable?: boolean 
     };
   }, []);
 
-  if (messages.length === 0 && !loadJobIds(conversationId).length) {
+  if (entries.length === 0) {
     return (
       <div className="chat-view chat-view-empty" ref={contentRef}>
         <div className="chat-empty">
@@ -90,10 +107,10 @@ export function ChatView({ mediaAvailable = false }: { mediaAvailable?: boolean 
 
   return (
     <div className="chat-view" ref={contentRef}>
-      {messages.map((m) => (
-        <MessageBubble key={m.id} message={m} />
-      ))}
-      <VideoJobs key={conversationId} conversationId={conversationId} discoveredIds={jobIds} enabled={mediaAvailable} />
+      {storageError && jobIds.length > 0 && <p className="media-warning">Browser storage is unavailable. Job IDs will not survive a reload.</p>}
+      {entries.map((entry) => entry.kind === "message"
+        ? <MessageBubble key={`message:${entry.message.id}`} message={entry.message} />
+        : <VideoJobCard key={`video:${entry.id}`} id={entry.id} conversationId={conversationId} enabled={mediaAvailable} />)}
     </div>
   );
 }

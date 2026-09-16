@@ -6,9 +6,87 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { once } from "node:events";
 import { access } from "node:fs/promises";
+import { mock } from "node:test";
 const webchatRequire = createRequire(new URL("../webchat/package.json", import.meta.url));
 const { register } = await import(pathToFileURL(webchatRequire.resolve("tsx/esm/api")).href);
 register();
+const { loadHealth } = await import("../webchat/client/src/api/health.ts");
+const originalHealthFetch = globalThis.fetch;
+const healthFixture = { mode: "local", agentUrl: "http://localhost:8088", model: "test", mediaEnabled: true, voiceEnabled: true };
+const flushHealth = () => new Promise((resolve) => setImmediate(resolve));
+mock.timers.enable({ apis: ["setTimeout"] });
+try {
+  let attempts = 0;
+  const healthResults = [];
+  let failures = 0;
+  globalThis.fetch = async (_url, options) => {
+    assert.equal(options.cache, "no-store");
+    attempts++;
+    if (attempts === 1) throw new TypeError("fetch failed");
+    if (attempts === 2) return Response.json(healthFixture, { status: 503 });
+    if (attempts === 3) return new Response("not json");
+    if (attempts === 4) return Response.json({ mediaEnabled: true });
+    return Response.json(healthFixture);
+  };
+  const stop = loadHealth((health) => healthResults.push(health), () => failures++);
+  await flushHealth();
+  assert.equal(failures, 1);
+  for (const delay of [1000, 2000, 4000, 5000]) {
+    mock.timers.tick(delay - 1);
+    await flushHealth();
+    assert.equal(healthResults.length, 0);
+    mock.timers.tick(1);
+    await flushHealth();
+  }
+  assert.equal(attempts, 5);
+  assert.equal(failures, 4);
+  assert.deepEqual(healthResults, [healthFixture]);
+  mock.timers.tick(30000);
+  await flushHealth();
+  assert.equal(attempts, 5);
+  stop();
+
+  const disabled = { ...healthFixture, mediaEnabled: false, mediaDisabledReason: "Media disabled by configuration" };
+  globalThis.fetch = async () => { attempts++; return Response.json(disabled); };
+  const stopDisabled = loadHealth((health) => healthResults.push(health), () => assert.fail("Valid disabled configuration must not retry"));
+  await flushHealth();
+  mock.timers.tick(30000);
+  await flushHealth();
+  assert.equal(attempts, 6);
+  assert.deepEqual(healthResults.at(-1), disabled);
+  stopDisabled();
+
+  let resolveHealth;
+  let pendingSignal;
+  globalThis.fetch = (_url, { signal }) => {
+    pendingSignal = signal;
+    return new Promise((resolve) => { resolveHealth = resolve; });
+  };
+  const stopPending = loadHealth(() => assert.fail("Unmounted health check updated state"), () => assert.fail("Unmounted health check retried"));
+  stopPending();
+  assert.equal(pendingSignal.aborted, true);
+  resolveHealth(Response.json(healthFixture));
+  await flushHealth();
+
+  let timeoutAttempts = 0;
+  let timeouts = 0;
+  globalThis.fetch = (_url, { signal }) => {
+    timeoutAttempts++;
+    return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
+  };
+  const stopTimeout = loadHealth(() => assert.fail("Stalled health request succeeded"), () => timeouts++);
+  mock.timers.tick(5000);
+  await flushHealth();
+  assert.equal(timeouts, 1);
+  stopTimeout();
+  mock.timers.tick(30000);
+  await flushHealth();
+  assert.equal(timeoutAttempts, 1);
+} finally {
+  globalThis.fetch = originalHealthFetch;
+  mock.timers.reset();
+}
+console.log("PASS startup health retry/backoff, HTTP/JSON failures, recovery, disabled config, timeout and unmount cleanup");
 const { MEDIA_PREFIX, signEnvelope, signBrowserKey, verifyBrowserKey, scopeFor, ownedReferences, mediaEnabled, requireOrigin } = await import("../webchat/server/src/mediaSecurity.ts");
 
 const secret = "local-tests-only-secret-32-characters-long";
@@ -251,11 +329,50 @@ globalThis.localStorage = { getItem: (name) => memoryStorage.get(name) ?? null, 
 globalThis.window = globalThis;
 const media = await import("../webchat/client/src/api/media.ts");
 const markdown = await import("../webchat/client/src/lib/parseMarkdown.ts");
+const voiceSecurity = await import("../webchat/server/src/mediaSecurity.ts");
+const voiceSecret = "voice-test-secret-".repeat(3);
+const voiceOwner = "a".repeat(64);
+const voiceCookie = `${voiceSecurity.COOKIE_NAME}=${voiceSecurity.signBrowserKey(voiceOwner, voiceSecret)}`;
+const voiceContext = voiceSecurity.voiceMediaContext(voiceCookie, conversation, voiceSecret);
+const voicePayload = JSON.parse(Buffer.from(voiceContext.slice(voiceSecurity.MEDIA_PREFIX.length).split(".")[0], "base64url").toString());
+assert.deepEqual(voicePayload, { scope: voiceSecurity.scopeFor(voiceOwner, conversation), text: "Voice request follows." });
+assert.equal(voiceSecurity.voiceMediaContext(undefined, conversation, voiceSecret), undefined);
+assert.equal(voiceSecurity.voiceMediaContext(voiceCookie + "tampered", conversation, voiceSecret), undefined);
+assert.equal(voiceSecurity.voiceMediaContext(voiceCookie, "invalid", voiceSecret), undefined);
+assert.equal(voiceSecurity.voiceMediaContext(voiceCookie, conversation, "short"), undefined);
+console.log("PASS voice media context: verified browser ownership, same typed scope, no actions, fail closed for invalid inputs");
 const fence = "```videojob\n" + JSON.stringify({ ...descriptor(), action: "approve" }) + "\n```";
 assert.deepEqual(markdown.extractVideoJobIds(fence + fence), [jobId]);
 assert.deepEqual(markdown.extractVideoJobIds('```videojob\n{"id":"../../evil"}\n```'), []);
 assert.equal(markdown.stripVideoJobBlocks("Hello\n```videojob\n{\"id\":"), "Hello");
 assert.equal(markdown.isVideoLink("https://test.blob.core.windows.net/screenshots/a.mp4?sig=test"), true);
+const timelineMessage = (id, role, text, status = "done") => ({ id, role, text, status, rawBuffer: text, currentStatus: null });
+const timelineKeys = (timeline) => timeline.entries.map((entry) => entry.kind === "message" ? `message:${entry.message.id}` : `video:${entry.id}`);
+const secondJobId = "f".repeat(32);
+const secondFence = "```videojob\n" + JSON.stringify({ id: secondJobId }) + "\n```";
+const renderTurn = [timelineMessage("request", "user", "Render the scene"), timelineMessage("render", "assistant", fence)];
+const firstTimeline = markdown.buildChatTimeline(renderTurn);
+assert.deepEqual(timelineKeys(firstTimeline), ["message:request", "message:render", `video:${jobId}`]);
+const nextTurn = [...renderTurn, timelineMessage("iterate", "user", "Make the cube blue"), timelineMessage("reply", "assistant", "Updated the scene")];
+assert.deepEqual(timelineKeys(markdown.buildChatTimeline(nextTurn)), [...timelineKeys(firstTimeline), "message:iterate", "message:reply"]);
+const repeated = markdown.buildChatTimeline([...nextTurn, timelineMessage("second-render", "assistant", fence + secondFence + secondFence)]);
+assert.deepEqual(timelineKeys(repeated), [...timelineKeys(firstTimeline), "message:iterate", "message:reply", "message:second-render", `video:${secondJobId}`]);
+assert.deepEqual(repeated.jobIds, [jobId, secondJobId]);
+const partial = timelineMessage("partial", "assistant", '```videojob\n{"id":"' + jobId + '"}', "streaming");
+assert.deepEqual(markdown.buildChatTimeline([partial]).jobIds, []);
+assert.deepEqual(markdown.buildChatTimeline([{ ...partial, text: partial.text + "\n```" }]).jobIds, [jobId]);
+assert.deepEqual(markdown.buildChatTimeline([timelineMessage("quoted", "user", fence)]).jobIds, []);
+assert.deepEqual(markdown.buildChatTimeline([timelineMessage("invalid", "assistant", '```videojob\n{"id":"bad"}\n```')]).jobIds, []);
+const recovered = markdown.buildChatTimeline(nextTurn, [jobId, jobId, "invalid"]);
+assert.deepEqual(timelineKeys(recovered), [`video:${jobId}`, "message:request", "message:render", "message:iterate", "message:reply"]);
+assert.deepEqual(markdown.buildChatTimeline([], [jobId]).jobIds, [jobId]);
+const manyIds = Array.from({ length: 101 }, (_, index) => index.toString(16).padStart(32, "0"));
+const capped = markdown.buildChatTimeline([timelineMessage("kept", "user", "Hello")], manyIds);
+assert.deepEqual(capped.jobIds, manyIds.slice(1));
+assert.equal(capped.entries.length, 101);
+assert.equal(capped.entries.at(-1).message.id, "kept");
+assert.deepEqual(markdown.buildChatTimeline([], media.loadJobIds("other-conversation")), { entries: [], jobIds: [] });
+console.log("PASS chronological job placement, later turns, first occurrence dedup, streaming fences, recovered jobs and retention");
 media.saveJobIds(conversation, [jobId, "invalid"]);
 assert.deepEqual(media.loadJobIds(conversation), [jobId]);
 assert.deepEqual(media.loadJobIds("other-conversation"), []);

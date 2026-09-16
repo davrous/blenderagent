@@ -4,28 +4,18 @@ import { ChatView } from "./components/ChatView";
 import { Composer } from "./components/Composer";
 import { voice } from "./api/voice";
 import { loadJobIds } from "./api/media";
-
-interface Health {
-  mode: string;
-  agentUrl: string;
-  model: string;
-  voiceEnabled?: boolean;
-  mediaEnabled?: boolean;
-  mediaDisabledReason?: string;
-}
+import { loadHealth, type Health } from "./api/health";
 
 export function App() {
   const reset = useChatStore((s) => s.reset);
   const messages = useChatStore((s) => s.messages);
   const conversationId = useChatStore((state) => state.conversationId);
   const [health, setHealth] = useState<Health | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState("Connecting to Webchat...");
 
-  useEffect(() => {
-    fetch("/api/health")
-      .then((r) => r.json())
-      .then(setHealth)
-      .catch(() => setHealth(null));
-  }, []);
+  useEffect(() => loadHealth(setHealth, () => {
+    setConnectionStatus("Webchat proxy is unavailable. Reconnecting...");
+  }), []);
 
   const voiceAvailable = !!health?.voiceEnabled && voice.isSupported();
 
@@ -80,7 +70,7 @@ export function App() {
         <ChatView mediaAvailable={!!health?.mediaEnabled} />
       </main>
       <footer className="app-footer">
-        <Composer key={conversationId} voiceAvailable={voiceAvailable} mediaAvailable={!!health?.mediaEnabled} mediaDisabledReason={health?.mediaDisabledReason} />
+        <Composer key={conversationId} voiceAvailable={voiceAvailable} mediaAvailable={!!health?.mediaEnabled} mediaDisabledReason={health ? health.mediaDisabledReason : connectionStatus} />
       </footer>
     </div>
   );

@@ -6,12 +6,26 @@ import {
   buildFoundryVoiceWsUrl,
   buildTraceHeaders,
   buildVoiceHistoryItems,
+  injectSession,
   requiresVoiceHistoryCommit,
 } from "../webchat/server/dist/voice.js";
 import { runSingleFlight } from "../webchat/server/dist/sessions.js";
 
 const generated = buildTraceHeaders({ headers: {} });
 assert.equal(generated.traceparent, undefined);
+
+const voiceFrame = Buffer.from(JSON.stringify({ type: "start", media_context: "forged", conversation_id: "browser" }));
+const scopedFrame = injectSession(voiceFrame, false, undefined, undefined, "verified-context");
+assert.equal(JSON.parse(scopedFrame.data.toString()).media_context, "verified-context");
+const unscopedFrame = injectSession(voiceFrame, false, undefined, undefined);
+assert.equal(JSON.parse(unscopedFrame.data.toString()).media_context, undefined);
+const untypedFrame = Buffer.from(JSON.stringify({ media_context: "forged" }));
+assert.equal(JSON.parse(injectSession(untypedFrame, false, undefined, undefined).data.toString()).media_context, undefined);
+const hostedFrame = JSON.parse(injectSession(voiceFrame, false, "session-foundry", "conv_shared", "verified-context").data.toString());
+assert.equal(hostedFrame.foundry_agent_session_id, "session-foundry");
+assert.equal(hostedFrame.foundry_conversation_id, "conv_shared");
+assert.equal(hostedFrame.media_context, "verified-context");
+assert.equal(injectSession(voiceFrame, true, undefined, undefined, "verified-context").data, voiceFrame);
 
 const parent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 const forwarded = buildTraceHeaders({
@@ -30,6 +44,7 @@ assert.equal(unsafe.baggage, undefined);
 
 const voiceUrl = new URL(
   buildFoundryVoiceWsUrl("session-foundry", "conv_shared"),
+  "https://offline.example",
 );
 assert.equal(voiceUrl.searchParams.get("agent_session_id"), "session-foundry");
 assert.equal(voiceUrl.searchParams.get("conversation_id"), "conv_shared");
