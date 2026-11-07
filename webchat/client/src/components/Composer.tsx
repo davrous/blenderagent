@@ -3,6 +3,7 @@ import { useChatStore } from "../state/chatStore";
 import { voice } from "../api/voice";
 import { Paperclip, X } from "lucide-react";
 import { uploadReference, type ReferenceUpload } from "../api/media";
+import { MUSIC_DURATIONS } from "../api/music";
 
 interface ComposerProps {
   voiceAvailable?: boolean;
@@ -38,6 +39,8 @@ export function Composer({ voiceAvailable = false, musicAvailable = false, media
   const micMode = useChatStore((s) => s.micMode);
   const setMicMode = useChatStore((s) => s.setMicMode);
   const musicCandidate = useChatStore((s) => s.musicCandidate);
+  const musicOptions = useChatStore((s) => s.musicOptions);
+  const setMusicOptions = useChatStore((s) => s.setMusicOptions);
   const confirmMusicScene = useChatStore((s) => s.confirmMusicScene);
   const declineMusicScene = useChatStore((s) => s.declineMusicScene);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
@@ -185,6 +188,18 @@ export function Composer({ voiceAvailable = false, musicAvailable = false, media
           useChatStore.getState().voiceFail("Enregistrement ou analyse musicale annulé.");
         }}>Annuler</button>}
       </div>}
+      {musical && <div className="music-generation-options" role="group" aria-label="Options de génération vidéo">
+        <label>Durée de l'animation<select disabled={inputLocked} value={musicOptions.duration_seconds} onChange={(event) => {
+          const duration = MUSIC_DURATIONS.find((value) => String(value) === event.target.value);
+          if (duration === undefined) throw new Error("Unsupported animation duration");
+          setMusicOptions({ ...musicOptions, duration_seconds: duration });
+        }}>{MUSIC_DURATIONS.map((duration) => <option key={duration} value={duration}>{duration} s</option>)}</select></label>
+        <label>Type de rendu<select disabled={inputLocked} value={musicOptions.render_mode} onChange={(event) => {
+          const mode = event.target.value;
+          if (mode !== "clay" && mode !== "standard") throw new Error("Unsupported rendering mode");
+          setMusicOptions({ ...musicOptions, render_mode: mode });
+        }}><option value="standard">Complet (matériaux et éclairage)</option><option value="clay">Clay (gris, plus rapide)</option></select></label>
+      </div>}
       {uploadError && <div className="media-error" role="alert">{uploadError}</div>}
       {attachments.length > 0 && <div className="reference-list">
         {attachments.map((item) => <div className="reference-item" key={item.id}>
@@ -203,7 +218,7 @@ export function Composer({ voiceAvailable = false, musicAvailable = false, media
         </div>
       )}
       {musical && musicCandidate && <div className="music-confirmation">
-        <span>Hypothèse : <strong>{musicCandidate.film}</strong>. Créer la séquence Devfest (15–20 s) ?</span>
+        <span>Hypothèse : <strong>{musicCandidate.film}</strong>. Créer la séquence Devfest ({musicOptions.duration_seconds} s, rendu {musicOptions.render_mode === "clay" ? "Clay" : "complet"}) ?</span>
         <button type="button" disabled={inputLocked} onClick={() => void confirmMusicScene()}>Oui, créer la scène 🎬</button>
         <button type="button" disabled={inputLocked} onClick={() => void declineMusicScene()}>Non</button>
       </div>}

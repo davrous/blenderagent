@@ -1,4 +1,9 @@
 export type MicMode = "voice" | "music";
+export const MUSIC_DURATIONS = [5, 10, 15] as const;
+export interface MusicGenerationOptions {
+  duration_seconds: typeof MUSIC_DURATIONS[number];
+  render_mode: "clay" | "standard";
+}
 
 export interface MusicCandidate {
   film: string | null;
@@ -10,6 +15,8 @@ export interface MusicCandidate {
 export interface MusicRequest {
   candidate: MusicCandidate;
   action: "discuss" | "generate";
+  duration_seconds?: MusicGenerationOptions["duration_seconds"];
+  render_mode?: MusicGenerationOptions["render_mode"];
 }
 
 export function isMusicCandidate(value: unknown): value is MusicCandidate {

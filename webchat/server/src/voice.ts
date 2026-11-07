@@ -1,9 +1,11 @@
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { Server, IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
+import { randomUUID } from "node:crypto";
 import { config } from "./config.js";
 import { getBearerToken } from "./auth.js";
 import { voiceMediaContext } from "./mediaSecurity.js";
+import { archiveInputAudio, archiveTurn, ownerFromCookie, registerWorkspace, workspaceHistory, workspaceRegistered, workspaceSceneExpected } from "./workspaces.js";
 import {
   appendConversationItems,
   getOrCreateConversation,
@@ -132,6 +134,7 @@ export function injectSession(
   foundryAgentSessionId: string | undefined,
   foundryConversationId: string | undefined,
   mediaContext?: string,
+  inlineHistory?: Array<{ role: "user" | "assistant"; content: string }>,
 ): { data: RawData; isBinary: boolean } {
   if (isBinary) {
     return { data, isBinary };
@@ -143,7 +146,9 @@ export function injectSession(
     const obj = JSON.parse(text);
     if (obj && typeof obj === "object" && !Array.isArray(obj)) {
       delete obj.media_context;
+      delete obj.inline_history;
       if (mediaContext) obj.media_context = mediaContext;
+      if (inlineHistory?.length) obj.inline_history = inlineHistory;
       if (foundryAgentSessionId) {
         obj.foundry_agent_session_id = foundryAgentSessionId;
       }
@@ -218,10 +223,15 @@ function relay(
   foundryAgentSessionId?: string,
   foundryConversationId?: string,
   mediaContext?: string,
+  conversationId?: string,
+  inlineHistory?: Array<{ role: "user" | "assistant"; content: string }>,
 ): void {
   const pending: Array<{ data: RawData; isBinary: boolean }> = [];
   const committedResponses = new Set<string>();
   let finalTranscript = "";
+  let finalReply = "";
+  let inputAudio: string | undefined;
+  let turnId = randomUUID();
   let upstreamOpen = false;
 
   browser.on("message", (data: RawData, isBinary: boolean) => {
@@ -244,6 +254,7 @@ function relay(
       foundryAgentSessionId,
       foundryConversationId,
       mediaContext,
+      inlineHistory,
     );
     if (upstreamOpen) sendTo(upstream, out.data, out.isBinary);
     else pending.push({ data: out.data, isBinary: out.isBinary });
@@ -269,19 +280,30 @@ function relay(
         const obj = JSON.parse(text);
         if (obj?.type === "stt" && obj.final && typeof obj.text === "string") {
           finalTranscript = obj.text;
+          finalReply = "";
+          inputAudio = undefined;
+          turnId = randomUUID();
+        }
+        if (obj?.type === "delta" && typeof obj.text === "string") finalReply += obj.text;
+        if (obj?.type === "input_audio" && typeof obj.audio_url === "string") {
+          inputAudio = obj.audio_url;
+          if (conversationId) void archiveInputAudio(conversationId, obj.audio_url).catch((error) => {
+            console.error("[voice] input audio archive failed", error);
+            sendTo(browser, Buffer.from(JSON.stringify({ type: "archive.warning", message: "L'audio n'a pas pu être indexé dans la galerie." })), false);
+          });
         }
         if (obj?.type === "error") {
           console.error("[voice] agent error frame:", obj.message ?? text.slice(0, 400));
+          if (conversationId && finalTranscript) void archiveTurn(conversationId, finalTranscript, finalReply, null, "error", inputAudio, turnId).catch((error) => console.error("[voice] failed turn archive", error));
         }
         if (
           obj &&
-          requiresVoiceHistoryCommit(obj) &&
-          foundryConversationId
+          obj.type === "done"
         ) {
           const responseId = typeof obj.history_response_id === "string"
             ? obj.history_response_id
             : "unknown";
-          const commitKey = `${foundryConversationId}:${responseId}`;
+          const commitKey = `${foundryConversationId ?? conversationId}:${responseId}`;
           if (committedResponses.has(commitKey)) {
             sendTo(browser, data, false);
             return;
@@ -291,20 +313,25 @@ function relay(
             finalTranscript,
             typeof obj.reply === "string" ? obj.reply : "",
           );
+          const completedTurn = { transcript: finalTranscript, reply: typeof obj.reply === "string" ? obj.reply : finalReply, audio: inputAudio, id: turnId };
           void (async () => {
+            if (requiresVoiceHistoryCommit(obj) && foundryConversationId) {
+              try {
+                await appendConversationItems(foundryConversationId, items);
+                obj.history_committed = true;
+              } catch (err) {
+                obj.history_commit_failed = true;
+                console.error("[voice] conversation history commit failed:", err);
+              }
+            }
             try {
-              await appendConversationItems(foundryConversationId, items);
+              if (conversationId) await archiveTurn(conversationId, completedTurn.transcript, completedTurn.reply,
+                typeof obj.response_id === "string" ? obj.response_id : null, "done", completedTurn.audio,
+                completedTurn.id, obj.mode !== "music");
               committedResponses.add(commitKey);
-              obj.history_committed = true;
-              console.log(
-                `[voice] committed ${items.length} conversation item(s) (conversation=${foundryConversationId}, response=${responseId})`,
-              );
-            } catch (err) {
-              obj.history_commit_failed = true;
-              console.error(
-                "[voice] conversation history commit failed:",
-                err instanceof Error ? err.message : err,
-              );
+            } catch (error) {
+              obj.archive_warning = "Ce tour n'a pas pu être sauvegardé dans la galerie. Gardez le travail ouvert.";
+              console.error("[voice] workspace archive failed", error);
             }
             sendTo(browser, Buffer.from(JSON.stringify(obj)), false);
           })();
@@ -351,6 +378,15 @@ async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): 
     conversationId = url.searchParams.get("sessionId") ?? undefined;
   } catch {
     /* ignore */
+  }
+  const owner = req.headers.origin === new URL(config.clientOrigin).origin ? ownerFromCookie(req.headers.cookie) : undefined;
+  if (conversationId && owner) {
+    try { await registerWorkspace(owner, conversationId); }
+    catch (error) {
+      sendTo(browser, Buffer.from(JSON.stringify({ type: "error", message: error instanceof Error ? error.message : "Workspace unavailable" })), false);
+      safeClose(browser, 1000, "workspace unavailable");
+      return;
+    }
   }
 
   // Resolve the shared Foundry session BEFORE opening the upstream. This MUST
@@ -427,9 +463,11 @@ async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): 
   }
 
   const mediaContext = req.headers.origin === new URL(config.clientOrigin).origin
-    ? voiceMediaContext(req.headers.cookie, conversationId, config.mediaControlSecret)
+    ? voiceMediaContext(req.headers.cookie, conversationId, config.mediaControlSecret,
+      conversationId && workspaceRegistered(conversationId) ? { resume: await workspaceSceneExpected(conversationId) } : undefined)
     : undefined;
-  relay(browser, upstream, foundryAgentSessionId, foundryConversationId, mediaContext);
+  const history = config.mode === "local" && conversationId ? await workspaceHistory(conversationId) : undefined;
+  relay(browser, upstream, foundryAgentSessionId, foundryConversationId, mediaContext, conversationId, history);
 }
 
 /**

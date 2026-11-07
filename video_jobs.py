@@ -22,8 +22,10 @@ from wavespeed_client import RATES, TERMINAL_FAILURES, WaveSpeedClient
 logger = logging.getLogger("blender_agent.video")
 video_scope = contextvars.ContextVar("video_scope", default=None)
 video_notifier = contextvars.ContextVar("video_notifier", default=None)
-FINAL_STATES = {"completed", "failed", "cancelled", "submission_unknown", "awaiting_seedance_approval"}
+FINAL_STATES = {"completed", "failed", "cancelled", "submission_unknown", "awaiting_seedance_approval", "awaiting_render_approval"}
 TRANSITIONS = {
+    "awaiting_render_approval": {"queued", "cancelled"},
+    "completed": {"queued"},
     "queued": {"rendering", "failed", "cancelled"},
     "rendering": {"encoding", "failed", "cancelled"},
     "encoding": {"completed", "awaiting_seedance_approval", "failed", "cancelled"},
@@ -54,6 +56,8 @@ class JobRepository:
         old_state = document["state"]
         if state is not None and state != old_state and state not in TRANSITIONS.get(old_state, set()):
             raise ValueError(f"Invalid job transition: {old_state} to {state}.")
+        if old_state == "completed" and state == "queued" and not document.get("inspection_required"):
+            raise ValueError("Only an inspected Blender animation can be rendered again.")
         updated = {**document, **changes, "state": state or old_state, "updated_at": time.time()}
         next_etag = self.storage.write_json(job_name(document["scope"], document["id"]), updated, etag=etag)
         logger.info("Video job %s state=%s", document["id"], updated["state"])
@@ -95,11 +99,16 @@ class VideoJobs:
             except Exception:
                 logger.warning("Could not reconcile a persisted video job identity")
 
-    def create(self, scope, settings, snapshot, *, seedance=False):
+    def create(self, scope, settings, snapshot, *, seedance=False, inspect_first=False):
         settings = render_settings(**{key: settings[key] for key in (
             "duration_seconds", "fps", "resolution", "mode", "engine", "samples")})
         if seedance and settings["mode"] != "clay":
             raise ValueError("Render a clay preview before Seedance finishing.")
+        if inspect_first and (
+            seedance or settings["mode"] not in ("clay", "standard") or settings["engine"] != "BLENDER_EEVEE_NEXT"
+            or settings["fps"] != 25 or settings["resolution"] != "480p" or settings["duration_seconds"] not in (5, 10, 15)
+        ):
+            raise ValueError("Devfest inspection requires 5, 10 or 15 seconds in clay/standard mode at 480p/25 fps.")
         job_id = uuid.uuid4().hex
         job_name(scope, job_id)
         with self._guard:
@@ -114,8 +123,22 @@ class VideoJobs:
             if not (directory / "scene.blend").is_file():
                 raise ValueError("Blender did not create the scene snapshot.")
             (directory / "settings.json").write_text(json.dumps(settings))
-            document = {"id": job_id, "scope": scope, "state": "queued", "progress": 0,
+            document = {"id": job_id, "scope": scope, "state": "awaiting_render_approval" if inspect_first else "queued", "progress": 0,
                         "created_at": time.time(), "updated_at": time.time(), "seedance": seedance, **settings}
+            if inspect_first:
+                if (directory / "scene.blend").stat().st_size > 200 * 1024 * 1024:
+                    raise ValueError("The packed Blender animation exceeds the 200 MiB download limit.")
+                document["scene_blob"] = f"videos/{scope}/{job_id}/scene.blend"
+                document["inspection_required"] = True
+                viewport = directory / "viewport.png"
+                if not viewport.is_file() or not 0 < viewport.stat().st_size <= 16 * 1024 * 1024:
+                    raise ValueError("Blender did not create a valid viewport preview for the animation.")
+                with viewport.open("rb") as image:
+                    if image.read(8) != b"\x89PNG\r\n\x1a\n":
+                        raise ValueError("The animation viewport preview must be a PNG.")
+                document["viewport_blob"] = f"videos/{scope}/{job_id}/viewport.png"
+                self.storage.upload_file(document["scene_blob"], directory / "scene.blend", "application/x-blender")
+                self.storage.upload_file(document["viewport_blob"], viewport, "image/png")
             self.storage.write_json(job_name(scope, job_id), document)
             (directory / "identity.json").write_text(json.dumps({"scope": scope, "id": job_id}))
         except BaseException:
@@ -124,8 +147,36 @@ class VideoJobs:
         notifier = video_notifier.get()
         if notifier:
             self._notifications[job_id] = notifier
-        self.ensure(scope, job_id)
+        if not inspect_first:
+            self.ensure(scope, job_id)
         return self.describe(document)
+
+    def render(self, scope, job_id, *, resolution="480p"):
+        document, etag = self.repo.read(scope, job_id)
+        scene_blob = f"videos/{scope}/{job_id}/scene.blend"
+        if (resolution not in ("480p", "1080p") or not document.get("inspection_required")
+                or document.get("scene_blob") != scene_blob or document["seedance"]):
+            raise ValueError("Render controls require an inspected, conversation-owned Blender animation.")
+        state = document["state"]
+        if document["resolution"] == resolution and document.get("render_approval"):
+            if state in ("queued", "rendering", "encoding", "completed"):
+                return self.status(scope, job_id)
+        if not (
+            (state == "awaiting_render_approval" and resolution == "480p")
+            or (state == "completed" and document["resolution"] == "480p" and resolution == "1080p")
+        ):
+            raise ValueError("Inspect the .blend before rendering 480p, and approve the completed 480p video before 1080p.")
+        settings = render_settings(
+            document["duration_seconds"], document["fps"], resolution, document["mode"],
+            document["engine"], document["samples"], allow_hd=resolution == "1080p",
+        )
+        required_gib = 4 if resolution == "1080p" else 2
+        if shutil.disk_usage(self.root).free < required_gib * 1024 ** 3:
+            raise ValueError(f"This render requires at least {required_gib} GiB of free temporary space.")
+        self.repo.update(document, etag, "queued", **settings, progress=0,
+                         render_approval={"resolution": resolution, "approved_at": time.time()})
+        self.ensure(scope, job_id)
+        return self.status(scope, job_id)
 
     def ensure(self, scope, job_id):
         job_name(scope, job_id)
@@ -199,21 +250,27 @@ class VideoJobs:
         document, etag = self.repo.read(scope, job_id)
         if "cancelled" not in TRANSITIONS.get(document["state"], set()):
             raise ValueError("This job can no longer be cancelled safely.")
-        self.repo.update(document, etag, "cancelled")
+        cancelled, _ = self.repo.update(document, etag, "cancelled")
         directory = self.root / job_id
         directory.mkdir(exist_ok=True)
         (directory / "cancel").touch()
+        if document["state"] == "awaiting_render_approval":
+            self._finalize(cancelled)
         return self.status(scope, job_id)
 
     def describe(self, document):
         result = {key: document[key] for key in ("id", "state", "progress", "mode", "duration_seconds", "fps", "resolution")}
         result["seedance_enabled"] = bool(os.getenv("WAVESPEED_API_KEY"))
         result["estimate_usd"] = round(document["duration_seconds"] * 2 * RATES["720p"], 2)
-        for field in ("preview", "poster", "output"):
+        for field in ("preview", "poster", "output", "viewport"):
             if document.get(field + "_blob"):
                 result[field + "_url"] = self.storage.signed_url(document[field + "_blob"])
         if document.get("error"):
             result["error"] = document["error"]
+        if document.get("inspection_required"):
+            result["inspection_required"] = True
+            result["scene_url"] = self.storage.signed_url(document["scene_blob"])
+            result["hd_available"] = document["state"] == "completed" and document["resolution"] == "480p"
         return result
 
     def _run(self, scope, job_id):
@@ -284,6 +341,18 @@ class VideoJobs:
         self._publish(document, final=True)
 
     def _render(self, document, etag, directory, lost):
+        if document.get("inspection_required"):
+            if (document.get("scene_blob") != f"videos/{document['scope']}/{document['id']}/scene.blend"
+                    or document.get("render_approval", {}).get("resolution") != document["resolution"]):
+                raise ValueError("The inspected animation has no matching render approval.")
+            settings = render_settings(**{key: document[key] for key in (
+                "duration_seconds", "fps", "resolution", "mode", "engine", "samples")},
+                allow_hd=document["resolution"] == "1080p")
+            self.storage.download(document["scene_blob"], directory / "scene.blend")
+            (directory / "settings.json").write_text(json.dumps(settings))
+            if document["state"] == "queued":
+                shutil.rmtree(directory / "frames", ignore_errors=True)
+                (directory / "progress").unlink(missing_ok=True)
         if not (directory / "scene.blend").is_file():
             raise ValueError("The saved render snapshot is unavailable; create a new preview.")
         if document["state"] == "queued":
@@ -323,12 +392,15 @@ class VideoJobs:
         if (directory / "preview.mp4").stat().st_size > 200 * 1024 * 1024:
             raise ValueError("Rendered output exceeds 200 MiB.")
         prefix = f"videos/{document['scope']}/{document['id']}"
-        self.storage.upload_file(prefix + "/preview.mp4", directory / "preview.mp4", "video/mp4")
+        output_blob = prefix + (f"/{document['resolution']}.mp4" if document.get("inspection_required") else "/preview.mp4")
+        self.storage.upload_file(output_blob, directory / "preview.mp4", "video/mp4")
         self.storage.upload_file(prefix + "/poster.png", directory / "frames" / "000001.png", "image/png")
         state = "awaiting_seedance_approval" if document["seedance"] else "completed"
-        changes = {"preview_blob": prefix + "/preview.mp4", "poster_blob": prefix + "/poster.png", "progress": 100}
+        changes = {"preview_blob": output_blob, "poster_blob": prefix + "/poster.png", "progress": 100}
         if state == "completed":
             changes["output_blob"] = changes["preview_blob"]
+        if document.get("inspection_required") and document["resolution"] == "1080p":
+            changes["preview_blob"] = document["preview_blob"]
         return self.repo.update(document, etag, state, **changes)
 
     def _finish(self, document, etag, directory, lost):

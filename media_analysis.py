@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 MAX_MEDIA_BYTES = 200 * 1024 * 1024
-RESOLUTIONS = {"480p": (854, 480), "720p": (1280, 720)}
+RESOLUTIONS = {"480p": (854, 480), "720p": (1280, 720), "1080p": (1920, 1080)}
 
 
 def run_media(command: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess:
@@ -84,18 +84,25 @@ def sample_reference(path: Path, directory: Path) -> tuple[dict, list[Path]]:
     return metadata, frames
 
 
-def render_settings(duration_seconds=5, fps=24, resolution="480p", mode="clay", engine="BLENDER_EEVEE_NEXT", samples=16) -> dict:
+def render_settings(duration_seconds=5, fps=24, resolution="480p", mode="clay", engine="BLENDER_EEVEE_NEXT", samples=16, *, allow_hd=False) -> dict:
     if type(duration_seconds) not in (int, float) or not math.isfinite(duration_seconds) or not 4 <= duration_seconds <= 30:
         raise ValueError("Animation duration must be between 4 and 30 seconds.")
-    if type(fps) is not int or fps not in (12, 24, 30):
-        raise ValueError("Use 12, 24 or 30 fps.")
+    if type(fps) is not int or fps not in (12, 24, 25, 30):
+        raise ValueError("Use 12, 24, 25 or 30 fps.")
     if resolution not in RESOLUTIONS or mode not in ("clay", "standard"):
         raise ValueError("Use clay/standard mode and 480p/720p resolution.")
     if engine not in ("BLENDER_EEVEE_NEXT", "CYCLES") or type(samples) is not int or not 1 <= samples <= 32:
         raise ValueError("Use Eevee or Cycles with 1-32 samples.")
+    if resolution == "1080p" and not (
+        allow_hd is True and mode in ("clay", "standard") and engine == "BLENDER_EEVEE_NEXT"
+        and fps == 25 and 5 <= duration_seconds <= 20
+    ):
+        raise ValueError("1080p requires explicit approval after inspecting a Devfest 480p/25 fps preview.")
     frames = round(duration_seconds * fps)
     width, height = RESOLUTIONS[resolution]
     budget = 80_000_000 if mode == "standard" and engine == "CYCLES" else 400_000_000
+    if resolution == "1080p":
+        budget = 1_100_000_000
     if frames * width * height > budget:
         raise ValueError("Animation exceeds this container's render budget; lower fps, duration or resolution.")
     return dict(duration_seconds=frames / fps, fps=fps, resolution=resolution, mode=mode,

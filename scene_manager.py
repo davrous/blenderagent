@@ -17,10 +17,11 @@ container lifetime. The previous design used ``<conversation-id>.blend``
 keys and a brittle "rename orphan after id changes" recovery path, which
 is no longer required.
 
-This module therefore stores the scene at a single fixed path:
+This module stores the active scene at a single fixed path:
 ``$HOME/blender_scenes/scene.blend``. It survives idle/resume because
 ``$HOME`` is persisted by the platform; it does not survive a fresh
-container (intended — a fresh container is a brand-new conversation).
+container. Known conversations additionally retain local checkpoints; private
+gallery turns save a packed Blob checkpoint for explicit workspace resumption.
 
 A small JSON state file ``$HOME/.blender_session_state`` records whether
 a scene exists to be reloaded and timestamps useful for diagnostics; it
@@ -34,14 +35,29 @@ Usage:
 """
 
 import json
+import hashlib
 import logging
 import os
 import tempfile
+import shutil
+from contextvars import ContextVar
+from pathlib import Path
 from datetime import datetime, timezone
 
 from blender_connection import current_epoch, get_blender_connection
+from artifact_storage import ArtifactStorage
+from azure.core.exceptions import ResourceNotFoundError
 
 logger = logging.getLogger("blender_agent.scene_manager")
+workspace_scene: ContextVar[tuple[str, bool] | None] = ContextVar("workspace_scene", default=None)
+_workspace_storage: ArtifactStorage | None = None
+
+
+def _archive_storage() -> ArtifactStorage:
+    global _workspace_storage
+    if _workspace_storage is None:
+        _workspace_storage = ArtifactStorage()
+    return _workspace_storage
 
 # Scene directory: $HOME/blender_scenes/ — persisted by the platform across
 # idle/resume cycles. Falls back to /tmp only when $HOME is not writable
@@ -58,6 +74,20 @@ except OSError:
 
 # Fixed scene filename — one Blender scene per micro-VM/conversation.
 _SCENE_FILE = os.path.join(_SCENE_DIR, "scene.blend")
+
+
+def _conversation_scene_file(conversation_id: str) -> str:
+    key = hashlib.sha256(conversation_id.encode()).hexdigest()
+    directory = os.path.join(_SCENE_DIR, "conversations")
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, key + ".blend")
+
+
+def _archive_scene(conversation_id: str) -> None:
+    destination = _conversation_scene_file(conversation_id)
+    temporary = destination + ".tmp"
+    shutil.copyfile(_SCENE_FILE, temporary)
+    os.replace(temporary, destination)
 
 # Persisted session state file (JSON). Lives in $HOME so it survives idle.
 # ``entrypoint.sh`` writes the initial file (with blender_ready=false) on
@@ -152,6 +182,8 @@ class SceneManager:
         """
         if self._new_scene or not conversation_id:
             return False
+        if os.path.exists(_conversation_scene_file(conversation_id)):
+            return False
         if not os.path.exists(_SCENE_FILE):
             return False
         last = _read_session_state().get("last_conversation_id")
@@ -187,7 +219,30 @@ class SceneManager:
         ``conversation_id`` is used to detect a Reset (id change) and for
         logging/diagnostics.
         """
-        if self._new_scene:
+        last = _read_session_state().get("last_conversation_id")
+        archived = _conversation_scene_file(conversation_id) if conversation_id else None
+        if isinstance(last, str) and last and conversation_id and last != conversation_id and os.path.exists(_SCENE_FILE):
+            _archive_scene(last)
+        workspace = workspace_scene.get()
+        if workspace and (self._new_scene or last != conversation_id or not os.path.exists(_SCENE_FILE)):
+            try:
+                temporary = _SCENE_FILE + ".restore"
+                _archive_storage().download(f"workspace-scenes/{workspace[0]}/scene.blend", Path(temporary))
+                os.replace(temporary, _SCENE_FILE)
+                _write_session_state({"last_conversation_id": conversation_id, "needs_scene_reload": True})
+                self._load_blend_file(_SCENE_FILE)
+                self._active_epoch = current_epoch()
+                self._new_scene = False
+                return
+            except ResourceNotFoundError:
+                if workspace[1] and not (archived and os.path.exists(archived)) and not (last == conversation_id and os.path.exists(_SCENE_FILE)):
+                    raise RuntimeError("The saved workspace scene checkpoint is missing. Archived media remain available; refusing to replace the work with an empty scene.") from None
+        if archived and os.path.exists(archived) and (last != conversation_id or not os.path.exists(_SCENE_FILE)):
+            logger.info("activate_scene: resuming archived conversation %s", conversation_id)
+            shutil.copyfile(archived, _SCENE_FILE)
+            _write_session_state({"last_conversation_id": conversation_id, "needs_scene_reload": True})
+            self._load_blend_file(_SCENE_FILE)
+        elif self._new_scene:
             logger.info(
                 "activate_scene: fresh container (conversation=%s) — resetting to clean scene",
                 conversation_id,
@@ -253,10 +308,22 @@ class SceneManager:
                 "to preserve previous scene.",
                 self._active_epoch, live_epoch,
             )
+            if workspace_scene.get() is not None:
+                raise RuntimeError("Blender restarted during this turn; the previous scene checkpoint was not overwritten.")
             return
 
         try:
-            self._save_blend_file(_SCENE_FILE)
+            self._save_blend_file(_SCENE_FILE, pack_resources=workspace_scene.get() is not None)
+            self._mark_scene_used()
+            self._active_epoch = current_epoch()
+            _write_session_state({"last_conversation_id": conversation_id, "last_saved_at": _utc_now_iso()})
+            if conversation_id:
+                _archive_scene(conversation_id)
+            workspace = workspace_scene.get()
+            if workspace:
+                if os.path.getsize(_SCENE_FILE) > 200 * 1024 * 1024:
+                    raise ValueError("The packed workspace scene exceeds the 200 MiB checkpoint limit.")
+                _archive_storage().upload_file(f"workspace-scenes/{workspace[0]}/scene.blend", _SCENE_FILE, "application/x-blender")
             file_size = os.path.getsize(_SCENE_FILE)
             logger.info("Scene saved: %s (%d bytes)", _SCENE_FILE, file_size)
 
@@ -270,6 +337,8 @@ class SceneManager:
             })
         except Exception:
             logger.error("Failed to save scene (conversation=%s)", conversation_id, exc_info=True)
+            if workspace_scene.get() is not None:
+                raise
 
     def reset_to_clean(self) -> None:
         """Reset Blender to a clean scene. Used by crash-recovery paths."""
@@ -328,16 +397,17 @@ print("Loaded scene from {safe_path}")
             logger.info("Loaded .blend file: %s", filepath)
         except Exception:
             logger.error(
-                "Failed to load .blend file %s, falling back to scene reset",
+                "Failed to load .blend file %s; keeping the archived scene instead of resetting",
                 filepath, exc_info=True,
             )
-            self._reset_scene()
+            raise
 
-    def _save_blend_file(self, filepath: str) -> None:
+    def _save_blend_file(self, filepath: str, *, pack_resources: bool = False) -> None:
         """Save the current Blender scene to a .blend file."""
         safe_path = filepath.replace("\\", "/")
         code = f"""
 import bpy
+{"bpy.ops.file.pack_all()" if pack_resources else ""}
 bpy.ops.wm.save_as_mainfile(filepath="{safe_path}", check_existing=False)
 print("Saved scene to {safe_path}")
 """

@@ -40,7 +40,7 @@ from artifact_storage import ArtifactStorage
 from auth_diagnostics import start_auth_diagnostics
 from blender_connection import get_blender_connection, close_blender_connection, is_blender_socket_ready
 from conversation_telemetry import FoundryConversationTelemetryAgent
-from scene_manager import SceneManager
+from scene_manager import SceneManager, workspace_scene
 from media_control import (
     MediaMiddleware, analyze_reference_media, apply_camera_path, configure_vision,
     get_video_job_status, start_animation_render, start_seedance_finish,
@@ -1857,6 +1857,7 @@ class SceneIsolationMiddleware(AgentMiddleware):
     def __init__(self, inner: AgentMiddleware, scene_manager: SceneManager):
         self._inner = inner
         self._scene_manager = scene_manager
+        self._scene_lock = asyncio.Lock()
 
     @staticmethod
     def _get_conversation_id(context: AgentContext) -> str | None:
@@ -2068,6 +2069,32 @@ class SceneIsolationMiddleware(AgentMiddleware):
             logger.warning("Scene isolation stable-id search failed: %s", e)
 
     async def process(self, context: AgentContext, call_next) -> None:
+        await self._scene_lock.acquire()
+        try:
+            await self._process_scene(context, call_next)
+        except BaseException:
+            self._scene_lock.release()
+            raise
+        if not context.stream:
+            self._scene_lock.release()
+            return
+        original = context.result
+        released = False
+        def release_scene():
+            nonlocal released
+            if not released:
+                released = True
+                self._scene_lock.release()
+        context.stream_cleanup_hooks.append(release_scene)
+        async def locked_stream():
+            try:
+                async for update in original:
+                    yield update
+            finally:
+                release_scene()
+        context.result = ResponseStream(locked_stream(), finalizer=AgentResponse.from_updates)
+
+    async def _process_scene(self, context: AgentContext, call_next) -> None:
         session = context.session
         logger.info(
             "Scene isolation: process() called. session=%r, session_id=%r, stream=%s",
@@ -2123,7 +2150,10 @@ class SceneIsolationMiddleware(AgentMiddleware):
         is_brand_new = self._scene_manager.new_scene
         is_reset = (not is_brand_new) and self._scene_manager.is_conversation_reset(conversation_id)
         has_local = self._scene_manager.has_saved_scene()
-        if is_brand_new:
+        workspace = workspace_scene.get()
+        if workspace and workspace[1]:
+            recovery_messages.append("📂 Reprise de la réalisation — restauration de son checkpoint Blender.")
+        elif is_brand_new:
             recovery_messages.append(
                 "🆕 First time using the agent in this session — setting up a fresh Blender scene for you."
             )
@@ -2184,6 +2214,7 @@ class SceneIsolationMiddleware(AgentMiddleware):
             original_stream = context.result
 
             async def _save_after_stream():
+                save_failed = False
                 # ── Stream recovery / status messages FIRST ──
                 # Surface idle-recovery and scene-restoration status to the
                 # user before any model output, so they understand the wait
@@ -2212,10 +2243,16 @@ class SceneIsolationMiddleware(AgentMiddleware):
                         await asyncio.to_thread(self._scene_manager.save_scene, save_id)
                         logger.info("Scene isolation: scene saved (conversation=%r)", save_id)
                     except Exception:
+                        save_failed = True
                         logger.error(
                             "Scene isolation: failed to save scene (conversation=%r)",
                             save_id, exc_info=True,
                         )
+                if save_failed:
+                    yield AgentResponseUpdate(
+                        contents=[Content.from_text("\n\n⚠️ La sauvegarde de la scène n'a pas pu être confirmée. Gardez ce travail ouvert et vérifiez le stockage avant de le reprendre ailleurs.\n\n")],
+                        role="assistant", message_id="workspace-save-warning",
+                    )
 
             context.result = ResponseStream(_save_after_stream(), finalizer=AgentResponse.from_updates)
         else:

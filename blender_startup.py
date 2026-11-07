@@ -255,7 +255,7 @@ class BlenderMCPServer:
         ], frames / fps, fps, interpolation)
         return apply_camera_keys(validated, fps, frames, interpolation)
 
-    def snapshot_animation(self, path):
+    def snapshot_animation(self, path, settings=None):
         from pathlib import Path
 
         destination = Path(path).resolve()
@@ -264,7 +264,56 @@ class BlenderMCPServer:
             raise ValueError("Invalid animation snapshot path")
         if bpy.context.scene.camera is None:
             raise ValueError("Apply a camera path before rendering")
-        bpy.ops.wm.save_as_mainfile(filepath=str(destination), check_existing=False, copy=True)
+        if settings is None:
+            bpy.ops.wm.save_as_mainfile(filepath=str(destination), check_existing=False, copy=True)
+            return {"saved": True}
+        from media_analysis import render_settings
+
+        settings = render_settings(**{key: settings[key] for key in (
+            "duration_seconds", "fps", "resolution", "mode", "engine", "samples")})
+        scene = bpy.context.scene
+        render = scene.render
+        names = ("engine", "resolution_x", "resolution_y", "resolution_percentage", "fps", "fps_base", "film_transparent")
+        original = {name: getattr(render, name) for name in names}
+        original_samples = scene.eevee.taa_render_samples
+        shading = scene.display.shading
+        shading_names = ("light", "color_type", "single_color", "background_type", "show_shadows", "show_cavity", "cavity_type")
+        original_shading = {name: tuple(getattr(shading, name)) if name == "single_color" else getattr(shading, name) for name in shading_names}
+        original_world = scene.world
+        original_world_color = tuple(original_world.color) if original_world else None
+        frames = (scene.frame_start, scene.frame_end, scene.frame_current)
+        try:
+            render.engine = "BLENDER_WORKBENCH" if settings["mode"] == "clay" else settings["engine"]
+            if settings["mode"] == "clay":
+                from blender_video import configure_clay_shading
+
+                configure_clay_shading(scene)
+            render.resolution_x, render.resolution_y = settings["width"], settings["height"]
+            render.resolution_percentage = 100
+            render.fps, render.fps_base = settings["fps"], 1
+            scene.eevee.taa_render_samples = settings["samples"]
+            scene.frame_start, scene.frame_end = 1, settings["frames"]
+            scene.frame_set(1)
+            bpy.ops.file.pack_all()
+            bpy.ops.wm.save_as_mainfile(filepath=str(destination), check_existing=False, copy=True)
+            preview = self.get_viewport_screenshot(filepath=str(destination.with_name("viewport.png")), camera_view=True)
+            if "error" in preview:
+                raise ValueError(f"Could not capture the animation viewport: {preview['error']}")
+        finally:
+            for name, value in original.items():
+                setattr(render, name, value)
+            scene.eevee.taa_render_samples = original_samples
+            for name, value in original_shading.items():
+                setattr(shading, name, value)
+            if scene.world != original_world:
+                temporary_world = scene.world
+                scene.world = original_world
+                if temporary_world and temporary_world.users == 0:
+                    bpy.data.worlds.remove(temporary_world)
+            if original_world_color is not None:
+                original_world.color = original_world_color
+            scene.frame_start, scene.frame_end = frames[:2]
+            scene.frame_set(frames[2])
         return {"saved": True}
     # ──────────────────────────────────────────────
 
@@ -355,8 +404,8 @@ class BlenderMCPServer:
 
         return obj_info
 
-    def get_viewport_screenshot(self, max_size=800, filepath=None, format="png"):
-        """Capture a screenshot of the current 3D viewport using OpenGL render."""
+    def get_viewport_screenshot(self, max_size=800, filepath=None, format="png", camera_view=False):
+        """Capture a viewport/camera screenshot; use Workbench without a GUI viewport."""
         try:
             if not filepath:
                 return {"error": "No filepath provided"}
@@ -370,6 +419,7 @@ class BlenderMCPServer:
             orig_res_x = scene.render.resolution_x
             orig_res_y = scene.render.resolution_y
             orig_percentage = scene.render.resolution_percentage
+            orig_engine = scene.render.engine
 
             try:
                 # Configure render output
@@ -378,8 +428,26 @@ class BlenderMCPServer:
                 scene.render.image_settings.color_mode = "RGB"
                 scene.render.resolution_percentage = 100
 
-                # Render the viewport using OpenGL (reads from the Blender display buffer)
-                bpy.ops.render.opengl(write_still=True)
+                context = bpy.context
+                view = (context.window, context.area, context.region) if (
+                    context.window and context.area and context.area.type == "VIEW_3D"
+                    and context.region and context.region.type == "WINDOW"
+                ) else None
+                if view is None:
+                    view = next((
+                        (window, area, region)
+                        for window in context.window_manager.windows
+                        for area in window.screen.areas if area.type == "VIEW_3D"
+                        for region in area.regions if region.type == "WINDOW"
+                    ), None)
+                if bpy.app.background or view is None or (camera_view and scene.render.engine == "BLENDER_WORKBENCH"):
+                    if scene.camera is None:
+                        raise ValueError("A camera is required for a headless viewport preview.")
+                    scene.render.engine = "BLENDER_WORKBENCH"
+                    bpy.ops.render.render(write_still=True)
+                else:
+                    with bpy.context.temp_override(window=view[0], area=view[1], region=view[2]):
+                        bpy.ops.render.opengl(write_still=True, view_context=not camera_view)
 
             finally:
                 # Restore original settings
@@ -389,6 +457,7 @@ class BlenderMCPServer:
                 scene.render.resolution_x = orig_res_x
                 scene.render.resolution_y = orig_res_y
                 scene.render.resolution_percentage = orig_percentage
+                scene.render.engine = orig_engine
 
             # Load saved image to get dimensions and optionally scale it
             img = bpy.data.images.load(filepath)
@@ -412,6 +481,7 @@ class BlenderMCPServer:
                 "filepath": filepath,
             }
         except Exception as e:
+            _logger.error("Viewport screenshot failed", exc_info=True)
             return {"error": str(e)}
 
     @staticmethod

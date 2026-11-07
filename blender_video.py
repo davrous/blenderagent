@@ -49,6 +49,23 @@ def apply_camera_keys(keys: list[dict], fps: int, frames: int, interpolation: st
     return {"camera": camera.name, "frames": frames, "fps": fps}
 
 
+def configure_clay_shading(scene):
+    import bpy
+
+    shading = scene.display.shading
+    shading.light = "STUDIO"
+    shading.color_type = "SINGLE"
+    shading.single_color = (0.65, 0.65, 0.65)
+    shading.background_type = "WORLD"
+    if scene.world is None:
+        scene.world = bpy.data.worlds.new("ClayWorld")
+    scene.world.color = (0.95, 0.95, 0.95)
+    shading.show_shadows = True
+    shading.show_cavity = True
+    shading.cavity_type = "BOTH"
+    scene.render.film_transparent = False
+
+
 def render_snapshot(directory: Path):
     import bpy
 
@@ -70,18 +87,7 @@ def render_snapshot(directory: Path):
     scene.render.use_sequencer = False
     scene.render.use_border = False
     if settings["mode"] == "clay":
-        shading = scene.display.shading
-        shading.light = "STUDIO"
-        shading.color_type = "SINGLE"
-        shading.single_color = (0.65, 0.65, 0.65)
-        shading.background_type = "WORLD"
-        if scene.world is None:
-            scene.world = bpy.data.worlds.new("ClayWorld")
-        scene.world.color = (0.95, 0.95, 0.95)
-        shading.show_shadows = True
-        shading.show_cavity = True
-        shading.cavity_type = "BOTH"
-        scene.render.film_transparent = False
+        configure_clay_shading(scene)
     elif settings["engine"] == "CYCLES":
         scene.cycles.device = "CPU"
         scene.cycles.samples = settings["samples"]

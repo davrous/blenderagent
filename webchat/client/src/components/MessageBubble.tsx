@@ -31,7 +31,9 @@ function MessageBubbleImpl({ message }: Props) {
   if (message.role === "user") {
     return (
       <div className="msg msg-user">
-        <div className="msg-bubble">{message.text}{message.referenceNames?.map((name, index) => <div className="reference-name" key={`${name}-${index}`}>{name}</div>)}</div>
+        <div className="msg-bubble">{message.text}{message.referenceNames?.map((name, index) => <div className="reference-name" key={`${name}-${index}`}>{name}</div>)}
+          {message.audioUrl && <audio className="workspace-audio" controls preload="metadata" aria-label="Extrait musical envoyé" src={blobProxyUrl(message.audioUrl)} />}
+        </div>
       </div>
     );
   }
@@ -129,4 +131,3 @@ function MessageBubbleImpl({ message }: Props) {
 }
 
 export const MessageBubble = memo(MessageBubbleImpl);
-

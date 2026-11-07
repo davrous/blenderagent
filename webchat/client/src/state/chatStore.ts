@@ -1,8 +1,10 @@
 import { create } from "zustand";
 import { streamChat } from "../api/stream";
-import type { VoiceStatus } from "../api/voice";
+import { voice, type VoiceStatus } from "../api/voice";
 import type { ReferenceUpload } from "../api/media";
-import { isMusicConfirmation, type MicMode, type MusicCandidate, type MusicRequest } from "../api/music";
+import { isMusicConfirmation, type MicMode, type MusicCandidate, type MusicRequest, type MusicGenerationOptions } from "../api/music";
+import { createWorkspace, loadWorkspace, type WorkspaceDetail, type WorkspaceBinding } from "../api/workspaces";
+import { saveJobIds } from "../api/media";
 
 export type Role = "user" | "assistant";
 export type Status = "streaming" | "done" | "error";
@@ -16,9 +18,22 @@ export interface Message {
   status: Status;
   errorText?: string;
   referenceNames?: string[];
+  audioUrl?: string;
 }
 
 interface ChatState {
+  workspaceView: "gallery" | "chat" | "resources";
+  workspaceLoading: boolean;
+  workspaceError: string | null;
+  workspaceBinding: WorkspaceBinding | null;
+  replayHistory: boolean;
+  showGallery: () => void;
+  showResources: () => void;
+  showChat: () => void;
+  startWorkspace: () => Promise<void>;
+  resumeWorkspace: (id: string) => Promise<void>;
+  setWorkspaceError: (message: string | null) => void;
+  voiceInputAudio: (url: string) => void;
   messages: Message[];
   previousResponseId: string | null;
   conversationId: string;
@@ -30,6 +45,8 @@ interface ChatState {
   voiceHint: string | null;
   micMode: MicMode;
   musicCandidate: MusicCandidate | null;
+  musicOptions: MusicGenerationOptions;
+  setMusicOptions: (options: MusicGenerationOptions) => void;
   setMicMode: (mode: MicMode) => void;
   setMusicCandidate: (candidate: MusicCandidate) => void;
   confirmMusicScene: () => Promise<void>;
@@ -150,6 +167,30 @@ function isCorruptedHistoryError(payload: any): boolean {
 }
 
 export const useChatStore = create<ChatState>((set, get) => {
+  const activateWorkspace = (workspace: WorkspaceDetail, fresh: boolean): void => {
+    voice.dispose();
+    const messages: Message[] = workspace.turns.flatMap((turn) => [
+      { id: `${turn.id}-user`, role: "user" as const, text: turn.user, rawBuffer: turn.user,
+        currentStatus: null, status: "done" as const, ...(turn.audio_url ? { audioUrl: turn.audio_url } : {}) },
+      { id: `${turn.id}-assistant`, role: "assistant" as const,
+        ...applyDelta("", null, turn.assistant), currentStatus: null, status: turn.status,
+        ...(turn.status === "error" ? { errorText: "Tour interrompu ou échoué lors de cette réalisation." } : {}) },
+    ]);
+    voiceAssistantId = null;
+    let storageWarning: string | null = null;
+    try {
+      localStorage.setItem(CONVERSATION_ID_STORAGE_KEY, workspace.id);
+      saveJobIds(workspace.id, workspace.job_ids);
+    } catch {
+      storageWarning = "Le stockage du navigateur est indisponible. La réalisation reste dans le catalogue serveur.";
+    }
+    set({
+      conversationId: workspace.id, messages, previousResponseId: null,
+      workspaceBinding: workspace.binding, workspaceView: workspace.binding.expired ? "resources" : "chat",
+      workspaceError: storageWarning ?? workspace.recovery_note ?? null, replayHistory: !fresh, voiceStatus: "idle", voiceActive: false, voiceHint: null,
+      micMode: "voice", musicCandidate: null, musicOptions: { duration_seconds: 15, render_mode: "standard" },
+    });
+  };
   // Recover from a corrupted server-side conversation history (orphaned tool
   // call). We DROP the poisoned response chain (`previousResponseId`) but KEEP
   // the conversation id so the per-conversation Blender scene is preserved. In
@@ -179,6 +220,10 @@ export const useChatStore = create<ChatState>((set, get) => {
     references: ReferenceUpload[] = [],
     music?: MusicRequest,
   ): Promise<void> => {
+    if (get().workspaceBinding?.expired) {
+      set({ workspaceError: "Ce sandbox a expiré. Les ressources restent consultables, mais la scène ne peut pas être remplacée silencieusement." });
+      return;
+    }
     if (get().isStreaming || get().voiceActive || ["connecting", "listening", "thinking", "analyzing"].includes(get().voiceStatus)) return;
     const trimmedInput = agentInput.trim();
     if (!trimmedInput && !references.length) return;
@@ -279,6 +324,9 @@ export const useChatStore = create<ChatState>((set, get) => {
           } else if (eventType === "response.completed") {
             const id = payload?.response?.id;
             if (id) set({ previousResponseId: id });
+            set({ replayHistory: false });
+          } else if (eventType === "archive.warning" && typeof payload?.message === "string") {
+            set({ workspaceError: payload.message });
           } else if (eventType === "error" || eventType === "response.failed") {
             if (isCorruptedHistoryError(payload)) {
               // Poisoned session: an orphaned tool call in the server-side
@@ -299,6 +347,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         ac.signal,
         references.map((reference) => reference.blob_name),
         music,
+        get().replayHistory,
       );
       finalize("done");
     } catch (err) {
@@ -313,6 +362,38 @@ export const useChatStore = create<ChatState>((set, get) => {
   };
 
   return {
+  workspaceView: "gallery",
+  workspaceLoading: false,
+  workspaceError: null,
+  workspaceBinding: null,
+  replayHistory: false,
+  setWorkspaceError: (message) => set({ workspaceError: message }),
+  showGallery: () => {
+    if (get().isStreaming || get().voiceActive || get().workspaceLoading) return;
+    voice.dispose();
+    set({ workspaceView: "gallery" });
+  },
+  showResources: () => set({ workspaceView: "resources" }),
+  showChat: () => set({ workspaceView: "chat" }),
+  startWorkspace: async () => {
+    if (get().workspaceLoading || get().isStreaming || get().voiceActive) return;
+    set({ workspaceLoading: true, workspaceError: null });
+    try {
+      const workspace = await createWorkspace();
+      activateWorkspace(workspace, true);
+    } catch (error) {
+      set({ workspaceError: error instanceof Error ? error.message : "Impossible de créer une scène." });
+    } finally { set({ workspaceLoading: false }); }
+  },
+  resumeWorkspace: async (id) => {
+    if (get().workspaceLoading || get().isStreaming || get().voiceActive) return;
+    set({ workspaceLoading: true, workspaceError: null });
+    try {
+      activateWorkspace(await loadWorkspace(id), false);
+    } catch (error) {
+      set({ workspaceError: error instanceof Error ? error.message : "Impossible de reprendre ce travail." });
+    } finally { set({ workspaceLoading: false }); }
+  },
   messages: [],
   previousResponseId: null,
   conversationId: loadOrCreateConversationId(),
@@ -323,6 +404,12 @@ export const useChatStore = create<ChatState>((set, get) => {
   voiceHint: null,
   micMode: "voice",
   musicCandidate: null,
+  musicOptions: { duration_seconds: 15, render_mode: "standard" },
+
+  setMusicOptions: (options) => {
+    if (get().isStreaming || get().voiceActive || ["connecting", "listening", "thinking", "analyzing"].includes(get().voiceStatus)) return;
+    set({ musicOptions: options });
+  },
 
   setMicMode: (mode) => {
     if (get().isStreaming || get().voiceActive || ["connecting", "listening", "thinking", "analyzing"].includes(get().voiceStatus)) return;
@@ -335,14 +422,14 @@ export const useChatStore = create<ChatState>((set, get) => {
     const candidate = get().musicCandidate;
     if (!candidate || get().isStreaming || get().voiceActive) return;
     set({ musicCandidate: null });
-    await runAgentTurn("Oui, crée la scène Devfest.", "Oui, crée la scène Devfest.", [], { candidate, action: "generate" });
+    await runAgentTurn("Oui, crée la scène Devfest.", "Oui, crée la scène Devfest.", [], { candidate, action: "generate", ...get().musicOptions });
     if (get().messages.at(-1)?.status === "error") set({ musicCandidate: candidate });
   },
   declineMusicScene: async () => {
     const candidate = get().musicCandidate;
     if (!candidate || get().isStreaming || get().voiceActive) return;
     set({ musicCandidate: null });
-    await runAgentTurn("Non, pas de scène.", "Non, pas de scène.", [], { candidate, action: "discuss" });
+    await runAgentTurn("Non, pas de scène.", "Non, pas de scène.", [], { candidate, action: "discuss", ...get().musicOptions });
   },
 
   reset: () => {
@@ -368,10 +455,17 @@ export const useChatStore = create<ChatState>((set, get) => {
       voiceHint: null,
       micMode: "voice",
       musicCandidate: null,
+      musicOptions: { duration_seconds: 15, render_mode: "standard" },
     });
   },
 
   setVoiceStatus: (s) => set({ voiceStatus: s }),
+  voiceInputAudio: (url) => {
+    const assistant = get().messages.findIndex((message) => message.id === voiceAssistantId);
+    if (assistant < 1) return;
+    const userId = get().messages[assistant - 1].id;
+    set((state) => ({ messages: state.messages.map((message) => message.id === userId ? { ...message, audioUrl: url } : message) }));
+  },
 
   voiceBeginTurn: (transcript) => {
     const userMsg: Message = {
@@ -418,6 +512,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         m.id === id ? { ...m, status: "done", currentStatus: null } : m,
       ),
       voiceActive: false,
+      replayHistory: false,
       previousResponseId: responseId ?? state.previousResponseId,
     }));
   },
@@ -443,7 +538,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     if (candidate && !references.length) {
       const generate = isMusicConfirmation(input);
       if (generate || /^non\b|^no\b/i.test(input.trim())) set({ musicCandidate: null });
-      await runAgentTurn(input, input.trim(), [], { candidate, action: generate ? "generate" : "discuss" });
+      await runAgentTurn(input, input.trim(), [], { candidate, action: generate ? "generate" : "discuss", ...get().musicOptions });
       if (generate && get().messages.at(-1)?.status === "error") set({ musicCandidate: candidate });
     } else {
       await runAgentTurn(input, input.trim(), references);

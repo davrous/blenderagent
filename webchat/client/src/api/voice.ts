@@ -31,6 +31,8 @@ export interface VoiceHandlers {
   onAgentDelta: (text: string) => void;
   onAgentDone: (responseId: string | null) => void;
   onMusicResult: (candidate: MusicCandidate) => void;
+  onInputAudio?: (url: string) => void;
+  onArchiveWarning?: (message: string) => void;
   onError: (message: string) => void;
   getConversationId: () => string;
   getPreviousResponseId: () => string | null;
@@ -440,6 +442,12 @@ class VoiceController {
         if (isMusicCandidate(frame.candidate)) h.onMusicResult(frame.candidate);
         else h.onError("The audio service returned an invalid music result.");
         break;
+      case "input_audio":
+        if (typeof frame.audio_url === "string") h.onInputAudio?.(frame.audio_url);
+        break;
+      case "archive.warning":
+        if (typeof frame.message === "string") h.onArchiveWarning?.(frame.message);
+        break;
       case "delta":
         if (typeof frame.text === "string") h.onAgentDelta(frame.text);
         break;
@@ -455,6 +463,7 @@ class VoiceController {
         }
         break;
       case "done":
+        if (typeof frame.archive_warning === "string") h.onArchiveWarning?.(frame.archive_warning);
         if (frame.mode === "music" && frame.history_commit_failed) {
           h.onError("La musique a été analysée, mais son historique n'a pas pu être enregistré. Réessaie avant de créer la scène.");
           this.setStatus("idle");

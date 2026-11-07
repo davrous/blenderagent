@@ -13,6 +13,7 @@ export async function streamChat(
   signal: AbortSignal,
   references: string[] = [],
   music?: MusicRequest,
+  replayHistory = false,
 ): Promise<void> {
   const res = await fetch("/api/chat", {
     method: "POST",
@@ -23,6 +24,7 @@ export async function streamChat(
       conversation_id: conversationId,
       ...(references.length ? { references } : {}),
       ...(music ? { music } : {}),
+      ...(replayHistory ? { replay_history: true } : {}),
     }),
     signal,
   });

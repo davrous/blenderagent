@@ -86,7 +86,8 @@ az storage container create --account-name <your-storage-account-name> --auth-mo
 
 This one container holds image/export artifacts, references and video jobs in separate
 namespaces. A `blender-scenes` container is no longer required. The working scene
-and render snapshots are stored under `$HOME`, not in Blob storage. Existing containers
+and ordinary render snapshots are stored under `$HOME`. Devfest inspection also
+publishes a frozen, packed animation snapshot in private Blob storage. Existing containers
 must also be private; the Webchat upload service rejects public containers.
 
 ### 2. Assign the Storage Blob Data Contributor role
@@ -522,24 +523,92 @@ and unidentified clips are explicitly reported.
 
 Only after a positive text reply (for example `oui`) or the confirmation button
 does the existing Blender agent create an original, family-friendly developer
-vignette with a Devfest Toulouse closing greeting. Discussion and refusal turns
+vignette with original caricature designs inspired by the film's character archetypes,
+exaggerated silhouettes, expressions, costume palettes and gestures, plus a Devfest
+Toulouse closing greeting. Discussion and refusal turns
 disable model tool calls. The opt-in creative brief is scoped to that turn;
 switching back to **Dialogue vocal** or Reset discards the pending hypothesis.
 Scene generation preserves existing objects and uses the existing viewport,
-camera-path and snapshot/video-job tools. Devfest renders are bounded to
-15-20 seconds, standard Eevee, without paid Seedance finishing (recommended:
-18 seconds, 12 fps, 720p). The recorded melody is not added to the video, and
-protected film scenes, characters, logos, dialogue and scores are not recreated.
+camera-path and snapshot/video-job tools. The first step only prepares a **packed,
+downloadable `.blend`** containing the camera and object keyframes. Open it in Blender
+and play the timeline before approving the card's **480p / 25 fps** render.
+A viewport screenshot is captured automatically at frame 1 and displayed above
+the card, independently of the model's choice of screenshot tools. Headless
+capture uses a fast Workbench still when no GUI viewport is available.
+Polling cannot start this render: the job waits in `awaiting_render_approval`.
+Before confirming scene creation, choose **5, 10 or 15 seconds** and **Clay**
+(neutral gray Workbench geometry) or **Complet** (Eevee materials and lighting).
+Defaults remain 15 seconds and full rendering. These signed options shape the
+LLM's creative brief and exact object/camera timeline: 125, 250 or 375 frames
+at 25 fps, initially 480p (recommended: 8 samples).
+Both the `.blend` and its viewport preview match the selected mode; original
+materials are retained even for Clay. Existing inspected animations keep their
+original duration; render/HD controls do not shorten previously saved snapshots.
+Clicking a render action immediately shows a spinner and a "prise en compte"
+message. This means the request is being verified, not that rendering has already
+started; the UI then reports accepted/queued, rendering and encoding states.
+
+After the 480p video completes, the card offers a separately approved **native
+1080p / 25 fps** render of that exact frozen animation, not an upscale or a new
+scene. The original 480p video and `.blend` remain downloadable. This HD profile
+retains compatibility with previously inspected clips up to 20 seconds / 500 frames,
+requires 4 GiB of free temporary disk, and
+can be about five times heavier in pixel workload. The 60-minute render timeout
+still applies; HD completion is not guaranteed for complex scenes on this CPU
+container. Ordinary model tool calls cannot enable this higher workload profile.
+Both Devfest render steps preserve the selected Clay/full mode without paid Seedance finishing.
+The recorded melody is not added to the video. Character designs remain original
+caricatures, not exact film models, actor likenesses, logos, scenes, dialogue or scores.
 
 Hosted music recognition uses the same Foundry Responses conversation via the
 authenticated relay's history commit; it keeps the existing Blender session and
-response-chain identity intact. Raw audio stays in memory for analysis and is
-not uploaded to the scene/artifact store.
+response-chain identity intact. The musical input is now saved as a private WAV
+artifact and replayable in the archived user turn and resources view. Previously
+unsaved microphone recordings cannot be recovered retroactively.
+
+## Private Work Gallery
+
+With `MEDIA_CONTROL_SECRET` and `AZURE_STORAGE_ACCOUNT_NAME` configured on
+Webchat, startup shows **Réalisations** instead of immediately opening a sandbox.
+Choose a thumbnail to resume a previous work, or **Nouvelle scène** for a fresh
+browser conversation UUID and empty Blender scene. The new-scene action never
+deletes a previous Foundry sandbox.
+
+The browser UUID remains the workspace key. Its distinct Foundry
+`agentSessionId` (scene affinity) and `foundryConversationId` (model transcript)
+are persisted in the existing private `screenshots` container under
+`webchat-workspaces/`. The catalogue is owned by the signed HttpOnly browser
+cookie, not a list of arbitrary client-provided Foundry IDs. Clearing that cookie
+removes access to the private gallery; cross-device account sync is not provided.
+
+Typed and voice turns, native job IDs and generated resource references are
+archived. **Ressources** replays musical WAVs and shows images, MP4s and Blender
+downloads chronologically. Thumbnails prefer an available rendered image or
+video poster, otherwise the viewport screenshot. Media SAS links are refreshed
+from recorded, owned Blob references when loading a work.
+
+The live primary file remains `$HOME/blender_scenes/scene.blend`. Known
+conversations also keep local checkpoints, so local Docker can switch A/B/A
+without erasing A. Gallery-enabled turns pack resources and save a private
+`workspace-scenes/{scope}/scene.blend` checkpoint for recovery after local
+filesystem loss. A missing required checkpoint fails explicitly instead of
+continuing on an empty replacement scene. A Foundry sandbox marked expired is
+read-only in the gallery; its archived media remain available.
+
+The gallery imports browser IDs/job IDs still present in localStorage, and
+recovers cached Foundry bindings/history where available. Old deleted sandboxes,
+lost histories and previously unsaved audio cannot be reconstructed. Legacy
+import problems are reported without hiding valid archived works.
+
+The proxy identity needs Storage Blob Data Contributor and Blob delegation
+permission on the existing private storage, like the agent. No new storage
+account/container, public access or external provider is created.
 
 Focused checks:
 
 ```bash
 .venv/bin/python devTools/test_music_pipeline.py
+.venv/bin/python -m unittest devTools.test_animation_inspection
 node devTools/test_music_webchat.mjs
 ```
 
@@ -653,7 +722,7 @@ party. Finished output is downloaded and rehosted in private Azure Blob storage.
 
 References are limited to 200 MiB each, four per turn, images up to 16 megapixels
 and 8192 pixels per side, and MP4 videos of 4-30 seconds up to 1080p.
-Blender output is 4-30 seconds at 480p/720p, 12/24/30 fps,
+Ordinary Blender output is 4-30 seconds at 480p/720p, 12/24/25/30 fps,
 with at most 400 million frame-pixels (80 million for standard-mode Cycles) and 1-32 samples.
 Two GiB of free temporary disk is required. `VIDEO_RENDER_TIMEOUT_SECONDS` defaults
 to 3600 (60 minutes). Agent turns stop after 180 seconds without model/tool stream progress
@@ -847,7 +916,7 @@ container. It keeps exactly one scene file at `$HOME/blender_scenes/scene.blend`
 Azure Blob Storage is **not** the persistence store for the working `.blend` scene.
 The pre-created private `screenshots` container holds screenshots, still renders,
 downloadable `.blend`/`.glb` exports, uploaded references, video manifests and MP4/poster
-artifacts. Video recovery also requires its local snapshot and checkpoints under
+artifacts. Ordinary video recovery also requires its local snapshot and checkpoints under
 `$HOME/tmp/video-jobs`; see [Jobs and Recovery](#jobs-and-recovery).
 
 ### Conversation Identity and Reset
@@ -870,7 +939,11 @@ videos/posters use `videos/{scope}/` in the existing container. Job writes use E
 and workers use renewable Blob leases. One isolated Blender process renders at a time;
 frames checkpoint under `$HOME/tmp/video-jobs` and completed frames are reused after
 restart. The local scene snapshot must remain on the persistent HOME filesystem until
-render completion. Loss of that filesystem requires creating a new preview.
+render completion. Loss of that filesystem requires creating a new ordinary preview.
+Devfest inspection snapshots are additionally stored as private
+`videos/{scope}/{job_id}/scene.blend` artifacts. Approved native renders restore
+this exact snapshot from Blob storage, including after container replacement;
+HD rerendering cannot pick up later edits to the live chat scene.
 
 Webchat polls through the existing Responses protocol, without adding control turns
 to conversation history, and restores saved job IDs after reload. A signed HttpOnly

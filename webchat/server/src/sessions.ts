@@ -1,5 +1,6 @@
 import { config } from "./config.js";
 import { getBearerToken } from "./auth.js";
+import { persistBinding, storedBinding, workspaceHistory } from "./workspaces.js";
 
 /**
  * Foundry hosted-agent session manager.
@@ -121,6 +122,8 @@ export async function getOrCreateSession(
 ): Promise<{ agentSessionId: string; agentVersion: string }> {
   const cached = sessionCache.get(conversationId);
   if (cached) {
+    if ((await storedBinding(conversationId))?.expired) throw new Error("This workspace sandbox has expired. Its archived resources remain available.");
+    await persistBinding(conversationId, { agentSessionId: cached.agentSessionId, agentVersion: cached.agentVersion });
     console.log(
       `[sessions] cache hit: conversation=${conversationId} agent_session_id=${cached.agentSessionId}`,
     );
@@ -131,6 +134,12 @@ export async function getOrCreateSession(
   }
 
   return runSingleFlight(sessionCreations, conversationId, async () => {
+    const restored = await storedBinding(conversationId);
+    if (restored?.expired) throw new Error("This Foundry workspace sandbox has expired. Its archived media remain available, but do not continue on a blank replacement scene.");
+    if (restored?.agentSessionId && restored.agentVersion) {
+      sessionCache.set(conversationId, { agentSessionId: restored.agentSessionId, agentVersion: restored.agentVersion, isolationKey: conversationId, createdAt: Date.now() });
+      return { agentSessionId: restored.agentSessionId, agentVersion: restored.agentVersion };
+    }
     const agentVersion = await fetchLatestVersion();
     const token = await ensureToken();
 
@@ -170,6 +179,7 @@ export async function getOrCreateSession(
       agentVersion,
       createdAt: Date.now(),
     });
+    await persistBinding(conversationId, { agentSessionId, agentVersion });
 
     console.log(
       `[sessions] created agent_session_id=${agentSessionId} for conversation=${conversationId} (agentVersion=${agentVersion})`,
@@ -194,9 +204,14 @@ export async function getOrCreateConversation(
   conversationId: string,
 ): Promise<string> {
   const cached = conversationCache.get(conversationId);
-  if (cached) return cached;
+  if (cached) { await persistBinding(conversationId, { foundryConversationId: cached }); return cached; }
 
   return runSingleFlight(conversationCreations, conversationId, async () => {
+    const restored = await storedBinding(conversationId);
+    if (restored?.foundryConversationId) {
+      conversationCache.set(conversationId, restored.foundryConversationId);
+      return restored.foundryConversationId;
+    }
     const token = await ensureToken();
     const url = withApiVersion(
       `${config.foundryAgentBase}/endpoint/protocols/openai/conversations`,
@@ -221,6 +236,9 @@ export async function getOrCreateConversation(
       throw new Error("Conversation create response missing id");
     }
 
+    const history = await workspaceHistory(conversationId);
+    if (history.length) await appendConversationItems(foundryConversationId, history.map((item) => ({ type: "message", ...item })));
+    await persistBinding(conversationId, { foundryConversationId });
     conversationCache.set(conversationId, foundryConversationId);
     console.log(
       `[conversations] created ${foundryConversationId} for conversation=${conversationId}`,
@@ -307,4 +325,29 @@ export async function deleteSession(conversationId: string): Promise<void> {
 
 export function getSessionInfo(conversationId: string): SessionCacheEntry | null {
   return sessionCache.get(conversationId) ?? null;
+}
+export function getConversationInfo(conversationId: string): string | null {
+  return conversationCache.get(conversationId) ?? null;
+}
+export async function readConversationMessages(conversationId: string): Promise<Array<{ role: "user" | "assistant"; content: string }>> {
+  const token = await ensureToken();
+  const messages: Array<{ role: "user" | "assistant"; content: string }> = [];
+  let after = "";
+  for (let page = 0; page < 10; page++) {
+    const base = `${config.foundryAgentBase}/endpoint/protocols/openai/conversations/${encodeURIComponent(conversationId)}/items?order=asc&limit=100${after ? `&after=${encodeURIComponent(after)}` : ""}`;
+    const response = await fetch(withApiVersion(base), { headers: buildHeaders(token) });
+    if (!response.ok) throw new Error(`Could not recover Foundry transcript (${response.status}).`);
+    const body = await response.json();
+    if (!Array.isArray(body.data)) throw new Error("Invalid Foundry conversation item list.");
+    for (const item of body.data) {
+      if (item.type !== "message" || (item.role !== "user" && item.role !== "assistant")) continue;
+      const content = typeof item.content === "string" ? item.content : Array.isArray(item.content)
+        ? item.content.filter((part: { text?: unknown }) => typeof part.text === "string").map((part: { text: string }) => part.text).join("\n") : "";
+      if (content) messages.push({ role: item.role, content });
+    }
+    if (!body.has_more) return messages;
+    if (typeof body.last_id !== "string") throw new Error("Foundry history pagination did not provide a cursor.");
+    after = body.last_id;
+  }
+  throw new Error("Foundry history is too long for automatic import. The original conversation remains available.");
 }

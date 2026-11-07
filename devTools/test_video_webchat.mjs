@@ -126,6 +126,7 @@ assert.equal(next, true);
 console.log("PASS media signatures, cookie tamper checks, scoped references, envelope text safety, Origin checks");
 
 process.env.AGENT_MODE = "local";
+process.env.AZURE_STORAGE_ACCOUNT_NAME = "";
 process.env.MEDIA_CONTROL_SECRET = secret;
 process.env.CLIENT_ORIGIN = "http://localhost:5173";
 const { default: express } = await import("../webchat/node_modules/express/index.js");
@@ -150,7 +151,14 @@ for (const metadata of [videoMetadata(1921, 1080, "10"), videoMetadata(1920, 108
 }
 const jobId = "e".repeat(32);
 let liveState = "awaiting_seedance_approval";
-const descriptor = () => ({ id: jobId, state: liveState, progress: 0.5, mode: "seedance", duration_seconds: 10, fps: 24, resolution: "720p", seedance_enabled: true });
+let nativeInspection = false;
+let nativeResolution = "480p";
+const descriptor = () => nativeInspection
+  ? { id: jobId, state: liveState, progress: 0, mode: "standard", duration_seconds: 18, fps: 25, resolution: nativeResolution,
+      seedance_enabled: false, inspection_required: true, scene_url: `https://teststorage.blob.core.windows.net/screenshots/videos/${scope}/${jobId}/scene.blend`,
+      viewport_url: `https://teststorage.blob.core.windows.net/screenshots/videos/${scope}/${jobId}/viewport.png`,
+      hd_available: liveState === "completed" && nativeResolution === "480p" }
+  : { id: jobId, state: liveState, progress: 0.5, mode: "seedance", duration_seconds: 10, fps: 24, resolution: "720p", seedance_enabled: true };
 const sse = (job) => {
   const text = "```videojob\n" + JSON.stringify(job) + "\n```";
   return [...text].map((delta) => `event: response.output_text.delta\r\ndata: ${JSON.stringify({ delta })}\r\n\r\n`).join("");
@@ -164,6 +172,7 @@ assert.equal((await readJobStream(new Response(splitStream), jobId)).id, jobId);
 await assert.rejects(readJobStream(new Response(sse({ ...descriptor(), id: "f".repeat(32) })), jobId));
 assert.throws(() => validateJob({ ...descriptor(), state: "invented" }, jobId));
 assert.equal(validateJob({ ...descriptor(), preview_url: "https://evil.example/a.mp4" }, jobId).preview_url, undefined);
+assert.throws(() => validateJob({ ...descriptor(), viewport_url: "https://evil.example/a.png" }, jobId), /viewport/);
 console.log("PASS media metadata limits, chunked CRLF SSE, descriptor validation");
 
 const upstream = express();
@@ -181,6 +190,7 @@ upstream.post("/responses", (req, res) => {
   calls.push(decoded.action);
   if (decoded.action.type === "approve") liveState = "wavespeed_processing";
   if (decoded.action.type === "cancel") liveState = "cancelled";
+  if (decoded.action.type === "render") { nativeResolution = decoded.action.resolution; liveState = "queued"; }
   res.type("text/event-stream").end(sse(descriptor()));
 });
 const upstreamServer = upstream.listen(0, "127.0.0.1");
@@ -241,6 +251,41 @@ try {
     response = await fetch(`${base}/api/references?conversation_id=${conversation}`, { method: "POST", headers: { Cookie: headers.Cookie, Origin: headers.Origin }, body: badForm });
     assert.equal(response.status, 400, invalid);
   }
+  nativeInspection = true;
+  liveState = "awaiting_render_approval";
+  response = await fetch(`${base}${route}?conversation_id=${conversation}`, { headers });
+  const prepared = await response.json();
+  assert.equal(prepared.state, "awaiting_render_approval");
+  assert.match(prepared.scene_url, /scene\.blend$/);
+  assert.match(prepared.viewport_url, /viewport\.png$/);
+  response = await fetch(`${base}${route}/render`, { method: "POST", headers, body: JSON.stringify({ conversation_id: conversation, resolution: "1080p" }) });
+  assert.equal(response.status, 409);
+  assert.equal(calls.at(-1).type, "status");
+  const nativeCalls = calls.length;
+  for (const invalid of [{ resolution: "720p" }, { resolution: "480p", prompt: "Paid finishing" }, { resolution: "480p", generate_audio: true }]) {
+    response = await fetch(`${base}${route}/render`, { method: "POST", headers, body: JSON.stringify({ conversation_id: conversation, ...invalid }) });
+    assert.equal(response.status, 400);
+  }
+  assert.equal(calls.length, nativeCalls);
+  response = await fetch(`${base}${route}/render`, { method: "POST", headers: { ...headers, Origin: "https://evil.example" }, body: JSON.stringify({ conversation_id: conversation }) });
+  assert.equal(response.status, 403);
+  response = await fetch(`${base}${route}/render`, { method: "POST", headers, body: JSON.stringify({ conversation_id: conversation, resolution: "480p" }) });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).state, "queued");
+  assert.deepEqual(calls.at(-1), { type: "render", job_id: jobId, resolution: "480p" });
+  response = await fetch(`${base}${route}/render`, { method: "POST", headers, body: JSON.stringify({ conversation_id: conversation, resolution: "1080p" }) });
+  assert.equal(response.status, 409);
+  liveState = "completed";
+  response = await fetch(`${base}${route}/render`, { method: "POST", headers, body: JSON.stringify({ conversation_id: conversation, resolution: "1080p" }) });
+  assert.equal(response.status, 200);
+  const hd = await response.json();
+  assert.equal(hd.fps, 25);
+  assert.equal(hd.resolution, "1080p");
+  assert.equal(hd.id, jobId);
+  assert.deepEqual(calls.at(-1), { type: "render", job_id: jobId, resolution: "1080p" });
+  nativeInspection = false;
+  liveState = "submission_unknown";
+  console.log("PASS signed native controls: .blend inspection, 480p/25 fps approval, completed-preview gate for 1080p, no paid options, Origin and immutable job identity");
   config.mediaControlSecret = "";
   response = await fetch(`${base}${route}?conversation_id=${conversation}`, { headers });
   assert.equal(response.status, 503);

@@ -3,8 +3,9 @@ import { randomUUID } from "node:crypto";
 import { config } from "./config.js";
 import { browserKey, isUuid, JOB_ID_RE, mediaEnabled, requireOrigin, scopeFor, signEnvelope, type MediaAction } from "./mediaSecurity.js";
 import { storeReference, withReferenceUpload } from "./referenceUploads.js";
+import { archiveJob, ownerFromCookie, registerWorkspace } from "./workspaces.js";
 
-export const JOB_STATES = ["queued", "rendering", "encoding", "awaiting_seedance_approval", "wavespeed_uploading", "wavespeed_submitting", "wavespeed_processing", "submission_unknown", "completed", "failed", "cancelled"] as const;
+export const JOB_STATES = ["queued", "rendering", "encoding", "awaiting_render_approval", "awaiting_seedance_approval", "wavespeed_uploading", "wavespeed_submitting", "wavespeed_processing", "submission_unknown", "completed", "failed", "cancelled"] as const;
 const TERMINAL = new Set(["completed", "failed", "cancelled", "submission_unknown"]);
 export interface VideoJob {
   id: string;
@@ -18,8 +19,12 @@ export interface VideoJob {
   preview_url?: string;
   poster_url?: string;
   output_url?: string;
+  viewport_url?: string;
   error?: string;
   estimate_usd?: number;
+  inspection_required?: boolean;
+  scene_url?: string;
+  hd_available?: boolean;
 }
 
 export function safeBlobUrl(value: unknown): string | undefined {
@@ -39,12 +44,19 @@ export function validateJob(value: unknown, id: string): VideoJob {
   for (const field of ["progress", "duration_seconds", "fps"] as const) {
     if (typeof job[field] !== "number" || !Number.isFinite(job[field]) || job[field] < 0) throw new Error("Invalid video job metadata");
   }
+  const sceneUrl = safeBlobUrl(job.scene_url);
+  const viewportUrl = safeBlobUrl(job.viewport_url);
+  if (job.viewport_url !== undefined && !viewportUrl) throw new Error("Invalid viewport preview URL");
+  if (job.inspection_required !== undefined && typeof job.inspection_required !== "boolean") throw new Error("Invalid animation inspection metadata");
+  if (job.inspection_required && (!sceneUrl || typeof job.hd_available !== "boolean")) throw new Error("Invalid Blender animation download");
   return {
     id, state: job.state as VideoJob["state"], progress: job.progress as number, mode: job.mode.slice(0, 100),
     duration_seconds: job.duration_seconds as number, fps: job.fps as number, resolution: job.resolution.slice(0, 40), seedance_enabled: job.seedance_enabled,
     preview_url: safeBlobUrl(job.preview_url), poster_url: safeBlobUrl(job.poster_url), output_url: safeBlobUrl(job.output_url),
+    ...(viewportUrl ? { viewport_url: viewportUrl } : {}),
     error: typeof job.error === "string" ? job.error.slice(0, 2000) : undefined,
     estimate_usd: typeof job.estimate_usd === "number" && Number.isFinite(job.estimate_usd) && job.estimate_usd >= 0 ? job.estimate_usd : undefined,
+    ...(job.inspection_required ? { inspection_required: true, scene_url: sceneUrl, hd_available: job.hd_available === true } : {}),
   };
 }
 
@@ -146,6 +158,8 @@ export function registerMediaRoutes(app: Express, build: UpstreamBuilder, upload
     const id = String(req.params.id);
     if (!JOB_ID_RE.test(id) || !isUuid(conversation)) { res.status(400).json({ error: "Valid job ID and conversation_id are required" }); return; }
     const scope = requestScope(req, res, conversation);
+    try { await registerWorkspace(ownerFromCookie(req.headers.cookie), conversation); }
+    catch (error) { res.status(502).json({ error: error instanceof Error ? error.message : "Workspace archive unavailable" }); return; }
     const lock = `${scope}:${id}`;
     if (inFlight.has(lock)) { res.status(409).json({ error: "Job request already in progress; retry status shortly" }); return; }
     let action: MediaAction = { type, job_id: id };
@@ -153,6 +167,14 @@ export function registerMediaRoutes(app: Express, build: UpstreamBuilder, upload
       const { prompt = "", resolution = "720p", generate_audio = false } = req.body;
       if (typeof prompt !== "string" || prompt.length > 8000 || !["480p", "720p", "1080p", "4k"].includes(resolution) || typeof generate_audio !== "boolean") { res.status(400).json({ error: "Invalid approval options" }); return; }
       action = { ...action, prompt, resolution, generate_audio };
+    }
+    if (type === "render") {
+      const resolution = req.body?.resolution ?? "480p";
+      if ((resolution !== "480p" && resolution !== "1080p") || req.body?.prompt !== undefined || req.body?.generate_audio !== undefined) {
+        res.status(400).json({ error: "Native Blender render accepts only 480p or 1080p, without paid finishing options" });
+        return;
+      }
+      action = { ...action, resolution };
     }
     inFlight.add(lock);
     const controller = new AbortController();
@@ -162,13 +184,22 @@ export function registerMediaRoutes(app: Express, build: UpstreamBuilder, upload
       const upstream = await withDeadline(build({ conversation_id: conversation }, signEnvelope(config.mediaControlSecret, scope, "", undefined, operation), true), controller.signal);
       controller.signal.throwIfAborted();
       const response = await fetch(upstream.url, { method: "POST", headers: upstream.headers, body: JSON.stringify(upstream.payload), signal: controller.signal });
-      return readJobStream(response, id);
+      const job = await readJobStream(response, id);
+      await archiveJob(conversation, job);
+      return job;
     };
     try {
       if (type !== "status") {
         const live = await call({ type: "status", job_id: id });
         if ((type === "approve" && (live.state !== "awaiting_seedance_approval" || !live.seedance_enabled)) || (type === "cancel" && TERMINAL.has(live.state))) {
           res.status(409).json({ error: "Job is no longer eligible for this action. Refresh status.", job: live });
+          return;
+        }
+        if (type === "render" && (!live.inspection_required || !live.scene_url || !(
+          (action.resolution === "480p" && live.state === "awaiting_render_approval")
+          || (action.resolution === "1080p" && live.state === "completed" && live.resolution === "480p" && live.hd_available)
+        ))) {
+          res.status(409).json({ error: "Inspect the Blender file before 480p rendering, then approve the completed preview before 1080p.", job: live });
           return;
         }
       }
@@ -183,4 +214,5 @@ export function registerMediaRoutes(app: Express, build: UpstreamBuilder, upload
   app.get("/api/video-jobs/:id", (req, res) => { void control(req, res, "status"); });
   app.post("/api/video-jobs/:id/approve", origin, (req, res) => { void control(req, res, "approve"); });
   app.post("/api/video-jobs/:id/cancel", origin, (req, res) => { void control(req, res, "cancel"); });
+  app.post("/api/video-jobs/:id/render", origin, (req, res) => { void control(req, res, "render"); });
 }

@@ -198,7 +198,7 @@ class ScopedSceneTests(unittest.IsolatedAsyncioTestCase):
             async def updates():
                 self.assertTrue(music.music_scene.get())
                 self.assertEqual(video_scope.get(), "a" * 32)
-                self.assertIn("15-20 seconds", ctx.messages[-1].text)
+                self.assertIn("EXACTLY 15 seconds", ctx.messages[-1].text)
                 yield AgentResponseUpdate(role="assistant", contents=[Content.from_text("Creating")])
                 raise RuntimeError("stream failed")
             ctx.result = ResponseStream(updates(), finalizer=AgentResponse.from_updates)
@@ -228,22 +228,43 @@ class ScopedSceneTests(unittest.IsolatedAsyncioTestCase):
             await MediaMiddleware(inner).process(context, AsyncMock())
 
     async def test_render_enforces_duration_style_and_no_paid_finishing(self):
-        token = music.music_scene.set(True)
+        token = music.music_scene.set(music.MusicRequest(candidate=CANDIDATE, action="generate"))
         try:
-            for settings in ({"duration_seconds": 14}, {"duration_seconds": 21}, {"duration_seconds": 18, "mode": "clay"}, {"duration_seconds": 18, "engine": "CYCLES"}, {"duration_seconds": 18, "seedance": True}):
+            for settings in ({"duration_seconds": 14}, {"duration_seconds": 18}, {"duration_seconds": 21}, {"duration_seconds": 15, "mode": "clay"}, {"duration_seconds": 15, "engine": "CYCLES"}, {"duration_seconds": 15, "seedance": True}, {"duration_seconds": 15, "fps": 12}, {"duration_seconds": 15, "resolution": "720p"}):
                 with self.assertRaises(ValueError):
                     await start_animation_render(**settings)
             scope = video_scope.set("a" * 32)
             jobs = SimpleNamespace(create=lambda _scope, settings, _snapshot, **kwargs: dict(id="b" * 32, **settings, **kwargs))
             try:
                 with patch("media_control.get_video_jobs", return_value=jobs), patch("media_control.descriptor", side_effect=lambda value: value):
-                    value = await start_animation_render(duration_seconds=18, fps=12, resolution="720p", mode="standard")
-                self.assertEqual((value["duration_seconds"], value["frames"], value["seedance"]), (18, 216, False))
+                    value = await start_animation_render(duration_seconds=15, fps=25, resolution="480p", mode="standard")
+                self.assertEqual((value["duration_seconds"], value["frames"], value["seedance"], value["inspect_first"]), (15, 375, False, True))
             finally:
                 video_scope.reset(scope)
         finally:
             music.music_scene.reset(token)
         self.assertEqual(render_settings(5)["duration_seconds"], 5)
+
+    async def test_all_selected_durations_and_modes_reach_tools_and_prompt(self):
+        for duration in (5, 10, 15):
+            for mode in ("clay", "standard"):
+                request = music.MusicRequest(candidate=CANDIDATE, action="generate",
+                                             duration_seconds=duration, render_mode=mode)
+                token = music.music_scene.set(request)
+                scope = video_scope.set("a" * 32)
+                jobs = SimpleNamespace(create=lambda _scope, settings, _snapshot, **kwargs: dict(settings, **kwargs))
+                try:
+                    prompt = music.music_instructions(request)
+                    self.assertIn(f"EXACTLY {duration} seconds", prompt)
+                    self.assertIn(f"mode='{mode}'", prompt)
+                    with patch("media_control.get_video_jobs", return_value=jobs), patch("media_control.descriptor", side_effect=lambda value: value):
+                        result = await start_animation_render(duration_seconds=duration, fps=25, mode=mode)
+                        self.assertEqual((result["frames"], result["mode"], result["inspect_first"]), (duration * 25, mode, True))
+                        with self.assertRaises(ValueError):
+                            await start_animation_render(duration_seconds=duration, fps=25, mode="standard" if mode == "clay" else "clay")
+                finally:
+                    video_scope.reset(scope)
+                    music.music_scene.reset(token)
 
     def test_signed_music_cannot_authorize_paid_actions(self):
         text, secret = self.envelope("generate")

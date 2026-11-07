@@ -29,10 +29,14 @@ export function verifyBrowserKey(cookie: string, secret: string): string | null 
   return timingSafeEqual(Buffer.from(match[2], "hex"), Buffer.from(expected, "hex")) ? match[1] : null;
 }
 
-export function browserKey(req: Request, res: Response, secret: string, secure: boolean): string {
-  const cookie = (req.headers.cookie ?? "").split(";").map((part) => part.trim())
+export function readBrowserKey(cookieHeader: string | undefined, secret: string): string | null {
+  const cookie = (cookieHeader ?? "").split(";").map((part) => part.trim())
     .find((part) => part.startsWith(`${COOKIE_NAME}=`))?.slice(COOKIE_NAME.length + 1) ?? "";
-  const existing = verifyBrowserKey(cookie, secret);
+  return verifyBrowserKey(cookie, secret);
+}
+
+export function browserKey(req: Request, res: Response, secret: string, secure: boolean): string {
+  const existing = readBrowserKey(req.headers.cookie, secret);
   if (existing) return existing;
   const key = randomBytes(32).toString("hex");
   res.cookie(COOKIE_NAME, signBrowserKey(key, secret), {
@@ -47,25 +51,23 @@ export function scopeFor(key: string, conversationId: string): string {
 }
 
 export type MediaAction = {
-  type: "status" | "approve" | "cancel";
+  type: "status" | "approve" | "cancel" | "render";
   job_id: string;
   prompt?: string;
   resolution?: "480p" | "720p" | "1080p" | "4k";
   generate_audio?: boolean;
 };
 
-export function signEnvelope(secret: string, scope: string, text: string, references?: string[], action?: MediaAction, music?: MusicRequest): string {
+export function signEnvelope(secret: string, scope: string, text: string, references?: string[], action?: MediaAction, music?: MusicRequest, workspace?: { resume: boolean }): string {
   if (!mediaEnabled(secret) || !JOB_ID_RE.test(scope)) throw new Error("Media controls are unavailable");
-  const part = Buffer.from(JSON.stringify({ scope, text, ...(references?.length ? { references } : {}), ...(action ? { action } : {}), ...(music ? { music } : {}) }), "utf8").toString("base64url");
+  const part = Buffer.from(JSON.stringify({ scope, text, ...(references?.length ? { references } : {}), ...(action ? { action } : {}), ...(music ? { music } : {}), ...(workspace ? { workspace } : {}) }), "utf8").toString("base64url");
   return `${MEDIA_PREFIX}${part}.${mac(part, secret)}`;
 }
 
-export function voiceMediaContext(cookieHeader: string | undefined, conversationId: string | undefined, secret: string): string | undefined {
+export function voiceMediaContext(cookieHeader: string | undefined, conversationId: string | undefined, secret: string, workspace?: { resume: boolean }): string | undefined {
   if (!mediaEnabled(secret) || !isUuid(conversationId)) return undefined;
-  const cookie = (cookieHeader ?? "").split(";").map((part) => part.trim())
-    .find((part) => part.startsWith(`${COOKIE_NAME}=`))?.slice(COOKIE_NAME.length + 1) ?? "";
-  const key = verifyBrowserKey(cookie, secret);
-  return key ? signEnvelope(secret, scopeFor(key, conversationId), "Voice request follows.") : undefined;
+  const key = readBrowserKey(cookieHeader, secret);
+  return key ? signEnvelope(secret, scopeFor(key, conversationId), "Voice request follows.", undefined, undefined, undefined, workspace) : undefined;
 }
 
 export function ownedReferences(value: unknown, scope: string): string[] {

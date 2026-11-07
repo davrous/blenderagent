@@ -10,11 +10,15 @@ import {
   evictSession,
   evictConversation,
   deleteSession,
+  getSessionInfo,
+  getConversationInfo,
+  readConversationMessages,
 } from "./sessions.js";
 import { attachVoiceRelay } from "./voice.js";
 import { MEDIA_PREFIX, browserKey, isUuid, mediaEnabled, ownedReferences, requireOrigin, signEnvelope } from "./mediaSecurity.js";
 import { registerMediaRoutes, requestScope } from "./videoJobs.js";
 import { parseMusicRequest } from "./music.js";
+import { archiveTurn, galleryEnabled, forgetConversationBinding, ownerFromCookie, persistBinding, registerWorkspace, registerWorkspaceRoutes, TurnArchiveCollector, workspaceHistory, workspaceRegistered, workspaceSceneExpected, recoverWorkspaceHistory, workspaceRecoveryWarning } from "./workspaces.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -53,6 +57,7 @@ app.get("/api/health", (req, res) => {
     model: config.modelName,
     voiceEnabled: config.voiceEnabled,
     musicEnabled: config.voiceEnabled && config.musicEnabled && mediaEnabled(config.mediaControlSecret),
+    galleryEnabled: galleryEnabled(),
     mediaEnabled: mediaEnabled(config.mediaControlSecret),
     mediaDisabledReason: mediaEnabled(config.mediaControlSecret) ? undefined : "Media disabled: MEDIA_CONTROL_SECRET must contain at least 32 characters on Webchat and the agent.",
   });
@@ -163,6 +168,7 @@ interface ChatRequestBody {
   conversation_id?: string;
   references?: unknown;
   music?: unknown;
+  replay_history?: boolean;
 }
 
 async function buildUpstreamRequest(
@@ -196,10 +202,16 @@ async function buildUpstreamRequest(
       // Without this, the middleware logs `session=None` and the scene is
       // never saved to blob storage, so it cannot survive container recycle.
       agent_session_id: conversationId,
+      user: conversationId,
+      metadata: { conversation_id: conversationId },
     };
     if (control) payload.store = false;
     if (!control && body.previous_response_id) {
       payload.previous_response_id = body.previous_response_id;
+    }
+    if (!control && body.replay_history) {
+      payload.input = [...await workspaceHistory(conversationId), { role: "user", content: input }];
+      delete payload.previous_response_id;
     }
     console.log(
       `[chat] local mode: conversation=${conversationId} previous_response_id=${body.previous_response_id ?? "none"}`,
@@ -247,10 +259,24 @@ async function buildUpstreamRequest(
 }
 
 registerMediaRoutes(app, buildUpstreamRequest);
+registerWorkspaceRoutes(app, async (id) => {
+  const session = getSessionInfo(id);
+  const conversation = getConversationInfo(id);
+  if (session) await persistBinding(id, { agentSessionId: session.agentSessionId, agentVersion: session.agentVersion });
+  if (conversation) {
+    await persistBinding(id, { foundryConversationId: conversation });
+    try { await recoverWorkspaceHistory(id, await readConversationMessages(conversation)); }
+    catch (error) {
+      console.warn("[workspaces] legacy transcript unavailable", error);
+      await workspaceRecoveryWarning(id, "L'ancien historique n'a pas pu être récupéré automatiquement. Seuls les contenus encore accessibles sont importés.");
+    }
+  }
+});
 
 app.post("/api/chat", requireOrigin(config.clientOrigin), async (req, res) => {
   const body = req.body as ChatRequestBody;
   let input = typeof body?.input === "string" ? body.input : "";
+  const originalInput = input;
   if (!input.trim() && !(Array.isArray(body?.references) && body.references.length)) {
     res.status(400).json({ error: "input is required" });
     return;
@@ -258,12 +284,16 @@ app.post("/api/chat", requireOrigin(config.clientOrigin), async (req, res) => {
 
   try {
     if (!isUuid(body.conversation_id)) throw new Error("conversation_id (UUID) is required");
+    if (body.replay_history !== undefined && typeof body.replay_history !== "boolean") throw new Error("Invalid history replay option.");
+    body.conversation_id = body.conversation_id.toLowerCase();
+    await registerWorkspace(ownerFromCookie(req.headers.cookie), body.conversation_id);
     if (mediaEnabled(config.mediaControlSecret)) {
       const scope = requestScope(req, res, body.conversation_id);
       const music = parseMusicRequest(body.music);
       const references = ownedReferences(body.references, scope);
       if (music && (!config.musicEnabled || references.length)) throw new Error("Music mode is unavailable or cannot be combined with references");
-      input = signEnvelope(config.mediaControlSecret, scope, input, references, undefined, music);
+      input = signEnvelope(config.mediaControlSecret, scope, input, references, undefined, music,
+        workspaceRegistered(body.conversation_id) ? { resume: await workspaceSceneExpected(body.conversation_id) } : undefined);
     } else if (body.references !== undefined || body.music !== undefined || input.trimStart().startsWith(MEDIA_PREFIX)) {
       throw new Error("Media is disabled; reference IDs and media envelopes are not accepted");
     }
@@ -311,6 +341,11 @@ app.post("/api/chat", requireOrigin(config.clientOrigin), async (req, res) => {
     !upstream.ok &&
     (upstream.status === 404 || upstream.status === 409 || upstream.status === 410)
   ) {
+    if (workspaceRegistered(upstreamReq.conversationId)) {
+      await persistBinding(upstreamReq.conversationId, { expired: true });
+      res.status(409).json({ error: "L'ancien sandbox Foundry n'est plus disponible. Les médias sont conservés dans la galerie ; aucune scène vierge n'a été créée à sa place." });
+      return;
+    }
     const text = await upstream.text().catch(() => "");
     console.warn(
       `[chat] stale session (${upstream.status}); evicting and retrying once: ${text.slice(0, 300)}`,
@@ -349,6 +384,7 @@ app.post("/api/chat", requireOrigin(config.clientOrigin), async (req, res) => {
   res.flushHeaders?.();
 
   const reader = upstream.body.getReader();
+  const archiveCollector = new TurnArchiveCollector();
   const aborted = { done: false };
   req.on("close", () => {
     aborted.done = true;
@@ -360,6 +396,7 @@ app.post("/api/chat", requireOrigin(config.clientOrigin), async (req, res) => {
       const { value, done } = await reader.read();
       if (done) break;
       if (value) {
+        archiveCollector.feed(value);
         res.write(Buffer.from(value));
       }
     }
@@ -373,6 +410,14 @@ app.post("/api/chat", requireOrigin(config.clientOrigin), async (req, res) => {
       );
     }
   } finally {
+    if (body.conversation_id && (originalInput.trim() || archiveCollector.reply)) {
+      try {
+        await archiveTurn(body.conversation_id, originalInput, archiveCollector.reply, archiveCollector.responseId, archiveCollector.failed || aborted.done ? "error" : "done", undefined, undefined, true);
+      } catch (error) {
+        console.error("[workspaces] turn archive failed", error);
+        if (!res.writableEnded && !res.destroyed) res.write(`event: archive.warning\ndata: ${JSON.stringify({ message: "Le résultat est généré, mais l'archive n'a pas pu être enregistrée. Gardez cette conversation ouverte et réessayez." })}\n\n`);
+      }
+    }
     if (!res.writableEnded) {
       res.end();
     }
@@ -394,7 +439,12 @@ app.post("/api/reset", requireOrigin(config.clientOrigin), async (req, res) => {
     return;
   }
   try {
-    await deleteSession(body.conversation_id);
+    await registerWorkspace(ownerFromCookie(req.headers.cookie), body.conversation_id);
+    if (workspaceRegistered(body.conversation_id)) {
+      await forgetConversationBinding(body.conversation_id);
+    } else {
+      await deleteSession(body.conversation_id);
+    }
     evictConversation(body.conversation_id);
     res.json({ ok: true });
   } catch (err) {

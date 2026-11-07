@@ -91,11 +91,61 @@ suppression. Musical notes animate during analysis, followed by a proposed
 film/title and uncertainty. No Blender tools run during recognition.
 
 Use the confirmation button or type `oui` to create the original developer
-vignette (15-20 seconds, Devfest Toulouse greeting). The existing viewport and
-video-job cards display the result and MP4 progress/download. Refusal and
+vignette with original film-inspired caricatures (choose 5, 10 or 15 seconds,
+Devfest Toulouse
+greeting). The musical-mode selectors choose **Clay** (neutral gray, fast)
+or **Complet** (materials and lighting); defaults are 15 seconds and full rendering.
+The options are signed with the confirmation request and enforced on the camera,
+timeline and saved snapshot, not applied as a later truncation.
+The existing viewport shows the scene, and the video card first offers
+a packed `.blend` download. A frame-1 viewport screenshot appears above the card
+and opens in the existing lightbox. It is captured during preparation, not left
+to a discretionary model tool call. Open the `.blend` in Blender and play the timeline, then check
+the inspection confirmation to launch the **480p / 25 fps** render. No render
+starts automatically during preparation or status polling, apart from the single
+fast viewport still. Clicking the render button immediately changes its label
+and shows a spinner/status message while the server validates the request.
+Only after acknowledgement does the UI show accepted/queued, rendering or
+encoding. Duplicate clicks cannot send a second action.
+
+Once that video completes, approve the card's **1080p / 25 fps** option if the
+preview pleases you. It rerenders the same frozen animation and selected Clay/full
+style, preserving the 480p
+download; it does not regenerate the scene or send it to Seedance. HD calculates
+about five times more pixels and remains subject to the 60-minute render timeout.
+The `.blend` includes packed resources and stays available on the same card.
+Refusal and
 discussion do not generate a scene. Switch back to **Dialogue vocal** or Reset
 to discard the pending music workflow. Approval never authorizes paid Seedance.
-Audio is not kept as an attachment or used as the rendered video's soundtrack.
+Musical input audio is kept as a private WAV for replay, but is not used as the
+rendered video's soundtrack.
+
+## Private realizations gallery
+
+Configure `AZURE_STORAGE_ACCOUNT_NAME` on this proxy as well as the agent and
+keep the signed browser cookie (`MEDIA_CONTROL_SECRET` must remain stable).
+Startup offers **Réalisations** and **Nouvelle scène**. Clicking a thumbnail
+loads the archived text/voice history, native job IDs and the distinct persisted
+Foundry sandbox/conversation associations. New work no longer deletes previous
+sandboxes. While a turn is active, navigation is disabled.
+
+**Discussion** continues the selected work; **Ressources** browses all recorded
+images, videos, musical inputs and downloads in chronological order. Native
+video cards still provide their existing render/approval controls. Private
+resource URLs are renewed on access. Local resumed voice/typed turns replay
+archived prose when their in-process response chain is no longer available.
+
+Metadata lives in `webchat-workspaces/` in the existing private `screenshots`
+container. Gallery ownership is tied to the signed HttpOnly cookie and endpoint,
+not caller-supplied Foundry IDs. Scene checkpoints live under
+`workspace-scenes/{scope}/scene.blend`; their packed contents can restore work
+after a local container's files disappear. The proxy requires Blob write/read
+and delegation rights. Keep storage private; do not commit archive credentials.
+
+Known legacy browser IDs/jobs are imported where possible. This cannot recover
+previously deleted compute files or microphone data that was never saved.
+If gallery configuration/storage is unavailable, the error is explicit; the
+existing text-only client behavior remains available when gallery is disabled.
 
 After `npm run build`, run `node ../devTools/test_music_webchat.mjs` from this
 directory (or `node devTools/test_music_webchat.mjs` from the repository root).
@@ -220,19 +270,28 @@ Uploads time out after three minutes; individual probes after twenty seconds.
 - Descriptor fields are `id,state,progress,mode,duration_seconds,fps,resolution,
   seedance_enabled` plus optional `preview_url,poster_url,output_url,error,
   estimate_usd`. IDs must be 32 lowercase hex. Known states are `queued`,
-  `rendering`, `encoding`, `awaiting_seedance_approval`, `wavespeed_uploading`,
+  `rendering`, `encoding`, `awaiting_render_approval`, `awaiting_seedance_approval`, `wavespeed_uploading`,
   `wavespeed_submitting`, `wavespeed_processing`, `submission_unknown`,
   `completed`, `failed`, `cancelled`. Progress is a percentage from 0 to 100;
   other numeric fields must be finite and nonnegative. Media URLs
   must be HTTPS on configured Blob hosts, and are played through `/api/blob`
   with Range support. The proxy rejects redirects. The backend must refresh
   expired media URLs in live status replies.
+- Devfest inspection descriptors additionally contain `inspection_required:true`,
+  a validated Blob `scene_url` and `hd_available`, plus `viewport_url` for new
+  preparations. The viewport URL is validated and refreshed like other media links.
+  Previously inspected jobs without this field remain valid. The native `POST
+  /api/video-jobs/:id/render` action accepts only `resolution:"480p"` or
+  `"1080p"` (and `conversation_id`), without paid prompt/audio options.
+  It requires verified browser ownership and Origin: 480p is eligible only while
+  awaiting render approval; 1080p only after a completed 480p preview with HD
+  available. Both actions operate on the same job and frozen `.blend`.
 - Job IDs, not descriptors or control messages, are saved per conversation in
   localStorage (most recent 100). Reload fetches live state; transcript and
   previous-response state are not modified by polling. Polls are single-flight,
   7.5 seconds after the preceding response, paused during typed/voice work, with
   a 45-second server deadline. Errors stop polling and offer Retry status.
-  Completed/failed/cancelled/**submission_unknown** stop automatic polling;
+  Completed/failed/cancelled/**submission_unknown** and `awaiting_render_approval` stop automatic polling;
   unknown submission must be reconciled externally, never auto-resubmitted.
 - Paid processing defaults to 720p and no audio. Explicit consent covers external
   WaveSpeed/Seedance processing and the estimate. Rates per **input + output**

@@ -1,6 +1,6 @@
 export const JOB_ID_RE = /^[0-9a-f]{32}$/;
 export const TERMINAL_JOB_STATES = new Set(["completed", "failed", "cancelled", "submission_unknown"]);
-export const VIDEO_JOB_STATES = new Set(["queued", "rendering", "encoding", "awaiting_seedance_approval", "wavespeed_uploading", "wavespeed_submitting", "wavespeed_processing", ...TERMINAL_JOB_STATES]);
+export const VIDEO_JOB_STATES = new Set(["queued", "rendering", "encoding", "awaiting_render_approval", "awaiting_seedance_approval", "wavespeed_uploading", "wavespeed_submitting", "wavespeed_processing", ...TERMINAL_JOB_STATES]);
 export const RESOLUTION_RATES = { "480p": 0.11, "720p": 0.22, "1080p": 0.55, "4k": 1.10 };
 export type VideoResolution = keyof typeof RESOLUTION_RATES;
 export interface VideoJob {
@@ -15,8 +15,12 @@ export interface VideoJob {
   preview_url?: string;
   poster_url?: string;
   output_url?: string;
+  viewport_url?: string;
   error?: string;
   estimate_usd?: number;
+  inspection_required?: boolean;
+  scene_url?: string;
+  hd_available?: boolean;
 }
 export interface ReferenceUpload {
   blob_name: string;
@@ -29,6 +33,9 @@ export interface ApprovalOptions {
   resolution: VideoResolution;
   generate_audio: boolean;
 }
+export interface RenderOptions {
+  resolution: "480p" | "1080p";
+}
 
 export function paidEstimate(inputSeconds: number, outputSeconds: number, resolution: VideoResolution): number {
   return (inputSeconds + outputSeconds) * RESOLUTION_RATES[resolution];
@@ -40,7 +47,7 @@ export function blobProxyUrl(url: string): string {
 
 const requests = new Map<string, { action: string; promise: Promise<VideoJob> }>();
 
-export function requestVideoJob(conversationId: string, id: string, action: "status" | "approve" | "cancel" = "status", options?: ApprovalOptions): Promise<VideoJob> {
+export function requestVideoJob(conversationId: string, id: string, action: "status" | "approve" | "cancel" | "render" = "status", options?: ApprovalOptions | RenderOptions): Promise<VideoJob> {
   if (!JOB_ID_RE.test(id)) return Promise.reject(new Error("Invalid video job ID"));
   const key = `${conversationId}:${id}`;
   const pending = requests.get(key);
@@ -57,6 +64,8 @@ export function requestVideoJob(conversationId: string, id: string, action: "sta
       const body = await response.json();
       if (!response.ok) throw new Error(body.error || `Job request failed (${response.status})`);
       if (body.id !== id || !VIDEO_JOB_STATES.has(body.state) || typeof body.seedance_enabled !== "boolean" || !Number.isFinite(body.duration_seconds) || body.duration_seconds < 0) throw new Error("Invalid video job response");
+      if (body.inspection_required && (typeof body.scene_url !== "string" || typeof body.hd_available !== "boolean")) throw new Error("Invalid animation inspection response");
+      if (body.viewport_url !== undefined && typeof body.viewport_url !== "string") throw new Error("Invalid viewport preview response");
       return body as VideoJob;
     } catch (error) {
       if (controller.signal.aborted) throw new Error("Job request timed out. Refresh status before trying an action again.");

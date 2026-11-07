@@ -6,6 +6,8 @@ export interface MusicRequest {
     evidence: string;
   };
   action: "discuss" | "generate";
+  duration_seconds?: 5 | 10 | 15;
+  render_mode?: "clay" | "standard";
 }
 
 export function parseMusicRequest(value: unknown): MusicRequest | undefined {
@@ -14,6 +16,11 @@ export function parseMusicRequest(value: unknown): MusicRequest | undefined {
     throw new Error("Invalid music confirmation");
   }
   const { candidate, action } = value;
+  const duration = "duration_seconds" in value ? value.duration_seconds : 15;
+  const renderMode = "render_mode" in value ? value.render_mode : "standard";
+  if ((duration !== 5 && duration !== 10 && duration !== 15) || (renderMode !== "clay" && renderMode !== "standard")) {
+    throw new Error("Choose 5, 10 or 15 seconds and clay or standard rendering");
+  }
   if (action !== "discuss" && action !== "generate") throw new Error("Invalid music action");
   if (!candidate || typeof candidate !== "object" || !("film" in candidate)
     || !("track" in candidate) || !("confidence" in candidate) || !("evidence" in candidate)) {
@@ -27,5 +34,5 @@ export function parseMusicRequest(value: unknown): MusicRequest | undefined {
     || (film === null) !== (confidence === "unknown") || (action === "generate" && film === null)) {
     throw new Error("Invalid music recognition result");
   }
-  return { action, candidate: { film, track, confidence, evidence } };
+  return { action, candidate: { film, track, confidence, evidence }, duration_seconds: duration, render_mode: renderMode };
 }

@@ -17,6 +17,7 @@ from artifact_storage import conversation_scope
 from blender_connection import get_blender_connection
 from media_analysis import render_settings, sample_reference, validate_camera_path
 from music import MusicRequest, music_instructions, music_scene
+from scene_manager import workspace_scene
 from video_jobs import descriptor, get_video_jobs, video_scope
 
 PREFIX = "BLENDER_MEDIA_V1:"
@@ -38,6 +39,8 @@ def decode_envelope(text: str, secret: str | None = None) -> dict:
         raise ValueError("Invalid media control envelope.")
     if len(value["text"]) > 32000:
         raise ValueError("The message is too long.")
+    if "workspace" in value and (not isinstance(value["workspace"], dict) or set(value["workspace"]) != {"resume"} or type(value["workspace"]["resume"]) is not bool):
+        raise ValueError("Invalid workspace scene context.")
     if "music" in value:
         MusicRequest.model_validate(value["music"])
         if value.get("action") is not None or value.get("references"):
@@ -54,9 +57,9 @@ def decode_envelope(text: str, secret: str | None = None) -> dict:
 def encode_voice_input(transcript: str, context: str) -> str:
     secret = os.getenv("MEDIA_CONTROL_SECRET", "")
     value = decode_envelope(context, secret)
-    if set(value) != {"scope", "text"} or value["text"] != "Voice request follows.":
+    if set(value) - {"scope", "text", "workspace"} or value["text"] != "Voice request follows.":
         raise ValueError("Invalid voice media context: only a conversation scope is allowed.")
-    payload = json.dumps({"scope": value["scope"], "text": transcript}).encode()
+    payload = json.dumps({"scope": value["scope"], "text": transcript, **({"workspace": value["workspace"]} if "workspace" in value else {})}).encode()
     part = base64.urlsafe_b64encode(payload).decode().rstrip("=")
     signature = hmac.new(secret.encode(), part.encode(), hashlib.sha256).hexdigest()
     return f"{PREFIX}{part}.{signature}"
@@ -81,6 +84,8 @@ def control_action(scope, action):
                             resolution=action.get("resolution", "720p"), generate_audio=action.get("generate_audio", False))
     if action.get("type") == "cancel":
         return jobs.cancel(scope, job_id)
+    if action.get("type") == "render":
+        return jobs.render(scope, job_id, resolution=action.get("resolution", "480p"))
     raise ValueError("Unknown video action.")
 
 
@@ -93,6 +98,7 @@ class MediaMiddleware(AgentMiddleware):
         latest = next((message for message in reversed(context.messages) if message.role == "user"), None)
         action = None
         music = None
+        workspace = None
         for message in context.messages:
             if message.role != "user":
                 continue
@@ -110,6 +116,8 @@ class MediaMiddleware(AgentMiddleware):
                     action = value.get("action")
                     if "music" in value:
                         music = MusicRequest.model_validate(value["music"])
+                    if "workspace" in value:
+                        workspace = (value["scope"], value["workspace"]["resume"])
                 content.text = value["text"] or "Analyze the attached reference and propose a Blender blockout."
                 if value.get("references"):
                     content.text += "\nStored reference IDs (analyze_reference_media before reconstruction):\n" + "\n".join(value["references"])
@@ -136,12 +144,14 @@ class MediaMiddleware(AgentMiddleware):
             if music.action == "discuss":
                 context.options = {**(context.options or {}), "tool_choice": "none"}
         token = video_scope.set(scope)
-        music_token = music_scene.set(bool(music and music.action == "generate"))
+        music_token = music_scene.set(music if music and music.action == "generate" else None)
+        workspace_token = workspace_scene.set(workspace)
         try:
             await self.inner.process(context, call_next)
         finally:
             video_scope.reset(token)
             music_scene.reset(music_token)
+            workspace_scene.reset(workspace_token)
             if music and (not context.stream or context.result is None):
                 context.messages = original_messages
                 context.options = original_options
@@ -149,13 +159,15 @@ class MediaMiddleware(AgentMiddleware):
             original = context.result
             async def scoped_stream():
                 stream_token = video_scope.set(scope)
-                stream_music_token = music_scene.set(bool(music and music.action == "generate"))
+                stream_music_token = music_scene.set(music if music and music.action == "generate" else None)
+                stream_workspace_token = workspace_scene.set(workspace)
                 try:
                     async for update in original:
                         yield update
                 finally:
                     video_scope.reset(stream_token)
                     music_scene.reset(stream_music_token)
+                    workspace_scene.reset(stream_workspace_token)
                     if music:
                         context.messages = original_messages
                         context.options = original_options
@@ -221,6 +233,9 @@ async def analyze_reference_media(reference_id: str, duration_seconds: float = 5
 @tool(approval_mode="never_require")
 def apply_camera_path(keyframes: list[dict], duration_seconds: float = 5, fps: int = 24, interpolation: str = "LINEAR") -> str:
     """Apply camera keys with time, position [x,y,z], target [x,y,z], lens; include time 0 and duration."""
+    request = music_scene.get()
+    if request and (duration_seconds != request.duration_seconds or fps != 25):
+        raise ValueError(f"Devfest camera animation must match the selected {request.duration_seconds} seconds at 25 fps.")
     keys = validate_camera_path(keyframes, duration_seconds, fps, interpolation)
     settings = render_settings(duration_seconds, fps)
     result = get_blender_connection().send_command("apply_camera_path", {
@@ -233,18 +248,23 @@ def apply_camera_path(keyframes: list[dict], duration_seconds: float = 5, fps: i
 async def start_animation_render(duration_seconds: float = 5, fps: int = 24, resolution: str = "480p",
                                  mode: str = "clay", engine: str = "BLENDER_EEVEE_NEXT", samples: int = 16,
                                  seedance: bool = False) -> str:
-    """Queue a short camera animation. seedance=True returns a clay preview awaiting a separate paid user approval."""
-    if music_scene.get() and (
-        not 15 <= duration_seconds <= 20 or mode != "standard"
-        or engine != "BLENDER_EEVEE_NEXT" or seedance
+    """Queue an animation. In Devfest mode, save a downloadable .blend for inspection; only the Webchat Render action starts rendering."""
+    request = music_scene.get()
+    if request and (
+        duration_seconds != request.duration_seconds or mode != request.render_mode
+        or engine != "BLENDER_EEVEE_NEXT" or seedance or fps != 25 or resolution != "480p"
     ):
-        raise ValueError("Devfest scenes require a 15-20 second standard Eevee render without Seedance.")
+        raise ValueError(f"Prepare the selected {request.duration_seconds}-second {request.render_mode} Devfest animation at 480p/25 fps, without Seedance.")
     scope = require_scope()
     settings = render_settings(duration_seconds, fps, resolution, mode, engine, samples)
     jobs = get_video_jobs()
+    inspect_first = request is not None
     def snapshot(path):
-        get_blender_connection().send_command("snapshot_animation", {"path": str(path)})
-    value = await asyncio.to_thread(jobs.create, scope, settings, snapshot, seedance=seedance)
+        parameters = {"path": str(path)}
+        if inspect_first:
+            parameters["settings"] = settings
+        get_blender_connection().send_command("snapshot_animation", parameters)
+    value = await asyncio.to_thread(jobs.create, scope, settings, snapshot, seedance=seedance, inspect_first=inspect_first)
     return descriptor(value)
 
 

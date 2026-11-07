@@ -596,6 +596,16 @@ class VoiceSession:
 
         media_context = (message or {}).get("media_context")
         self._media_context = media_context if isinstance(media_context, str) else None
+        history = message.get("inline_history")
+        if history is not None:
+            if not isinstance(history, list) or len(history) > 80 or any(
+                not isinstance(item, dict) or item.get("role") not in ("user", "assistant")
+                or not isinstance(item.get("content"), str) or len(item["content"]) > 32000
+                for item in history
+            ):
+                await self._send_text({"type": "error", "message": "Invalid resumed voice history."})
+                return
+            self._fallback_history = history
 
         if mtype == "start":
             mode = message.get("mode", "voice")
@@ -881,9 +891,19 @@ class VoiceSession:
         self._turn_task = asyncio.create_task(self._run_music(pcm, transcript))
 
     async def _run_music(self, pcm: bytes, transcript: str) -> None:
-        from music import recognize_music, recognition_reply
+        from music import archive_music_audio, recognize_music, recognition_reply
 
         try:
+            if self._media_context:
+                try:
+                    from media_control import decode_envelope
+
+                    context = decode_envelope(self._media_context)
+                    audio = await asyncio.to_thread(archive_music_audio, pcm, context["scope"])
+                    await self._send_text({"type": "input_audio", **audio})
+                except Exception:
+                    logger.warning("Could not archive musical input audio.", exc_info=True)
+                    await self._send_text({"type": "archive.warning", "message": "L'extrait audio n'a pas pu être sauvegardé. La reconnaissance continue, mais cet audio ne sera pas rejouable dans la galerie."})
             candidate = await recognize_music(pcm)
             if self._cancelled:
                 return
@@ -1083,7 +1103,7 @@ class VoiceSession:
         elif transcript.startswith("BLENDER_MEDIA_V1:"):
             raise ValueError("Media control envelopes cannot be submitted through voice.")
         input_value: Any = input_text
-        if _is_hosted() and not self._foundry_conversation_id and self._fallback_history:
+        if not self._foundry_conversation_id and self._fallback_history and (_is_hosted() or not self._previous_response_id):
             input_value = [
                 *self._fallback_history,
                 {"role": "user", "content": input_text},

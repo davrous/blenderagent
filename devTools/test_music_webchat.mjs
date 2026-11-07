@@ -12,9 +12,13 @@ const { signEnvelope, MEDIA_PREFIX } = await import("../webchat/server/src/media
 const { isMusicConfirmation } = await import("../webchat/client/src/api/music.ts");
 
 const candidate = { film: "Original space adventure", track: "Space theme", confidence: "low", evidence: "A fanfare melody." };
-const request = { candidate, action: "generate" };
+const request = { candidate, action: "generate", duration_seconds: 15, render_mode: "standard" };
 assert.deepEqual(parseMusicRequest(request), request);
-for (const invalid of [null, {}, { ...request, action: "approve" }, { ...request, candidate: { ...candidate, film: null } }, { ...request, candidate: { ...candidate, evidence: "" } }]) {
+assert.deepEqual(parseMusicRequest({ candidate, action: "generate" }), request);
+for (const duration of [5, 10, 15]) for (const mode of ["clay", "standard"]) {
+  assert.deepEqual(parseMusicRequest({ ...request, duration_seconds: duration, render_mode: mode }), { ...request, duration_seconds: duration, render_mode: mode });
+}
+for (const invalid of [null, {}, { ...request, action: "approve" }, { ...request, duration_seconds: 7 }, { ...request, duration_seconds: 20 }, { ...request, render_mode: "cycles" }, { ...request, candidate: { ...candidate, film: null } }, { ...request, candidate: { ...candidate, evidence: "" } }]) {
   assert.throws(() => parseMusicRequest(invalid));
 }
 const envelope = signEnvelope("music-test-secret-".repeat(4), "a".repeat(32), "Oui", undefined, undefined, request);
@@ -120,9 +124,17 @@ try {
     await useChatStore.getState().send("Quel film ?");
     assert.equal(requests.at(-1).music.action, "discuss");
     assert.deepEqual(useChatStore.getState().musicCandidate, candidate);
+    useChatStore.getState().setMusicOptions({ duration_seconds: 5, render_mode: "clay" });
     await useChatStore.getState().send("oui");
     assert.equal(requests.at(-1).music.action, "generate");
+    assert.equal(requests.at(-1).music.duration_seconds, 5);
+    assert.equal(requests.at(-1).music.render_mode, "clay");
     assert.equal(useChatStore.getState().musicCandidate, null);
+    useChatStore.getState().setMusicCandidate(candidate);
+    useChatStore.getState().setMusicOptions({ duration_seconds: 10, render_mode: "standard" });
+    await useChatStore.getState().confirmMusicScene();
+    assert.equal(requests.at(-1).music.duration_seconds, 10);
+    assert.equal(requests.at(-1).music.render_mode, "standard");
     useChatStore.getState().setMusicCandidate(candidate);
     await useChatStore.getState().declineMusicScene();
     assert.equal(requests.at(-1).music.action, "discuss");
