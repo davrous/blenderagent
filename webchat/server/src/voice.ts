@@ -225,6 +225,19 @@ function relay(
   let upstreamOpen = false;
 
   browser.on("message", (data: RawData, isBinary: boolean) => {
+    if (!isBinary) {
+      let frame: unknown;
+      try {
+        frame = JSON.parse(data.toString());
+      } catch {
+        frame = undefined;
+      }
+      if (frame && typeof frame === "object" && "mode" in frame && frame.mode === "music"
+        && (!config.musicEnabled || !mediaContext)) {
+        sendTo(browser, Buffer.from(JSON.stringify({ type: "error", message: "Music mode requires enabled, authenticated Webchat media controls." })), false);
+        return;
+      }
+    }
     const out = injectSession(
       data,
       isBinary,

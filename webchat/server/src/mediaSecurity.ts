@@ -1,5 +1,6 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Request, Response, NextFunction } from "express";
+import type { MusicRequest } from "./music.js";
 
 export const MEDIA_PREFIX = "BLENDER_MEDIA_V1:";
 export const JOB_ID_RE = /^[0-9a-f]{32}$/;
@@ -53,9 +54,9 @@ export type MediaAction = {
   generate_audio?: boolean;
 };
 
-export function signEnvelope(secret: string, scope: string, text: string, references?: string[], action?: MediaAction): string {
+export function signEnvelope(secret: string, scope: string, text: string, references?: string[], action?: MediaAction, music?: MusicRequest): string {
   if (!mediaEnabled(secret) || !JOB_ID_RE.test(scope)) throw new Error("Media controls are unavailable");
-  const part = Buffer.from(JSON.stringify({ scope, text, ...(references?.length ? { references } : {}), ...(action ? { action } : {}) }), "utf8").toString("base64url");
+  const part = Buffer.from(JSON.stringify({ scope, text, ...(references?.length ? { references } : {}), ...(action ? { action } : {}), ...(music ? { music } : {}) }), "utf8").toString("base64url");
   return `${MEDIA_PREFIX}${part}.${mac(part, secret)}`;
 }
 

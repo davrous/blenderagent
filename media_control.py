@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from artifact_storage import conversation_scope
 from blender_connection import get_blender_connection
 from media_analysis import render_settings, sample_reference, validate_camera_path
+from music import MusicRequest, music_instructions, music_scene
 from video_jobs import descriptor, get_video_jobs, video_scope
 
 PREFIX = "BLENDER_MEDIA_V1:"
@@ -37,6 +38,10 @@ def decode_envelope(text: str, secret: str | None = None) -> dict:
         raise ValueError("Invalid media control envelope.")
     if len(value["text"]) > 32000:
         raise ValueError("The message is too long.")
+    if "music" in value:
+        MusicRequest.model_validate(value["music"])
+        if value.get("action") is not None or value.get("references"):
+            raise ValueError("Music controls cannot be combined with references or paid video actions.")
     references = value.get("references", [])
     if not isinstance(references, list) or len(references) > 4 or any(
         not isinstance(name, str) or not re.fullmatch(r"references/" + value["scope"] + r"/[a-f0-9]{32}\.(png|jpg|webp|mp4)", name)
@@ -87,6 +92,7 @@ class MediaMiddleware(AgentMiddleware):
         scope = video_scope.get()
         latest = next((message for message in reversed(context.messages) if message.role == "user"), None)
         action = None
+        music = None
         for message in context.messages:
             if message.role != "user":
                 continue
@@ -102,6 +108,8 @@ class MediaMiddleware(AgentMiddleware):
                 if message is latest:
                     scope = value["scope"]
                     action = value.get("action")
+                    if "music" in value:
+                        music = MusicRequest.model_validate(value["music"])
                 content.text = value["text"] or "Analyze the attached reference and propose a Blender blockout."
                 if value.get("references"):
                     content.text += "\nStored reference IDs (analyze_reference_media before reconstruction):\n" + "\n".join(value["references"])
@@ -118,20 +126,39 @@ class MediaMiddleware(AgentMiddleware):
         if not scope:
             owner = self.inner._get_conversation_id(context)
             scope = conversation_scope(owner) if owner else None
+        original_messages = context.messages
+        original_options = getattr(context, "options", None)
+        if music:
+            context.messages = [
+                *context.messages,
+                Message(role="system", contents=[Content.from_text(music_instructions(music))]),
+            ]
+            if music.action == "discuss":
+                context.options = {**(context.options or {}), "tool_choice": "none"}
         token = video_scope.set(scope)
+        music_token = music_scene.set(bool(music and music.action == "generate"))
         try:
             await self.inner.process(context, call_next)
         finally:
             video_scope.reset(token)
+            music_scene.reset(music_token)
+            if music and (not context.stream or context.result is None):
+                context.messages = original_messages
+                context.options = original_options
         if context.stream:
             original = context.result
             async def scoped_stream():
                 stream_token = video_scope.set(scope)
+                stream_music_token = music_scene.set(bool(music and music.action == "generate"))
                 try:
                     async for update in original:
                         yield update
                 finally:
                     video_scope.reset(stream_token)
+                    music_scene.reset(stream_music_token)
+                    if music:
+                        context.messages = original_messages
+                        context.options = original_options
             context.result = ResponseStream(scoped_stream(), finalizer=AgentResponse.from_updates)
 
 
@@ -207,6 +234,11 @@ async def start_animation_render(duration_seconds: float = 5, fps: int = 24, res
                                  mode: str = "clay", engine: str = "BLENDER_EEVEE_NEXT", samples: int = 16,
                                  seedance: bool = False) -> str:
     """Queue a short camera animation. seedance=True returns a clay preview awaiting a separate paid user approval."""
+    if music_scene.get() and (
+        not 15 <= duration_seconds <= 20 or mode != "standard"
+        or engine != "BLENDER_EEVEE_NEXT" or seedance
+    ):
+        raise ValueError("Devfest scenes require a 15-20 second standard Eevee render without Seedance.")
     scope = require_scope()
     settings = render_settings(duration_seconds, fps, resolution, mode, engine, samples)
     jobs = get_video_jobs()

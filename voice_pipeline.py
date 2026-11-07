@@ -45,6 +45,7 @@ import os
 import random
 import re
 import time
+import uuid
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 logger = logging.getLogger("blender_agent.voice")
@@ -545,6 +546,8 @@ class VoiceSession:
         # that"). Set from the SDK's background thread via the captured loop.
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._stt_done: Optional[asyncio.Event] = None
+        self._capture_mode = "voice"
+        self._music_pcm = bytearray()
 
     # -- outbound helpers ---------------------------------------------------
     async def _send_text(self, obj: dict) -> None:
@@ -595,18 +598,53 @@ class VoiceSession:
         self._media_context = media_context if isinstance(media_context, str) else None
 
         if mtype == "start":
-            await self._start_capture()
+            mode = message.get("mode", "voice")
+            if mode not in ("voice", "music"):
+                await self._send_text({"type": "error", "message": "Unknown microphone mode."})
+                return
+            if self._capturing:
+                return
+            if mode == "music":
+                from music import music_enabled
+
+                if not music_enabled():
+                    await self._send_text({"type": "error", "message": "Music recognition is not configured on the agent."})
+                    return
+                await self._barge_in()
+                self._capture_mode = "music"
+                self._music_pcm.clear()
+                self._capturing = True
+                await self._send_text({"type": "listening", "mode": "music"})
+            else:
+                self._capture_mode = "voice"
+                await self._start_capture()
         elif mtype == "context":
             # continuity hint only — values already captured above
             pass
         elif mtype == "commit":
-            await self._commit_and_run()
+            if self._capture_mode == "music":
+                await self._commit_music()
+            else:
+                await self._commit_and_run()
         elif mtype == "cancel":
+            if self._capture_mode == "music":
+                self._stop_capture()
+                self._music_pcm.clear()
             await self._barge_in()
         else:
             logger.debug("Ignoring unknown control frame: %r", mtype)
 
     async def on_audio(self, chunk: bytes) -> None:
+        if self._capturing and self._capture_mode == "music":
+            from music import MAX_PCM_BYTES
+
+            if len(chunk) % 2 or len(self._music_pcm) + len(chunk) > MAX_PCM_BYTES:
+                self._stop_capture()
+                self._music_pcm.clear()
+                await self._send_text({"type": "error", "message": "Music recording must be PCM16 and at most 30 seconds."})
+                return
+            self._music_pcm.extend(chunk)
+            return
         if not self._capturing or not self._push_stream:
             return
         self._stt_audio_bytes += len(chunk)
@@ -822,6 +860,53 @@ class VoiceSession:
         self._turn_ready_at = time.perf_counter()
         self._first_audio_sent = False
         self._turn_task = asyncio.ensure_future(self._run_turn(transcript))
+
+    async def _commit_music(self) -> None:
+        if not self._capturing:
+            return
+        from music import pcm_to_wav
+
+        self._capturing = False
+        pcm = bytes(self._music_pcm)
+        self._music_pcm.clear()
+        try:
+            pcm_to_wav(pcm)
+        except ValueError as exc:
+            await self._send_text({"type": "error", "message": str(exc)})
+            return
+        transcript = f"Extrait musical ({len(pcm) / 48000:.1f} s)"
+        await self._send_text({"type": "stt", "mode": "music", "text": transcript, "final": True})
+        await self._send_text({"type": "delta", "text": "\n\n*🎵 J'analyse la musique… 🎶*\n\n"})
+        self._cancelled = False
+        self._turn_task = asyncio.create_task(self._run_music(pcm, transcript))
+
+    async def _run_music(self, pcm: bytes, transcript: str) -> None:
+        from music import recognize_music, recognition_reply
+
+        try:
+            candidate = await recognize_music(pcm)
+            if self._cancelled:
+                return
+            reply = recognition_reply(candidate)
+            await self._send_text({"type": "delta", "text": reply})
+            await self._send_text({"type": "music_result", "candidate": candidate.model_dump()})
+            if _is_hosted() and not self._foundry_conversation_id:
+                self._fallback_history.extend([
+                    {"role": "user", "content": transcript},
+                    {"role": "assistant", "content": reply},
+                ])
+                self._fallback_history = self._fallback_history[-self._history_max_messages:]
+            await self._send_text({
+                "type": "done", "mode": "music", "reply": reply, "response_id": None,
+                "history_response_id": f"music-{uuid.uuid4().hex}",
+                "history_commit_required": bool(_is_hosted() and self._foundry_conversation_id),
+            })
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Music recognition failed.", exc_info=True)
+            _record_failure("music", exc)
+            await self._send_text({"type": "error", "message": f"Music recognition failed: {exc}"})
 
     # -- barge-in / cancel --------------------------------------------------
     async def _barge_in(self) -> None:
@@ -1326,6 +1411,7 @@ class VoiceSession:
     async def close(self) -> None:
         self._cancelled = True
         self._stop_capture()
+        self._music_pcm.clear()
         if self._turn_task and not self._turn_task.done():
             self._turn_task.cancel()
         if self._tts_task and not self._tts_task.done():

@@ -64,6 +64,9 @@ export const config = {
   voiceEnabled: ["1", "true", "yes", "on"].includes(
     (process.env.VOICE_ENABLED ?? "true").trim().toLowerCase(),
   ),
+  musicEnabled: ["1", "true", "yes", "on"].includes(
+    (process.env.MUSIC_ENABLED ?? "false").trim().toLowerCase(),
+  ),
   // Upstream voice WebSocket for local mode (the agent's invocations_ws server).
   localVoiceWsUrl:
     process.env.VOICE_LOCAL_WS_URL ?? "ws://localhost:8089/invocations_ws",

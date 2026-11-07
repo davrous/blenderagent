@@ -1,4 +1,5 @@
 export type SseEvent = { event: string; data: string };
+import type { MusicRequest } from "./music";
 
 /**
  * Stream chat from the proxy. Calls onEvent for each SSE frame.
@@ -11,6 +12,7 @@ export async function streamChat(
   onEvent: (e: SseEvent) => void,
   signal: AbortSignal,
   references: string[] = [],
+  music?: MusicRequest,
 ): Promise<void> {
   const res = await fetch("/api/chat", {
     method: "POST",
@@ -20,6 +22,7 @@ export async function streamChat(
       previous_response_id: previousResponseId ?? undefined,
       conversation_id: conversationId,
       ...(references.length ? { references } : {}),
+      ...(music ? { music } : {}),
     }),
     signal,
   });

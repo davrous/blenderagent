@@ -555,6 +555,43 @@ html, body, #root {
 
 /* ── Lightbox ─────────────────────────────── */
 
+.music-controls, .music-confirmation {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.mic-modes { display: inline-flex; gap: 4px; }
+.mic-modes button, .music-confirmation button, .music-cancel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: var(--bg-elev-2);
+  color: var(--text);
+  cursor: pointer;
+}
+.mic-modes button[aria-pressed="true"], .music-analysis {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.music-controls small { flex: 1 1 250px; }
+.music-confirmation { padding: 10px; border: 1px solid var(--accent); border-radius: 10px; }
+.music-confirmation span { flex: 1 1 250px; }
+.music-controls button:disabled, .music-confirmation button:disabled { opacity: 0.5; cursor: not-allowed; }
+.music-notes { display: inline-flex; gap: 5px; }
+.music-notes span { animation: music-note 1.2s ease-in-out infinite; }
+.music-notes span:nth-child(2) { animation-delay: 0.2s; }
+.music-notes span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes music-note {
+  0%, 100% { transform: translateY(2px); opacity: 0.4; }
+  50% { transform: translateY(-3px); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .music-notes span { animation: none; }
+}
+
 .lightbox {
   position: fixed;
   inset: 0;

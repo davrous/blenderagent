@@ -492,6 +492,57 @@ cd webchat && npm --workspace server run build && cd ..
 node devTools/test_voice_relay.mjs
 ```
 
+## Devfest Film-Music Mode
+
+Webchat can opt into a separate **Musique de film** microphone mode. Normal
+push-to-talk still uses Azure Speech; music capture disables speech-oriented
+noise suppression/gain processing and sends the actual 24 kHz mono PCM16 melody,
+wrapped as WAV, to an audio-capable Azure Chat Completions model. GPT-6 Astra
+remains the Blender scene model: it does not accept raw audio itself.
+
+Configure `MUSIC_AUDIO_ENDPOINT` (an HTTPS Azure resource root, without an API
+path) and `MUSIC_MODEL_DEPLOYMENT_NAME` on the Python agent, and
+`MUSIC_ENABLED=true` on Webchat. Both hosts still need their matching
+`MEDIA_CONTROL_SECRET`; existing voice, storage and video prerequisites apply.
+Leave music settings unset/disabled to preserve the regular speech/text UX.
+Inject the two optional music variables when deploying the Devfest manifest.
+
+On this branch the local ignored configuration targets the `devfest-music`
+deployment (`gpt-audio-1.5`, version `2026-02-23`) on `SwedenFoundryProject`.
+The model is GlobalStandard (global processing, not EU-only residency).
+The identity **running the agent**, not just the developer deploying the model,
+needs `Cognitive Services OpenAI User` on that audio resource. Cross-resource
+access is not automatically granted. See [Azure audio input guidance](https://learn.microsoft.com/azure/foundry/openai/audio-completions-quickstart).
+
+Click to start recording, then click again to submit 2-30 seconds of played,
+sung, hummed or whistled melody. Recording stops automatically after 30 seconds
+and can be cancelled. Animated notes appear in the chat during analysis.
+Recognition is a best-effort hypothesis, **not audio fingerprinting**; uncertain
+and unidentified clips are explicitly reported.
+
+Only after a positive text reply (for example `oui`) or the confirmation button
+does the existing Blender agent create an original, family-friendly developer
+vignette with a Devfest Toulouse closing greeting. Discussion and refusal turns
+disable model tool calls. The opt-in creative brief is scoped to that turn;
+switching back to **Dialogue vocal** or Reset discards the pending hypothesis.
+Scene generation preserves existing objects and uses the existing viewport,
+camera-path and snapshot/video-job tools. Devfest renders are bounded to
+15-20 seconds, standard Eevee, without paid Seedance finishing (recommended:
+18 seconds, 12 fps, 720p). The recorded melody is not added to the video, and
+protected film scenes, characters, logos, dialogue and scores are not recreated.
+
+Hosted music recognition uses the same Foundry Responses conversation via the
+authenticated relay's history commit; it keeps the existing Blender session and
+response-chain identity intact. Raw audio stays in memory for analysis and is
+not uploaded to the scene/artifact store.
+
+Focused checks:
+
+```bash
+.venv/bin/python devTools/test_music_pipeline.py
+node devTools/test_music_webchat.mjs
+```
+
 ## Reference-to-Video Workflow
 
 Webchat and Teams support PNG/JPEG/WebP references and MP4 clips. The agent samples
@@ -605,7 +656,7 @@ and 8192 pixels per side, and MP4 videos of 4-30 seconds up to 1080p.
 Blender output is 4-30 seconds at 480p/720p, 12/24/30 fps,
 with at most 400 million frame-pixels (80 million for standard-mode Cycles) and 1-32 samples.
 Two GiB of free temporary disk is required. `VIDEO_RENDER_TIMEOUT_SECONDS` defaults
-to 1800. Agent turns stop after 180 seconds without model/tool stream progress
+to 3600 (60 minutes). Agent turns stop after 180 seconds without model/tool stream progress
 (`AGENT_TURN_IDLE_TIMEOUT_SECONDS`) or after a 900-second absolute maximum
 (`AGENT_TURN_TIMEOUT_SECONDS`). Webchat reports elapsed progress every 30 seconds;
 this is a client-side status timer, not proof of server-side progress.
@@ -619,7 +670,7 @@ this is a client-side status timer, not proof of server-side progress.
 | `AZURE_STORAGE_ACCOUNT_NAME` | Yes | - | Private artifact storage for images, exports, references and video jobs |
 | `MEDIA_CONTROL_SECRET` | For Webchat media controls | - | Same random secret of at least 32 characters on the agent and Webchat server; Teams uses verified channel identity instead |
 | `WAVESPEED_API_KEY` | For paid finishing | - | Agent-only WaveSpeed credential; omit for Blender-only videos |
-| `VIDEO_RENDER_TIMEOUT_SECONDS` | No | `1800` | Blender animation worker render deadline, separate from the agent turn |
+| `VIDEO_RENDER_TIMEOUT_SECONDS` | No | `3600` | Blender animation worker render deadline, separate from the agent turn |
 | `AGENT_TURN_IDLE_TIMEOUT_SECONDS` | No | `180` | Maximum time without an upstream model/tool stream update |
 | `AGENT_TURN_TIMEOUT_SECONDS` | No | `900` | Absolute maximum agent turn duration, even when updates continue |
 | `BLENDER_PATH` / `FFMPEG_PATH` / `FFPROBE_PATH` | No | `blender` / `ffmpeg` / `ffprobe` | Executable overrides for local media processing |

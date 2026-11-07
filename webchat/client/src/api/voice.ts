@@ -14,11 +14,14 @@
  * server-side Blender scene.
  */
 
+import { isMusicCandidate, type MicMode, type MusicCandidate } from "./music";
+
 export type VoiceStatus =
   | "idle"
   | "connecting"
   | "listening"
   | "thinking"
+  | "analyzing"
   | "speaking"
   | "error";
 
@@ -27,6 +30,7 @@ export interface VoiceHandlers {
   onUserTranscript: (text: string) => void;
   onAgentDelta: (text: string) => void;
   onAgentDone: (responseId: string | null) => void;
+  onMusicResult: (candidate: MusicCandidate) => void;
   onError: (message: string) => void;
   getConversationId: () => string;
   getPreviousResponseId: () => string | null;
@@ -82,6 +86,10 @@ class VoiceController {
   private processor: ScriptProcessorNode | null = null;
   private sinkNode: GainNode | null = null;
   private capturing = false;
+  private captureMode: MicMode = "voice";
+  private captureToken = 0;
+  private captureSamples = 0;
+  private captureTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Playback
   private playbackCtx: AudioContext | null = null;
@@ -152,14 +160,17 @@ class VoiceController {
       this.setStatus("error");
     };
     ws.onclose = (event) => {
-      if (this.ws === ws) this.ws = null;
+      if (this.ws !== ws) return;
+      this.ws = null;
       const interrupted =
         this.capturing ||
         this._status === "connecting" ||
         this._status === "listening" ||
         this._status === "thinking" ||
+        this._status === "analyzing" ||
         this._status === "speaking";
       if (!interrupted) return;
+      this.captureToken++;
       this.teardownCapture();
       this.stopPlayback();
       if (!this.prewarming) {
@@ -207,9 +218,11 @@ class VoiceController {
       const cleanup = () => {
         ws.removeEventListener("open", onOpen);
         ws.removeEventListener("error", onErr);
+        ws.removeEventListener("close", onErr);
       };
       ws.addEventListener("open", onOpen);
       ws.addEventListener("error", onErr);
+      ws.addEventListener("close", onErr);
     });
   }
 
@@ -220,9 +233,13 @@ class VoiceController {
   }
 
   // ── Capture (push-to-talk) ───────────────────────────────────────────────
-  async startListening(): Promise<void> {
+  async startListening(mode: MicMode = "voice"): Promise<void> {
     if (!this.handlers) return;
     if (this.capturing) return;
+    const token = ++this.captureToken;
+    this.captureMode = mode;
+    this.captureSamples = 0;
+    if (mode === "music") this.stopPlayback();
 
     // Barge-in: interrupt any current playback and tell the agent to stop.
     if (this._status === "speaking") {
@@ -234,33 +251,58 @@ class VoiceController {
     try {
       await this.ensureSocket();
     } catch {
+      if (token !== this.captureToken) return;
       this.handlers.onError("Could not connect to the voice service.");
       this.setStatus("error");
       return;
     }
+    if (token !== this.captureToken) return;
 
     // Unlock the playback AudioContext now, while we still have the user gesture,
     // so scheduled TTS audio is not blocked by the browser autoplay policy.
     this.ensurePlaybackCtx();
 
+    let stream: MediaStream;
     try {
-      this.mediaStream = await navigator.mediaDevices.getUserMedia({
+      stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
+          echoCancellation: mode !== "music",
+          noiseSuppression: mode !== "music",
+          autoGainControl: mode !== "music",
         },
       });
+      if (token !== this.captureToken) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
     } catch {
+      if (token !== this.captureToken) return;
       this.handlers.onError("Microphone access was denied.");
       this.setStatus("error");
       return;
     }
 
     const AC = window.AudioContext ?? (window as any).webkitAudioContext;
-    this.captureCtx = new AC();
-    await this.captureCtx.resume().catch(() => {});
+    const captureCtx: AudioContext = new AC();
+    try {
+      await captureCtx.resume();
+    } catch {
+      stream.getTracks().forEach((track) => track.stop());
+      void captureCtx.close();
+      if (token === this.captureToken) {
+        this.handlers.onError("Could not start microphone audio capture.");
+        this.setStatus("error");
+      }
+      return;
+    }
+    if (token !== this.captureToken) {
+      stream.getTracks().forEach((track) => track.stop());
+      void captureCtx.close();
+      return;
+    }
+    this.captureCtx = captureCtx;
+    this.mediaStream = stream;
     const inRate = this.captureCtx.sampleRate;
 
     this.sourceNode = this.captureCtx.createMediaStreamSource(this.mediaStream);
@@ -272,8 +314,14 @@ class VoiceController {
       if (!this.capturing) return;
       const input = e.inputBuffer.getChannelData(0);
       const pcm = downsampleToPcm16(input, inRate, TARGET_SAMPLE_RATE);
+      const samples = mode === "music"
+        ? pcm.subarray(0, Math.max(0, TARGET_SAMPLE_RATE * 30 - this.captureSamples))
+        : pcm;
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(pcm.buffer);
+        if (samples.length) {
+          this.ws.send(samples);
+          this.captureSamples += samples.length;
+        }
       }
     };
 
@@ -284,9 +332,13 @@ class VoiceController {
     this.capturing = true;
     this.sendControl({
       type: "start",
+      mode,
       conversation_id: this.handlers.getConversationId(),
     });
     this.setStatus("listening");
+    if (mode === "music") {
+      this.captureTimer = setTimeout(() => void this.stopAndCommit(), 30_000);
+    }
   }
 
   async stopAndCommit(): Promise<void> {
@@ -299,18 +351,23 @@ class VoiceController {
     // which is why releasing immediately returns an empty transcript
     // ("Didn't catch that") while holding a beat longer works.
     const TAIL_MS = 350;
-    this.setStatus("thinking");
-    await new Promise((resolve) => setTimeout(resolve, TAIL_MS));
+    this.setStatus(this.captureMode === "music" ? "analyzing" : "thinking");
+    if (this.captureMode === "voice") {
+      await new Promise((resolve) => setTimeout(resolve, TAIL_MS));
+    }
     if (!this.capturing) return; // cancelled during the tail window
     this.teardownCapture();
     this.sendControl({
       type: "commit",
+      mode: this.captureMode,
       conversation_id: this.handlers?.getConversationId(),
       previous_response_id: this.handlers?.getPreviousResponseId() ?? undefined,
     });
   }
 
   private teardownCapture(): void {
+    if (this.captureTimer !== null) clearTimeout(this.captureTimer);
+    this.captureTimer = null;
     this.capturing = false;
     try {
       this.processor?.disconnect();
@@ -343,6 +400,7 @@ class VoiceController {
 
   /** Cancel the current interaction (barge-in / abort) without committing. */
   cancel(): void {
+    this.captureToken++;
     if (this.capturing) this.teardownCapture();
     this.stopPlayback();
     this.sendControl({ type: "cancel" });
@@ -372,10 +430,15 @@ class VoiceController {
       case "stt":
         if (frame.text && String(frame.text).trim()) {
           h.onUserTranscript(String(frame.text));
+          if (frame.mode === "music") this.setStatus("analyzing");
         } else if (frame.final) {
           h.onError("Didn't catch that — try again.");
           this.setStatus("idle");
         }
+        break;
+      case "music_result":
+        if (isMusicCandidate(frame.candidate)) h.onMusicResult(frame.candidate);
+        else h.onError("The audio service returned an invalid music result.");
         break;
       case "delta":
         if (typeof frame.text === "string") h.onAgentDelta(frame.text);
@@ -392,10 +455,17 @@ class VoiceController {
         }
         break;
       case "done":
+        if (frame.mode === "music" && frame.history_commit_failed) {
+          h.onError("La musique a été analysée, mais son historique n'a pas pu être enregistré. Réessaie avant de créer la scène.");
+          this.setStatus("idle");
+          break;
+        }
         h.onAgentDone(frame.response_id ?? null);
         if (!this.capturing) this.setStatus("idle");
         break;
       case "error":
+        this.captureToken++;
+        this.teardownCapture();
         h.onError(String(frame.message ?? "Voice error."));
         this.setStatus("idle");
         break;
@@ -452,6 +522,7 @@ class VoiceController {
   }
 
   dispose(): void {
+    this.captureToken++;
     this.teardownCapture();
     this.stopPlayback();
     if (this.playbackCtx) {

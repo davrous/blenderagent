@@ -14,6 +14,7 @@ import {
 import { attachVoiceRelay } from "./voice.js";
 import { MEDIA_PREFIX, browserKey, isUuid, mediaEnabled, ownedReferences, requireOrigin, signEnvelope } from "./mediaSecurity.js";
 import { registerMediaRoutes, requestScope } from "./videoJobs.js";
+import { parseMusicRequest } from "./music.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -51,6 +52,7 @@ app.get("/api/health", (req, res) => {
     apiVersion: config.mode === "foundry" ? config.apiVersion : undefined,
     model: config.modelName,
     voiceEnabled: config.voiceEnabled,
+    musicEnabled: config.voiceEnabled && config.musicEnabled && mediaEnabled(config.mediaControlSecret),
     mediaEnabled: mediaEnabled(config.mediaControlSecret),
     mediaDisabledReason: mediaEnabled(config.mediaControlSecret) ? undefined : "Media disabled: MEDIA_CONTROL_SECRET must contain at least 32 characters on Webchat and the agent.",
   });
@@ -160,6 +162,7 @@ interface ChatRequestBody {
   previous_response_id?: string | null;
   conversation_id?: string;
   references?: unknown;
+  music?: unknown;
 }
 
 async function buildUpstreamRequest(
@@ -257,8 +260,11 @@ app.post("/api/chat", requireOrigin(config.clientOrigin), async (req, res) => {
     if (!isUuid(body.conversation_id)) throw new Error("conversation_id (UUID) is required");
     if (mediaEnabled(config.mediaControlSecret)) {
       const scope = requestScope(req, res, body.conversation_id);
-      input = signEnvelope(config.mediaControlSecret, scope, input, ownedReferences(body.references, scope));
-    } else if (body.references !== undefined || input.trimStart().startsWith(MEDIA_PREFIX)) {
+      const music = parseMusicRequest(body.music);
+      const references = ownedReferences(body.references, scope);
+      if (music && (!config.musicEnabled || references.length)) throw new Error("Music mode is unavailable or cannot be combined with references");
+      input = signEnvelope(config.mediaControlSecret, scope, input, references, undefined, music);
+    } else if (body.references !== undefined || body.music !== undefined || input.trimStart().startsWith(MEDIA_PREFIX)) {
       throw new Error("Media is disabled; reference IDs and media envelopes are not accepted");
     }
   } catch (error) {

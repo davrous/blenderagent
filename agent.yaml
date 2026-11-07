@@ -35,6 +35,11 @@ environment_variables:
     value: "{{PROJECT_ENDPOINT}}"
   - name: MODEL_DEPLOYMENT_NAME
     value: "{{MODEL_DEPLOYMENT_NAME}}"
+  # Devfest audio input is a separate model; regular speech still uses Azure Speech.
+  - name: MUSIC_AUDIO_ENDPOINT
+    value: "{{MUSIC_AUDIO_ENDPOINT}}"
+  - name: MUSIC_MODEL_DEPLOYMENT_NAME
+    value: "{{MUSIC_MODEL_DEPLOYMENT_NAME}}"
   - name: AUTH_DIAGNOSTICS_ENABLED
     value: "true"
   - name: BLENDER_HOST
@@ -44,7 +49,7 @@ environment_variables:
   - name: AZURE_STORAGE_ACCOUNT_NAME
     value: "{{AZURE_STORAGE_ACCOUNT_NAME}}"
   - name: VIDEO_RENDER_TIMEOUT_SECONDS
-    value: "1800"
+    value: "3600"
   # Supply MEDIA_CONTROL_SECRET and optional WAVESPEED_API_KEY through your
   # deployment's secret configuration, never as literal committed values.
   # ── Teams / M365 Copilot (Activity protocol) ──

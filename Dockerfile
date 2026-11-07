@@ -83,7 +83,7 @@ RUN pip install --no-cache-dir --retries "$PIP_RETRIES" --timeout "$PIP_DEFAULT_
 COPY main.py auth_diagnostics.py conversation_telemetry.py \
     voice_pipeline.py activity_bridge.py blender_startup.py \
     blender_connection.py scene_manager.py artifact_storage.py media_analysis.py \
-    media_control.py video_jobs.py wavespeed_client.py blender_video.py teams_media.py \
+    media_control.py music.py video_jobs.py wavespeed_client.py blender_video.py teams_media.py \
     entrypoint.sh agent.yaml ./
 
 RUN chmod +x /app/entrypoint.sh

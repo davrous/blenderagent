@@ -3,6 +3,7 @@ export interface Health {
   agentUrl: string;
   model: string;
   voiceEnabled?: boolean;
+  musicEnabled?: boolean;
   mediaEnabled?: boolean;
   mediaDisabledReason?: string;
 }
@@ -22,7 +23,8 @@ export function loadHealth(onHealth: (health: Health) => void, onUnavailable: ()
       const health = await response.json();
       if (!health || typeof health.mode !== "string" || typeof health.agentUrl !== "string" || typeof health.model !== "string"
         || (health.mediaEnabled !== undefined && typeof health.mediaEnabled !== "boolean")
-        || (health.voiceEnabled !== undefined && typeof health.voiceEnabled !== "boolean")) {
+        || (health.voiceEnabled !== undefined && typeof health.voiceEnabled !== "boolean")
+        || (health.musicEnabled !== undefined && typeof health.musicEnabled !== "boolean")) {
         throw new Error("Invalid health response");
       }
       if (!stopped) onHealth(health);

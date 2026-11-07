@@ -6,6 +6,7 @@ import { uploadReference, type ReferenceUpload } from "../api/media";
 
 interface ComposerProps {
   voiceAvailable?: boolean;
+  musicAvailable?: boolean;
   mediaAvailable?: boolean;
   mediaDisabledReason?: string;
 }
@@ -19,7 +20,7 @@ interface Attachment {
   error?: string;
 }
 
-export function Composer({ voiceAvailable = false, mediaAvailable = false, mediaDisabledReason }: ComposerProps) {
+export function Composer({ voiceAvailable = false, musicAvailable = false, mediaAvailable = false, mediaDisabledReason }: ComposerProps) {
   const [value, setValue] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploadError, setUploadError] = useState("");
@@ -34,10 +35,25 @@ export function Composer({ voiceAvailable = false, mediaAvailable = false, media
   const voiceActive = useChatStore((s) => s.voiceActive);
   const voiceStatus = useChatStore((s) => s.voiceStatus);
   const voiceHint = useChatStore((s) => s.voiceHint);
+  const micMode = useChatStore((s) => s.micMode);
+  const setMicMode = useChatStore((s) => s.setMicMode);
+  const musicCandidate = useChatStore((s) => s.musicCandidate);
+  const confirmMusicScene = useChatStore((s) => s.confirmMusicScene);
+  const declineMusicScene = useChatStore((s) => s.declineMusicScene);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
   const ref = useRef<HTMLTextAreaElement>(null);
 
-  const inputLocked = isStreaming || voiceActive;
+  const inputLocked = isStreaming || voiceActive || ["connecting", "listening", "thinking", "analyzing"].includes(voiceStatus);
   const pending = attachments.some((item) => !item.reference);
+  const musical = micMode === "music" && musicAvailable;
+
+  useEffect(() => {
+    if (voiceStatus !== "listening" || !musical) return;
+    const started = Date.now();
+    setRecordingSeconds(0);
+    const timer = window.setInterval(() => setRecordingSeconds(Math.min(30, Math.floor((Date.now() - started) / 1000))), 250);
+    return () => window.clearInterval(timer);
+  }, [voiceStatus, musical]);
 
   useEffect(() => () => {
     controllers.current.forEach((controller) => controller.abort());
@@ -56,7 +72,7 @@ export function Composer({ voiceAvailable = false, mediaAvailable = false, media
   };
 
   const addFiles = async (files: File[]) => {
-    if (!mediaAvailable || inputLocked || uploading.current || !files.length) return;
+    if (!mediaAvailable || musical || inputLocked || uploading.current || !files.length) return;
     setUploadError("");
     if (attachments.length + files.length > 4) { setUploadError("At most four references can be attached to a message."); return; }
     if (files.some((file) => !["image/png", "image/jpeg", "image/webp", "video/mp4"].includes(file.type) || file.size === 0 || file.size > 200 * 1024 * 1024)) {
@@ -111,9 +127,16 @@ export function Composer({ voiceAvailable = false, mediaAvailable = false, media
   // the button even if the pointer drifts off it while held.
   const listening = voiceStatus === "listening";
   const micDisabled =
-    isStreaming || attachments.length > 0 || (voiceActive && voiceStatus !== "speaking");
+    isStreaming || attachments.length > 0 || voiceStatus === "connecting" || voiceStatus === "analyzing"
+    || (voiceActive && voiceStatus !== "speaking");
 
-  const micLabel = listening
+  const micLabel = musical
+    ? listening
+      ? `Arrêter et analyser (${recordingSeconds}/30 s)`
+      : voiceStatus === "analyzing"
+        ? "Analyse musicale…"
+        : "Enregistrer une musique de film"
+    : listening
     ? "Listening… release to send"
     : voiceStatus === "thinking"
       ? "Thinking…"
@@ -122,7 +145,7 @@ export function Composer({ voiceAvailable = false, mediaAvailable = false, media
         : "Hold to talk";
 
   const onMicDown = (e: React.PointerEvent<HTMLButtonElement>) => {
-    if (micDisabled) return;
+    if (micDisabled || musical) return;
     e.preventDefault();
     e.currentTarget.setPointerCapture?.(e.pointerId);
     void voice.startListening();
@@ -130,11 +153,19 @@ export function Composer({ voiceAvailable = false, mediaAvailable = false, media
 
   const onMicUp = (e: React.PointerEvent<HTMLButtonElement>) => {
     e.currentTarget.releasePointerCapture?.(e.pointerId);
-    if (listening) void voice.stopAndCommit();
+    if (musical) return;
+    if (voice.listening) void voice.stopAndCommit();
+    else if (voice.status === "connecting") voice.cancel();
   };
 
   const onMicCancel = () => {
-    if (listening) voice.cancel();
+    if (!musical && (voice.listening || voice.status === "connecting")) voice.cancel();
+  };
+
+  const toggleMusicRecording = () => {
+    if (!musical || micDisabled) return;
+    if (voice.listening) void voice.stopAndCommit();
+    else void voice.startListening("music");
   };
 
   return (
@@ -143,6 +174,17 @@ export function Composer({ voiceAvailable = false, mediaAvailable = false, media
       onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false); }}
       onDrop={(event) => { event.preventDefault(); setDragging(false); void addFiles(Array.from(event.dataTransfer.files)); }}>
       {!mediaAvailable && <div className="media-warning" role="status">{mediaDisabledReason ?? "Reference uploads and video controls are unavailable."}</div>}
+      {musicAvailable && <div className="music-controls">
+        <div className="mic-modes" role="group" aria-label="Microphone mode">
+          <button type="button" aria-pressed={!musical} disabled={inputLocked || attachments.length > 0} onClick={() => setMicMode("voice")}>🎙️ Dialogue vocal</button>
+          <button type="button" aria-pressed={musical} disabled={inputLocked || attachments.length > 0} onClick={() => setMicMode("music")}>🎵 Musique de film</button>
+        </div>
+        {musical && <small>Joue, chante ou fredonne 2–30 s. Clique pour démarrer, puis pour envoyer. Reconnaissance incertaine ; aucune scène sans confirmation.</small>}
+        {musical && (listening || voiceStatus === "connecting" || voiceStatus === "analyzing") && <button type="button" className="music-cancel" onClick={() => {
+          voice.cancel();
+          useChatStore.getState().voiceFail("Enregistrement ou analyse musicale annulé.");
+        }}>Annuler</button>}
+      </div>}
       {uploadError && <div className="media-error" role="alert">{uploadError}</div>}
       {attachments.length > 0 && <div className="reference-list">
         {attachments.map((item) => <div className="reference-item" key={item.id}>
@@ -160,13 +202,19 @@ export function Composer({ voiceAvailable = false, mediaAvailable = false, media
           {voiceHint ?? micLabel}
         </div>
       )}
+      {musical && musicCandidate && <div className="music-confirmation">
+        <span>Hypothèse : <strong>{musicCandidate.film}</strong>. Créer la séquence Devfest (15–20 s) ?</span>
+        <button type="button" disabled={inputLocked} onClick={() => void confirmMusicScene()}>Oui, créer la scène 🎬</button>
+        <button type="button" disabled={inputLocked} onClick={() => void declineMusicScene()}>Non</button>
+      </div>}
       <div className="composer">
         <input ref={fileInput} className="reference-file-input" type="file" multiple accept="image/png,image/jpeg,image/webp,video/mp4" onChange={(event) => { void addFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} />
-        <button type="button" className="media-icon composer-attach" disabled={!mediaAvailable || inputLocked || pending || attachments.length >= 4} onClick={() => fileInput.current?.click()} title="Attach reference" aria-label="Attach reference"><Paperclip size={20} /></button>
+        <button type="button" className="media-icon composer-attach" disabled={!mediaAvailable || musical || inputLocked || pending || attachments.length >= 4} onClick={() => fileInput.current?.click()} title="Attach reference" aria-label="Attach reference"><Paperclip size={20} /></button>
         {voiceAvailable && (
           <button
             type="button"
-            className={`composer-mic${listening ? " is-listening" : ""}`}
+            className={`composer-mic${listening ? " is-listening" : ""}${musical ? " is-musical" : ""}`}
+            onClick={toggleMusicRecording}
             onPointerDown={onMicDown}
             onPointerUp={onMicUp}
             onPointerCancel={onMicCancel}
@@ -175,7 +223,7 @@ export function Composer({ voiceAvailable = false, mediaAvailable = false, media
             aria-label={micLabel}
             aria-pressed={listening}
           >
-            <span aria-hidden>{listening ? "●" : "🎙️"}</span>
+            <span aria-hidden>{listening ? "●" : musical ? "🎵" : "🎙️"}</span>
           </button>
         )}
         <textarea
@@ -186,7 +234,9 @@ export function Composer({ voiceAvailable = false, mediaAvailable = false, media
           placeholder={
             inputLocked
               ? "Working…"
-              : "Describe a scene, ask for a render, … (Shift+Enter for newline)"
+              : musical
+                ? "Après l'écoute, confirme avec « oui » ou discute de l'hypothèse…"
+                : "Describe a scene, ask for a render, … (Shift+Enter for newline)"
           }
           disabled={inputLocked}
           rows={2}

@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { streamChat } from "../api/stream";
 import type { VoiceStatus } from "../api/voice";
 import type { ReferenceUpload } from "../api/media";
+import { isMusicConfirmation, type MicMode, type MusicCandidate, type MusicRequest } from "../api/music";
 
 export type Role = "user" | "assistant";
 export type Status = "streaming" | "done" | "error";
@@ -27,6 +28,12 @@ interface ChatState {
   voiceStatus: VoiceStatus;
   voiceActive: boolean;
   voiceHint: string | null;
+  micMode: MicMode;
+  musicCandidate: MusicCandidate | null;
+  setMicMode: (mode: MicMode) => void;
+  setMusicCandidate: (candidate: MusicCandidate) => void;
+  confirmMusicScene: () => Promise<void>;
+  declineMusicScene: () => Promise<void>;
   send: (input: string, references?: ReferenceUpload[]) => Promise<void>;
   selectModel: (modelUrl: string, name: string) => Promise<void>;
   selectTexture: (assetId: string, name: string) => Promise<void>;
@@ -170,8 +177,9 @@ export const useChatStore = create<ChatState>((set, get) => {
     agentInput: string,
     userBubbleText: string | null,
     references: ReferenceUpload[] = [],
+    music?: MusicRequest,
   ): Promise<void> => {
-    if (get().isStreaming || get().voiceActive) return;
+    if (get().isStreaming || get().voiceActive || ["connecting", "listening", "thinking", "analyzing"].includes(get().voiceStatus)) return;
     const trimmedInput = agentInput.trim();
     if (!trimmedInput && !references.length) return;
 
@@ -290,6 +298,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         },
         ac.signal,
         references.map((reference) => reference.blob_name),
+        music,
       );
       finalize("done");
     } catch (err) {
@@ -312,6 +321,29 @@ export const useChatStore = create<ChatState>((set, get) => {
   voiceStatus: "idle",
   voiceActive: false,
   voiceHint: null,
+  micMode: "voice",
+  musicCandidate: null,
+
+  setMicMode: (mode) => {
+    if (get().isStreaming || get().voiceActive || ["connecting", "listening", "thinking", "analyzing"].includes(get().voiceStatus)) return;
+    set({ micMode: mode, musicCandidate: null, voiceHint: null });
+  },
+  setMusicCandidate: (candidate) => {
+    if (get().micMode === "music") set({ musicCandidate: candidate.film ? candidate : null });
+  },
+  confirmMusicScene: async () => {
+    const candidate = get().musicCandidate;
+    if (!candidate || get().isStreaming || get().voiceActive) return;
+    set({ musicCandidate: null });
+    await runAgentTurn("Oui, crée la scène Devfest.", "Oui, crée la scène Devfest.", [], { candidate, action: "generate" });
+    if (get().messages.at(-1)?.status === "error") set({ musicCandidate: candidate });
+  },
+  declineMusicScene: async () => {
+    const candidate = get().musicCandidate;
+    if (!candidate || get().isStreaming || get().voiceActive) return;
+    set({ musicCandidate: null });
+    await runAgentTurn("Non, pas de scène.", "Non, pas de scène.", [], { candidate, action: "discuss" });
+  },
 
   reset: () => {
     const { abortController, conversationId } = get();
@@ -334,6 +366,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       voiceStatus: "idle",
       voiceActive: false,
       voiceHint: null,
+      micMode: "voice",
+      musicCandidate: null,
     });
   },
 
@@ -362,6 +396,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       messages: [...get().messages, userMsg, assistantMsg],
       voiceActive: true,
       voiceHint: null,
+      ...(get().micMode === "music" ? { musicCandidate: null } : {}),
     });
   },
 
@@ -396,14 +431,23 @@ export const useChatStore = create<ChatState>((set, get) => {
           m.id === id ? { ...m, status: "error", errorText: message } : m,
         ),
         voiceActive: false,
+        musicCandidate: null,
       }));
     } else {
-      set({ voiceHint: message, voiceActive: false });
+      set({ voiceHint: message, voiceActive: false, musicCandidate: null });
     }
   },
 
   send: async (input, references = []) => {
-    await runAgentTurn(input, input.trim(), references);
+    const candidate = get().micMode === "music" ? get().musicCandidate : null;
+    if (candidate && !references.length) {
+      const generate = isMusicConfirmation(input);
+      if (generate || /^non\b|^no\b/i.test(input.trim())) set({ musicCandidate: null });
+      await runAgentTurn(input, input.trim(), [], { candidate, action: generate ? "generate" : "discuss" });
+      if (generate && get().messages.at(-1)?.status === "error") set({ musicCandidate: candidate });
+    } else {
+      await runAgentTurn(input, input.trim(), references);
+    }
   },
 
   // Clicking a model thumbnail in a gallery: send a silent note asking the agent

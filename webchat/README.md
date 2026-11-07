@@ -74,6 +74,31 @@ All settings live in `webchat/.env`. See [`.env.example`](.env.example) for the 
 | `PORT` | `5174` | Proxy listen port. |
 | `VOICE_ENABLED` | `true` | Show the 🎙️ push-to-talk UI and enable the `/api/voice` relay. In local mode this must match the agent's own `ENABLE_VOICE`; in foundry mode the deployed agent must declare the `invocations_ws` protocol. |
 | `VOICE_LOCAL_WS_URL` | `ws://localhost:8089/invocations_ws` | Upstream voice WebSocket for local mode. |
+| `MUSIC_ENABLED` | `false` | Offer the separate film-music mode; requires enabled voice/media controls and an audio model configured on the Python agent. |
+
+## Devfest music mode
+
+Set `MUSIC_ENABLED=true` here and configure `MUSIC_AUDIO_ENDPOINT` and
+`MUSIC_MODEL_DEPLOYMENT_NAME` on the agent. Rebuild/restart both sides after
+the changes. An existing deployed agent must also receive the updated Python
+code and configuration; deploying the audio model alone does not update it.
+The agent identity needs audio-resource inference permission, even if the
+developer's CLI smoke test succeeds. See [the agent setup](../README.md#devfest-film-music-mode).
+
+**Dialogue vocal** stays the default push-to-talk mode. **Musique de film**
+uses click-to-start/click-to-stop, recording 2-30 seconds without speech noise
+suppression. Musical notes animate during analysis, followed by a proposed
+film/title and uncertainty. No Blender tools run during recognition.
+
+Use the confirmation button or type `oui` to create the original developer
+vignette (15-20 seconds, Devfest Toulouse greeting). The existing viewport and
+video-job cards display the result and MP4 progress/download. Refusal and
+discussion do not generate a scene. Switch back to **Dialogue vocal** or Reset
+to discard the pending music workflow. Approval never authorizes paid Seedance.
+Audio is not kept as an attachment or used as the rendered video's soundtrack.
+
+After `npm run build`, run `node ../devTools/test_music_webchat.mjs` from this
+directory (or `node devTools/test_music_webchat.mjs` from the repository root).
 
 ## Project layout
 

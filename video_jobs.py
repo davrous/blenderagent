@@ -294,7 +294,7 @@ class VideoJobs:
                        "--python", str(Path(__file__).with_name("blender_video.py")), "--", str(directory)]
             with (directory / "render.log").open("wb") as output:
                 process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
-                deadline = time.monotonic() + int(os.getenv("VIDEO_RENDER_TIMEOUT_SECONDS", "1800"))
+                deadline = time.monotonic() + int(os.getenv("VIDEO_RENDER_TIMEOUT_SECONDS", "3600"))
                 try:
                     while process.poll() is None:
                         if lost.wait(1) or time.monotonic() > deadline or (directory / "cancel").exists():

@@ -27,6 +27,7 @@ export function App() {
       onUserTranscript: (t) => useChatStore.getState().voiceBeginTurn(t),
       onAgentDelta: (d) => useChatStore.getState().voiceAppendDelta(d),
       onAgentDone: (rid) => useChatStore.getState().voiceFinalizeTurn(rid),
+      onMusicResult: (candidate) => useChatStore.getState().setMusicCandidate(candidate),
       onError: (m) => useChatStore.getState().voiceFail(m),
       getConversationId: () => useChatStore.getState().conversationId,
       getPreviousResponseId: () => useChatStore.getState().previousResponseId,
@@ -70,7 +71,7 @@ export function App() {
         <ChatView mediaAvailable={!!health?.mediaEnabled} />
       </main>
       <footer className="app-footer">
-        <Composer key={conversationId} voiceAvailable={voiceAvailable} mediaAvailable={!!health?.mediaEnabled} mediaDisabledReason={health ? health.mediaDisabledReason : connectionStatus} />
+        <Composer key={conversationId} voiceAvailable={voiceAvailable} musicAvailable={voiceAvailable && !!health?.musicEnabled} mediaAvailable={!!health?.mediaEnabled} mediaDisabledReason={health ? health.mediaDisabledReason : connectionStatus} />
       </footer>
     </div>
   );
