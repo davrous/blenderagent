@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from azure.core import MatchConditions
+from azure.core.exceptions import ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSettings, generate_blob_sas
 
@@ -26,6 +27,27 @@ def validate_blob_name(name: str) -> str:
     return name
 
 
+class WorkspaceDeletedError(RuntimeError):
+    pass
+
+
+def workspace_artifact_name(name: str, scope: str | None) -> str:
+    validate_blob_name(name)
+    if scope is None:
+        return name
+    if not re.fullmatch(r"[a-f0-9]{32}", scope):
+        raise ValueError("Invalid workspace artifact scope.")
+    basename = Path(name).name
+    if not re.fullmatch(r"[A-Za-z0-9_-]+\.(png|jpg|webp|blend|glb)", basename):
+        raise ValueError("Invalid workspace artifact filename.")
+    return f"workspace-artifacts/{scope}/{basename}"
+
+
+def _artifact_scope(name: str) -> str | None:
+    match = re.match(r"(?:workspace-artifacts|workspace-scenes|music-audio|references|videos|video-jobs)/([a-f0-9]{32})/", name)
+    return match[1] if match else None
+
+
 class ArtifactStorage:
     def __init__(self, account: str | None = None, *, service=None):
         self.account = account or os.environ.get("AZURE_STORAGE_ACCOUNT_NAME", "")
@@ -39,14 +61,40 @@ class ArtifactStorage:
     def blob(self, name: str):
         return self.service.get_blob_client(self.container, validate_blob_name(name))
 
+    def assert_workspace_active(self, scope: str) -> None:
+        if not re.fullmatch(r"[a-f0-9]{32}", scope):
+            raise ValueError("Invalid workspace scope.")
+        try:
+            self.blob(f"workspace-scenes/{scope}/deleted.json").get_blob_properties()
+        except ResourceNotFoundError:
+            return
+        raise WorkspaceDeletedError("This workspace was deleted; refusing to recreate its artifacts.")
+
+    def _write_blob(self, name: str, data, **options):
+        scope = _artifact_scope(name)
+        if scope:
+            self.assert_workspace_active(scope)
+        blob = self.blob(name)
+        result = blob.upload_blob(data, **options)
+        if scope:
+            try:
+                self.assert_workspace_active(scope)
+            except WorkspaceDeletedError:
+                try:
+                    blob.delete_blob(etag=result["etag"], match_condition=MatchConditions.IfNotModified, delete_snapshots="include")
+                except ResourceNotFoundError:
+                    pass
+                raise
+        return result
+
     def upload(self, name: str, data, media_type: str, *, download_name: str | None = None):
         disposition = None
         if download_name:
             if not re.fullmatch(r"[A-Za-z0-9_.-]+", download_name):
                 raise ValueError("Invalid download filename.")
             disposition = f'attachment; filename="{download_name}"'
-        return self.blob(name).upload_blob(
-            data, overwrite=True,
+        return self._write_blob(
+            name, data, overwrite=True,
             content_settings=ContentSettings(content_type=media_type, content_disposition=disposition),
         )
 
@@ -55,6 +103,9 @@ class ArtifactStorage:
             return self.upload(name, source, media_type)
 
     def download(self, name: str, path: Path, *, max_bytes: int = 200 * 1024 * 1024):
+        scope = _artifact_scope(name)
+        if scope:
+            self.assert_workspace_active(scope)
         stream = self.blob(name).download_blob()
         if stream.size > max_bytes:
             raise ValueError("Artifact exceeds the size limit.")
@@ -71,6 +122,9 @@ class ArtifactStorage:
             raise
 
     def read_json(self, name: str) -> tuple[dict, str]:
+        scope = _artifact_scope(name)
+        if scope:
+            self.assert_workspace_active(scope)
         stream = self.blob(name).download_blob()
         if stream.size > 256 * 1024:
             raise ValueError("Manifest exceeds the size limit.")
@@ -84,8 +138,8 @@ class ArtifactStorage:
         if len(payload) > 256 * 1024:
             raise ValueError("Manifest exceeds the size limit.")
         conditions = {"etag": etag, "match_condition": MatchConditions.IfNotModified} if etag else {}
-        result = self.blob(name).upload_blob(
-            payload, overwrite=etag is not None,
+        result = self._write_blob(
+            name, payload, overwrite=etag is not None,
             content_settings=ContentSettings(content_type="application/json", cache_control="no-store"),
             **conditions,
         )

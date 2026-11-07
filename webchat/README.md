@@ -129,6 +129,31 @@ loads the archived text/voice history, native job IDs and the distinct persisted
 Foundry sandbox/conversation associations. New work no longer deletes previous
 sandboxes. While a turn is active, navigation is disabled.
 
+Each thumbnail has a **delete** control with an irreversible-deletion
+confirmation. Only the verified owning browser can rename or delete, and the
+server requires `confirm: true` for deletion. Rendering, running operations,
+leased artifacts and ambiguous paid submissions block deletion. Cleanup uses
+persisted Foundry sandbox/conversation IDs rather than process caches, deletes
+conversation items before their conversation, and removes only exact,
+version-checked files in the workspace's verified media scope. Shared referenced
+files and legacy unscoped artifacts whose ownership cannot be proven are kept;
+no shared directories or containers are removed.
+
+A durable deletion record replaces the archived transcript before cleanup.
+`workspace-scenes/{scope}/deleted.json` stays permanently to prevent legacy
+imports and late agent callbacks from recreating deleted work. If cleanup fails,
+the gallery shows a non-resumable pending-deletion tile; use its trash control
+again to retry the remaining cleanup. Do not remove tombstones manually.
+Local cleanup is a signed `workspace_delete` control sent with `stream:false`,
+acknowledged with the exact `{"workspace_deleted":"<UUID>"}` JSON; it bypasses
+the LLM and targets only that conversation's local checkpoint.
+
+The existing Blender LLM reply supplies a short French title in a private
+`workspacetitle` JSON fence. The UI hides that metadata, and the archive accepts
+only the first valid generated title. No separate paid title-generation call
+is made. Use the pencil control to edit the title (1–90 characters); manual
+titles remain protected against late replies and concurrent archive retries.
+
 **Discussion** continues the selected work; **Ressources** browses all recorded
 images, videos, musical inputs and downloads in chronological order. Native
 video cards still provide their existing render/approval controls. Private
@@ -146,6 +171,11 @@ Known legacy browser IDs/jobs are imported where possible. This cannot recover
 previously deleted compute files or microphone data that was never saved.
 If gallery configuration/storage is unavailable, the error is explicit; the
 existing text-only client behavior remains available when gallery is disabled.
+
+Offline workspace checks: `node devTools/test_workspaces.mjs` and
+`node devTools/test_workspace_management.mjs` from the repository root. Tests
+use memory storage and fake Foundry endpoints; they never delete real records
+or invoke a paid model.
 
 After `npm run build`, run `node ../devTools/test_music_webchat.mjs` from this
 directory (or `node devTools/test_music_webchat.mjs` from the repository root).

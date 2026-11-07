@@ -35,7 +35,7 @@ from agent_framework.foundry import FoundryChatClient
 from agent_framework_foundry_hosting import ResponsesHostServer
 
 from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
-from artifact_storage import ArtifactStorage
+from artifact_storage import ArtifactStorage, workspace_artifact_name
 
 from auth_diagnostics import start_auth_diagnostics
 from blender_connection import get_blender_connection, close_blender_connection, is_blender_socket_ready
@@ -163,6 +163,8 @@ def _log_storage_principal_once() -> None:
 
 def upload_image_to_blob(image_bytes: bytes, blob_name: str) -> str:
     """Upload image bytes to private storage and return a one-hour read link."""
+    workspace = workspace_scene.get()
+    blob_name = workspace_artifact_name(blob_name, workspace[0] if workspace else None)
     logger.info("Uploading image to blob: %s (%d bytes)", blob_name, len(image_bytes))
     _log_storage_principal_once()
     storage = ArtifactStorage(AZURE_STORAGE_ACCOUNT_NAME)
@@ -172,6 +174,8 @@ def upload_image_to_blob(image_bytes: bytes, blob_name: str) -> str:
 
 def upload_blend_to_blob(local_path: str, blob_name: str) -> str:
     """Upload a .blend file to Azure Blob Storage and return a download URL."""
+    workspace = workspace_scene.get()
+    blob_name = workspace_artifact_name(blob_name, workspace[0] if workspace else None)
     file_size = os.path.getsize(local_path)
     logger.info("Uploading .blend to blob: %s (%d bytes)", blob_name, file_size)
     storage = ArtifactStorage(AZURE_STORAGE_ACCOUNT_NAME)
@@ -182,6 +186,8 @@ def upload_blend_to_blob(local_path: str, blob_name: str) -> str:
 
 def upload_glb_to_blob(local_path: str, blob_name: str) -> str:
     """Upload a .glb file to Azure Blob Storage and return a download URL."""
+    workspace = workspace_scene.get()
+    blob_name = workspace_artifact_name(blob_name, workspace[0] if workspace else None)
     file_size = os.path.getsize(local_path)
     logger.info("Uploading .glb to blob: %s (%d bytes)", blob_name, file_size)
     storage = ArtifactStorage(AZURE_STORAGE_ACCOUNT_NAME)

@@ -48,7 +48,7 @@ interface ChatState {
   musicOptions: MusicGenerationOptions;
   setMusicOptions: (options: MusicGenerationOptions) => void;
   setMicMode: (mode: MicMode) => void;
-  setMusicCandidate: (candidate: MusicCandidate) => void;
+  setMusicCandidate: (candidate: MusicCandidate | null) => void;
   confirmMusicScene: () => Promise<void>;
   declineMusicScene: () => Promise<void>;
   send: (input: string, references?: ReferenceUpload[]) => Promise<void>;
@@ -416,7 +416,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     set({ micMode: mode, musicCandidate: null, voiceHint: null });
   },
   setMusicCandidate: (candidate) => {
-    if (get().micMode === "music") set({ musicCandidate: candidate.film ? candidate : null });
+    if (get().micMode === "music") set({ musicCandidate: candidate?.film ? candidate : null });
   },
   confirmMusicScene: async () => {
     const candidate = get().musicCandidate;
@@ -459,7 +459,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     });
   },
 
-  setVoiceStatus: (s) => set({ voiceStatus: s }),
+  setVoiceStatus: (s) => set({ voiceStatus: s, ...(s === "connecting" ? { voiceHint: null } : {}) }),
   voiceInputAudio: (url) => {
     const assistant = get().messages.findIndex((message) => message.id === voiceAssistantId);
     if (assistant < 1) return;

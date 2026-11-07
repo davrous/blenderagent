@@ -64,6 +64,12 @@ export function signEnvelope(secret: string, scope: string, text: string, refere
   return `${MEDIA_PREFIX}${part}.${mac(part, secret)}`;
 }
 
+export function signWorkspaceDeletion(secret: string, scope: string, id: string): string {
+  if (!mediaEnabled(secret) || !JOB_ID_RE.test(scope) || !isUuid(id)) throw new Error("Workspace deletion controls are unavailable.");
+  const part = Buffer.from(JSON.stringify({ scope, text: "", workspace_delete: id }), "utf8").toString("base64url");
+  return `${MEDIA_PREFIX}${part}.${mac(part, secret)}`;
+}
+
 export function voiceMediaContext(cookieHeader: string | undefined, conversationId: string | undefined, secret: string, workspace?: { resume: boolean }): string | undefined {
   if (!mediaEnabled(secret) || !isUuid(conversationId)) return undefined;
   const key = readBrowserKey(cookieHeader, secret);

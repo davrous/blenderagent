@@ -427,7 +427,7 @@ class VoiceController {
 
     switch (frame.type) {
       case "listening":
-        this.setStatus("listening");
+        if (this.capturing) this.setStatus("listening");
         break;
       case "stt":
         if (frame.text && String(frame.text).trim()) {

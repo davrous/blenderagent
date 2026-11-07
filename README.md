@@ -517,7 +517,11 @@ access is not automatically granted. See [Azure audio input guidance](https://le
 
 Click to start recording, then click again to submit 2-30 seconds of played,
 sung, hummed or whistled melody. Recording stops automatically after 30 seconds
-and can be cancelled. Animated notes appear in the chat during analysis.
+and can be cancelled with **Annuler l'enregistrement**, without submitting the
+take for recognition or saving it. **Annuler l'analyse** stops a submitted
+request; audio already archived remains replayable. Use **Nouvelle tentative**
+to record another excerpt if the hypothesis is unconvincing; this clears only
+the pending hypothesis, not the previous audio or conversation. Animated notes appear in the chat during analysis.
 Recognition is a best-effort hypothesis, **not audio fingerprinting**; uncertain
 and unidentified clips are explicitly reported.
 
@@ -565,6 +569,10 @@ authenticated relay's history commit; it keeps the existing Blender session and
 response-chain identity intact. The musical input is now saved as a private WAV
 artifact and replayable in the archived user turn and resources view. Previously
 unsaved microphone recordings cannot be recovered retroactively.
+The voice relay buffers controls/audio while resolving the owned workspace and
+handles upstream sockets that are already open; gallery startup must not lose
+the first recording. Python diagnostics log music capture, committed PCM size
+and recognition confidence without logging the recorded audio.
 
 ## Private Work Gallery
 
@@ -586,6 +594,15 @@ archived. **Ressources** replays musical WAVs and shows images, MP4s and Blender
 downloads chronologically. Thumbnails prefer an available rendered image or
 video poster, otherwise the viewport screenshot. Media SAS links are refreshed
 from recorded, owned Blob references when loading a work.
+
+The LLM supplies a short French catalogue title, including for musical recognition
+before scene creation. Use the pencil on a tile to rename it; manual titles are
+never overwritten by later model replies. The trash button requires confirmation
+before deleting history, verified realization-owned files and its Foundry sandbox.
+Shared or unprovable legacy files are preserved rather than risking another work.
+Active turns/renders and ambiguous paid submissions block deletion. Durable
+deletion markers prevent late uploads or legacy imports from recreating a deleted
+work; failed cleanup is reported and remains retryable.
 
 The live primary file remains `$HOME/blender_scenes/scene.blend`. Known
 conversations also keep local checkpoints, so local Docker can switch A/B/A
@@ -610,6 +627,8 @@ Focused checks:
 .venv/bin/python devTools/test_music_pipeline.py
 .venv/bin/python -m unittest devTools.test_animation_inspection
 node devTools/test_music_webchat.mjs
+.venv/bin/python -m unittest devTools.test_workspace_controls devTools.test_workspace_scenes
+node devTools/test_workspace_management.mjs
 ```
 
 ## Reference-to-Video Workflow

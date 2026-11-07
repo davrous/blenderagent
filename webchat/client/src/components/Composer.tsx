@@ -43,6 +43,8 @@ export function Composer({ voiceAvailable = false, musicAvailable = false, media
   const setMusicOptions = useChatStore((s) => s.setMusicOptions);
   const confirmMusicScene = useChatStore((s) => s.confirmMusicScene);
   const declineMusicScene = useChatStore((s) => s.declineMusicScene);
+  const setMusicCandidate = useChatStore((s) => s.setMusicCandidate);
+  const [musicAttempted, setMusicAttempted] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const ref = useRef<HTMLTextAreaElement>(null);
 
@@ -168,7 +170,11 @@ export function Composer({ voiceAvailable = false, musicAvailable = false, media
   const toggleMusicRecording = () => {
     if (!musical || micDisabled) return;
     if (voice.listening) void voice.stopAndCommit();
-    else void voice.startListening("music");
+    else {
+      setMusicCandidate(null);
+      setMusicAttempted(true);
+      void voice.startListening("music");
+    }
   };
 
   return (
@@ -185,8 +191,13 @@ export function Composer({ voiceAvailable = false, musicAvailable = false, media
         {musical && <small>Joue, chante ou fredonne 2–30 s. Clique pour démarrer, puis pour envoyer. Reconnaissance incertaine ; aucune scène sans confirmation.</small>}
         {musical && (listening || voiceStatus === "connecting" || voiceStatus === "analyzing") && <button type="button" className="music-cancel" onClick={() => {
           voice.cancel();
-          useChatStore.getState().voiceFail("Enregistrement ou analyse musicale annulé.");
-        }}>Annuler</button>}
+          useChatStore.getState().voiceFail(voiceStatus === "analyzing"
+            ? "Analyse musicale annulée. L'extrait déjà envoyé reste dans l'historique."
+            : "Enregistrement annulé : aucun extrait envoyé pour reconnaissance.");
+        }}>{voiceStatus === "analyzing" ? "Annuler l'analyse" : "Annuler l'enregistrement"}</button>}
+        {musical && musicAttempted && !inputLocked && <button type="button" className="music-cancel" disabled={attachments.length > 0} onClick={toggleMusicRecording}>
+          Nouvelle tentative : enregistrer un autre extrait
+        </button>}
       </div>}
       {musical && <div className="music-generation-options" role="group" aria-label="Options de génération vidéo">
         <label>Durée de l'animation<select disabled={inputLocked} value={musicOptions.duration_seconds} onChange={(event) => {

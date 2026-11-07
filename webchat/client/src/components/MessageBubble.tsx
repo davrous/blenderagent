@@ -15,6 +15,7 @@ import {
   isVideoLink,
   extractVideoJobIds,
   stripVideoJobBlocks,
+  stripWorkspaceTitleBlocks,
 } from "../lib/parseMarkdown";
 import { blobProxyUrl } from "../api/media";
 
@@ -40,7 +41,7 @@ function MessageBubbleImpl({ message }: Props) {
 
   const galleries = extractGalleries(message.text);
   const jobIds = extractVideoJobIds(message.text);
-  const prose = dedupeMarkdownMedia(stripGalleryBlocks(stripVideoJobBlocks(message.text)));
+  const prose = dedupeMarkdownMedia(stripGalleryBlocks(stripVideoJobBlocks(stripWorkspaceTitleBlocks(message.text))));
 
   if (jobIds.length && !prose && !galleries.length && message.status === "done") return null;
 

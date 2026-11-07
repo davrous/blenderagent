@@ -624,6 +624,7 @@ class VoiceSession:
                 self._capture_mode = "music"
                 self._music_pcm.clear()
                 self._capturing = True
+                logger.info("Music capture started.")
                 await self._send_text({"type": "listening", "mode": "music"})
             else:
                 self._capture_mode = "voice"
@@ -885,6 +886,7 @@ class VoiceSession:
             await self._send_text({"type": "error", "message": str(exc)})
             return
         transcript = f"Extrait musical ({len(pcm) / 48000:.1f} s)"
+        logger.info("Music commit: %d PCM bytes (%.1f s).", len(pcm), len(pcm) / 48000)
         await self._send_text({"type": "stt", "mode": "music", "text": transcript, "final": True})
         await self._send_text({"type": "delta", "text": "\n\n*🎵 J'analyse la musique… 🎶*\n\n"})
         self._cancelled = False
@@ -905,6 +907,7 @@ class VoiceSession:
                     logger.warning("Could not archive musical input audio.", exc_info=True)
                     await self._send_text({"type": "archive.warning", "message": "L'extrait audio n'a pas pu être sauvegardé. La reconnaissance continue, mais cet audio ne sera pas rejouable dans la galerie."})
             candidate = await recognize_music(pcm)
+            logger.info("Music recognition completed: confidence=%s.", candidate.confidence)
             if self._cancelled:
                 return
             reply = recognition_reply(candidate)

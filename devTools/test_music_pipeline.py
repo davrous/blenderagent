@@ -48,6 +48,16 @@ class AudioTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             music.MusicCandidate(film=None, track=None, confidence="high", evidence="Noise")
 
+    def test_audio_model_title_is_emitted_as_catalogue_metadata(self):
+        candidate = music.MusicCandidate(film=None, track=None, confidence="unknown",
+                                         evidence="Une melodie incertaine.", title="Une fanfare encore à découvrir")
+        reply = music.recognition_reply(candidate)
+        self.assertIn('```workspacetitle', reply)
+        self.assertIn(json.dumps({"title": candidate.title}, ensure_ascii=False), reply)
+        self.assertNotIn("Confirme", reply)
+        with self.assertRaises(ValueError):
+            music.MusicCandidate(film=None, track=None, confidence="unknown", evidence="Noise", title="x" * 91)
+
 
 class RecognitionTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_wav_contract_no_transcription_or_tools(self):

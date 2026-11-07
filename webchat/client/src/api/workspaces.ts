@@ -11,6 +11,8 @@ export interface WorkspaceSummary {
   updated_at: number;
   resource_count: number;
   thumbnail_url?: string;
+  deletion_pending?: boolean;
+  deletion_error?: string;
 }
 export interface WorkspaceResource {
   id: string;
@@ -40,3 +42,5 @@ async function request<T>(path: string, body?: object): Promise<T> {
 export const listWorkspaces = () => request<WorkspaceSummary[]>("/api/workspaces");
 export const loadWorkspace = (id: string) => request<WorkspaceDetail>(`/api/workspaces/${encodeURIComponent(id)}`);
 export const createWorkspace = (legacyId?: string) => request<WorkspaceDetail>("/api/workspaces", legacyId ? { conversation_id: legacyId } : {});
+export const renameWorkspace = (id: string, title: string) => request<{ ok: true }>(`/api/workspaces/${encodeURIComponent(id)}/rename`, { title });
+export const deleteWorkspace = (id: string) => request<{ ok: true }>(`/api/workspaces/${encodeURIComponent(id)}/delete`, { confirm: true });

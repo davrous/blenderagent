@@ -206,6 +206,10 @@ class MemoryBlob:
         return SimpleNamespace(size=len(self.payload), readall=lambda: self.payload,
                                properties=SimpleNamespace(etag=str(self.version)))
 
+    def get_blob_properties(self):
+        from azure.core.exceptions import ResourceNotFoundError
+        raise ResourceNotFoundError("No workspace deletion marker")
+
 
 class StorageTests(unittest.TestCase):
     def test_manifest_compare_and_swap(self):

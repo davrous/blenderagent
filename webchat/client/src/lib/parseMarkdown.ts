@@ -44,6 +44,9 @@ export function buildChatTimeline(messages: readonly Message[], recoveredIds: re
 export function stripVideoJobBlocks(text: string): string {
   return text.replace(/```videojob\s*\n[\s\S]*?```/gi, "").replace(/```videojob\b[^]*$/i, "").trim();
 }
+export function stripWorkspaceTitleBlocks(text: string): string {
+  return text.replace(/```(?:workspacetitle|workspace-title)\s*\n[\s\S]*?```/gi, "").replace(/```(?:workspacetitle|workspace-title)\b[\s\S]*$/i, "").trim();
+}
 
 /** Heuristic: does this URL look like a downloadable Blender scene file? */
 export function isDownloadLink(href: string): boolean {

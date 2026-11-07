@@ -13,12 +13,14 @@ import {
   getSessionInfo,
   getConversationInfo,
   readConversationMessages,
+  deleteWorkspaceSandbox,
+  deleteWorkspaceConversation,
 } from "./sessions.js";
 import { attachVoiceRelay } from "./voice.js";
-import { MEDIA_PREFIX, browserKey, isUuid, mediaEnabled, ownedReferences, requireOrigin, signEnvelope } from "./mediaSecurity.js";
+import { MEDIA_PREFIX, browserKey, isUuid, mediaEnabled, ownedReferences, requireOrigin, signEnvelope, signWorkspaceDeletion } from "./mediaSecurity.js";
 import { registerMediaRoutes, requestScope } from "./videoJobs.js";
 import { parseMusicRequest } from "./music.js";
-import { archiveTurn, galleryEnabled, forgetConversationBinding, ownerFromCookie, persistBinding, registerWorkspace, registerWorkspaceRoutes, TurnArchiveCollector, workspaceHistory, workspaceRegistered, workspaceSceneExpected, recoverWorkspaceHistory, workspaceRecoveryWarning } from "./workspaces.js";
+import { archiveTurn, beginWorkspaceOperation, galleryEnabled, forgetConversationBinding, ownerFromCookie, persistBinding, readWorkspaceDeletionAck, registerWorkspace, registerWorkspaceRoutes, TurnArchiveCollector, workspaceHistory, workspaceRegistered, workspaceSceneExpected, recoverWorkspaceHistory, workspaceRecoveryWarning } from "./workspaces.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -258,6 +260,22 @@ async function buildUpstreamRequest(
   return { url, headers, payload, conversationId };
 }
 
+app.use(["/api/chat", "/api/reset", "/api/references", "/api/video-jobs"], async (req, res, next) => {
+  if (!galleryEnabled()) { next(); return; }
+  if (req.method !== "GET" && req.headers.origin !== new URL(config.clientOrigin).origin) {
+    res.status(403).json({ error: "Same-origin request required" }); return;
+  }
+  try {
+    const id = req.body?.conversation_id ?? req.query.conversation_id;
+    if (!isUuid(id)) throw new Error("conversation_id (UUID) is required");
+    const owner = ownerFromCookie(req.headers.cookie);
+    if (!owner) { res.status(403).json({ error: "Load the gallery first to establish verified browser ownership." }); return; }
+    await registerWorkspace(owner, id.toLowerCase());
+    const release = await beginWorkspaceOperation(id.toLowerCase());
+    res.once("finish", () => { void release().catch((error) => console.error("[workspaces] operation release failed", error)); });
+    next();
+  } catch (error) { res.status(409).json({ error: error instanceof Error ? error.message : "Workspace is unavailable." }); }
+});
 registerMediaRoutes(app, buildUpstreamRequest);
 registerWorkspaceRoutes(app, async (id) => {
   const session = getSessionInfo(id);
@@ -271,6 +289,18 @@ registerWorkspaceRoutes(app, async (id) => {
       await workspaceRecoveryWarning(id, "L'ancien historique n'a pas pu être récupéré automatiquement. Seuls les contenus encore accessibles sont importés.");
     }
   }
+}, {
+  sandbox: async (id, binding, scope) => {
+    if (config.mode === "foundry") { await deleteWorkspaceSandbox(id, binding); return; }
+    const input = signWorkspaceDeletion(config.mediaControlSecret, scope, id);
+    const upstream = await buildUpstreamRequest({ conversation_id: id }, input, true);
+    upstream.payload.stream = false;
+    const response = await fetch(upstream.url, {
+      method: "POST", headers: upstream.headers, body: JSON.stringify(upstream.payload), signal: AbortSignal.timeout(30_000),
+    });
+    await readWorkspaceDeletionAck(response, id);
+  },
+  conversation: deleteWorkspaceConversation,
 });
 
 app.post("/api/chat", requireOrigin(config.clientOrigin), async (req, res) => {

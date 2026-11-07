@@ -157,6 +157,25 @@ class SceneManager:
 
     # ── Public read-only accessors ──
 
+    def delete_workspace_scene(self, conversation_id: str) -> None:
+        """Remove one local checkpoint while the caller holds the scene lock."""
+        from uuid import UUID
+
+        UUID(conversation_id)
+        checkpoint = _conversation_scene_file(conversation_id)
+        paths = [checkpoint, checkpoint + ".tmp", checkpoint + "1"]
+        state = _read_session_state()
+        if state.get("last_conversation_id") == conversation_id:
+            paths.extend([_SCENE_FILE, _SCENE_FILE + ".tmp", _SCENE_FILE + "1"])
+            _write_session_state({"last_conversation_id": None, "needs_scene_reload": False})
+            if _read_session_state().get("last_conversation_id") == conversation_id:
+                raise RuntimeError("Could not clear the deleted workspace's local scene ownership.")
+            self._new_scene = True
+            self._active_epoch = None
+        for path in paths:
+            Path(path).unlink(missing_ok=True)
+        logger.info("Deleted local scene checkpoint for workspace %s.", conversation_id)
+
     @property
     def new_scene(self) -> bool:
         """True if this is the very first boot of the container (no scene to restore)."""
@@ -219,6 +238,9 @@ class SceneManager:
         ``conversation_id`` is used to detect a Reset (id change) and for
         logging/diagnostics.
         """
+        workspace = workspace_scene.get()
+        if workspace:
+            _archive_storage().assert_workspace_active(workspace[0])
         last = _read_session_state().get("last_conversation_id")
         archived = _conversation_scene_file(conversation_id) if conversation_id else None
         if isinstance(last, str) and last and conversation_id and last != conversation_id and os.path.exists(_SCENE_FILE):
@@ -294,6 +316,9 @@ class SceneManager:
             "save_scene called (conversation=%s, target=%s)",
             conversation_id, _SCENE_FILE,
         )
+        workspace = workspace_scene.get()
+        if workspace:
+            _archive_storage().assert_workspace_active(workspace[0])
 
         # ── Crash-corruption guard ──
         # If Blender's connection epoch has bumped since we activated the

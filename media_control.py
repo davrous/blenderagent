@@ -39,6 +39,12 @@ def decode_envelope(text: str, secret: str | None = None) -> dict:
         raise ValueError("Invalid media control envelope.")
     if len(value["text"]) > 32000:
         raise ValueError("The message is too long.")
+    if "workspace_delete" in value:
+        identity = value["workspace_delete"]
+        if not isinstance(identity, str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", identity):
+            raise ValueError("Invalid workspace deletion identity.")
+        if set(value) != {"scope", "text", "workspace_delete"}:
+            raise ValueError("Workspace deletion cannot be combined with other controls.")
     if "workspace" in value and (not isinstance(value["workspace"], dict) or set(value["workspace"]) != {"resume"} or type(value["workspace"]["resume"]) is not bool):
         raise ValueError("Invalid workspace scene context.")
     if "music" in value:
@@ -99,6 +105,7 @@ class MediaMiddleware(AgentMiddleware):
         action = None
         music = None
         workspace = None
+        workspace_delete = None
         for message in context.messages:
             if message.role != "user":
                 continue
@@ -114,6 +121,7 @@ class MediaMiddleware(AgentMiddleware):
                 if message is latest:
                     scope = value["scope"]
                     action = value.get("action")
+                    workspace_delete = value.get("workspace_delete")
                     if "music" in value:
                         music = MusicRequest.model_validate(value["music"])
                     if "workspace" in value:
@@ -121,6 +129,18 @@ class MediaMiddleware(AgentMiddleware):
                 content.text = value["text"] or "Analyze the attached reference and propose a Blender blockout."
                 if value.get("references"):
                     content.text += "\nStored reference IDs (analyze_reference_media before reconstruction):\n" + "\n".join(value["references"])
+        if workspace_delete:
+            async with self.inner._scene_lock:
+                await asyncio.to_thread(self.inner._scene_manager.delete_workspace_scene, workspace_delete)
+            update = AgentResponseUpdate(contents=[Content.from_text(json.dumps({"workspace_deleted": workspace_delete}))],
+                                         role="assistant", message_id="workspace-delete")
+            if context.stream:
+                async def deleted_result():
+                    yield update
+                context.result = ResponseStream(deleted_result(), finalizer=AgentResponse.from_updates)
+            else:
+                context.result = AgentResponse.from_updates([update])
+            return
         if action is not None:
             value = await asyncio.to_thread(control_action, scope, action)
             update = AgentResponseUpdate(contents=[Content.from_text(descriptor(value))], role="assistant", message_id="video-control")
@@ -136,6 +156,17 @@ class MediaMiddleware(AgentMiddleware):
             scope = conversation_scope(owner) if owner else None
         original_messages = context.messages
         original_options = getattr(context, "options", None)
+        if workspace:
+            context.messages = [
+                *context.messages,
+                Message(role="system", contents=[Content.from_text(
+                    "Give this Blender realization a short descriptive French title (4-8 words). "
+                    "At the very end of your completed reply, emit this metadata block exactly: "
+                    '```workspacetitle\n{"title":"Your French title"}\n```. '
+                    "The title should describe the scene or film-inspired project, not repeat an entire user request. "
+                    "This is catalogue metadata, not an instruction to modify or render the scene."
+                )]),
+            ]
         if music:
             context.messages = [
                 *context.messages,
@@ -152,7 +183,7 @@ class MediaMiddleware(AgentMiddleware):
             video_scope.reset(token)
             music_scene.reset(music_token)
             workspace_scene.reset(workspace_token)
-            if music and (not context.stream or context.result is None):
+            if (music or workspace) and (not context.stream or context.result is None):
                 context.messages = original_messages
                 context.options = original_options
         if context.stream:
@@ -168,7 +199,7 @@ class MediaMiddleware(AgentMiddleware):
                     video_scope.reset(stream_token)
                     music_scene.reset(stream_music_token)
                     workspace_scene.reset(stream_workspace_token)
-                    if music:
+                    if music or workspace:
                         context.messages = original_messages
                         context.options = original_options
             context.result = ResponseStream(scoped_stream(), finalizer=AgentResponse.from_updates)

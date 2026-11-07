@@ -18,6 +18,10 @@ from music import archive_music_audio, pcm_to_wav
 class MemoryScenes:
     def __init__(self):
         self.files = {}
+        self.deleted = set()
+    def assert_workspace_active(self, scope):
+        if scope in self.deleted:
+            raise RuntimeError("Workspace was deleted")
     def upload_file(self, name, path, _type):
         self.files[name] = Path(path).read_bytes()
     def download(self, name, path):
@@ -101,6 +105,43 @@ class WorkspaceSceneTests(unittest.TestCase):
         self.manager.save_scene("local-b")
         self.manager.activate_scene("local-a")
         self.assertEqual(self.current, {"local": 1})
+
+    def test_delete_checkpoint_preserves_other_workspace_and_active_scene(self):
+        first = "af43df8a-6e27-48b4-9647-18ad8c9b0f3a"
+        second = "abaf4754-c434-4c5c-a2e4-e8f7774e7312"
+        self.manager.activate_scene(first)
+        self.current["cube"] = "red"
+        self.manager.save_scene(first)
+        self.manager.activate_scene(second)
+        self.current.clear()
+        self.current["sphere"] = "blue"
+        self.manager.save_scene(second)
+        primary = Path(sm._SCENE_FILE).read_bytes()
+        self.manager.delete_workspace_scene(first)
+        self.assertFalse(Path(sm._conversation_scene_file(first)).exists())
+        self.assertTrue(Path(sm._conversation_scene_file(second)).exists())
+        self.assertEqual(Path(sm._SCENE_FILE).read_bytes(), primary)
+        self.assertEqual(sm._read_session_state()["last_conversation_id"], second)
+        self.manager.delete_workspace_scene(second)
+        self.assertFalse(Path(sm._SCENE_FILE).exists())
+        self.assertIsNone(sm._read_session_state()["last_conversation_id"])
+        self.assertTrue(self.manager.new_scene)
+        self.manager.delete_workspace_scene(second)
+
+    def test_delete_invalid_identity_leaves_files_untouched(self):
+        self.manager.activate_scene("local-work")
+        self.manager.save_scene("local-work")
+        with self.assertRaises(ValueError):
+            self.manager.delete_workspace_scene("../scene")
+        self.assertTrue(Path(sm._SCENE_FILE).exists())
+
+    def test_deleted_workspace_cannot_activate_or_save(self):
+        sm._workspace_storage.deleted.add("a" * 32)
+        with self.assertRaisesRegex(RuntimeError, "deleted"):
+            self.use("workspace-a", "a" * 32, False)
+        with self.assertRaisesRegex(RuntimeError, "deleted"):
+            self.save("workspace-a", "a" * 32)
+        self.assertFalse(Path(sm._SCENE_FILE).exists())
 
     def test_load_error_does_not_reset_the_saved_work(self):
         reset = Mock()

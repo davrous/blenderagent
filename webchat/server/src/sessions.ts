@@ -1,6 +1,6 @@
 import { config } from "./config.js";
 import { getBearerToken } from "./auth.js";
-import { persistBinding, storedBinding, workspaceHistory } from "./workspaces.js";
+import { persistBinding, storedBinding, workspaceHistory, type WorkspaceBinding } from "./workspaces.js";
 
 /**
  * Foundry hosted-agent session manager.
@@ -321,6 +321,45 @@ export async function deleteSession(conversationId: string): Promise<void> {
       `[sessions] Delete returned ${res.status}: ${text.slice(0, 500)}`,
     );
   }
+
+}
+
+export async function deleteWorkspaceSandbox(conversationId: string, binding: WorkspaceBinding): Promise<void> {
+  if (config.mode !== "foundry" || !binding.agentSessionId) return;
+  const token = await ensureToken();
+  const response = await fetch(withApiVersion(`${config.foundryAgentBase}/endpoint/sessions/${encodeURIComponent(binding.agentSessionId)}`), {
+    method: "DELETE", headers: { ...buildHeaders(token), "x-session-isolation-key": conversationId },
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok && response.status !== 404 && response.status !== 410) throw new Error(`Foundry sandbox cleanup failed (${response.status}).`);
+  evictSession(conversationId);
+}
+
+export async function deleteWorkspaceConversation(binding: WorkspaceBinding): Promise<void> {
+  if (config.mode !== "foundry" || !binding.foundryConversationId) return;
+  const token = await ensureToken();
+  const base = `${config.foundryAgentBase}/endpoint/protocols/openai/conversations/${encodeURIComponent(binding.foundryConversationId)}`;
+  for (let page = 0; page < 100; page++) {
+    const list = await fetch(withApiVersion(`${base}/items?limit=100`), { headers: buildHeaders(token), signal: AbortSignal.timeout(30_000) });
+    if (list.status === 404 || list.status === 410) break;
+    if (!list.ok) throw new Error(`Foundry transcript enumeration failed (${list.status}).`);
+    const body = await list.json();
+    if (!Array.isArray(body.data)) throw new Error("Invalid Foundry transcript item list.");
+    if (!body.data.length) break;
+    for (const item of body.data) {
+      if (typeof item.id !== "string" || !/^[A-Za-z0-9_-]{1,256}$/.test(item.id)) throw new Error("Invalid Foundry transcript item identity.");
+      const result = await fetch(withApiVersion(`${base}/items/${encodeURIComponent(item.id)}`), {
+        method: "DELETE", headers: buildHeaders(token), signal: AbortSignal.timeout(30_000),
+      });
+      if (!result.ok && result.status !== 404 && result.status !== 410) throw new Error(`Foundry transcript item cleanup failed (${result.status}).`);
+    }
+    if (page === 99) throw new Error("Foundry transcript cleanup requires another retry.");
+  }
+  const response = await fetch(withApiVersion(base), {
+    method: "DELETE", headers: buildHeaders(token), signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok && response.status !== 404 && response.status !== 410) throw new Error(`Foundry transcript cleanup failed (${response.status}).`);
+  for (const [id, value] of conversationCache) if (value === binding.foundryConversationId) evictConversation(id);
 }
 
 export function getSessionInfo(conversationId: string): SessionCacheEntry | null {

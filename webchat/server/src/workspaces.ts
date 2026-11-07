@@ -3,7 +3,7 @@ import { BlobServiceClient, BlobSASPermissions, SASProtocol, generateBlobSASQuer
 import { DefaultAzureCredential } from "@azure/identity";
 import type { Express, Request, Response } from "express";
 import { config } from "./config.js";
-import { browserKey, isUuid, JOB_ID_RE, mediaEnabled, readBrowserKey, requireOrigin } from "./mediaSecurity.js";
+import { browserKey, isUuid, JOB_ID_RE, mediaEnabled, readBrowserKey, requireOrigin, scopeFor } from "./mediaSecurity.js";
 
 export interface WorkspaceBinding {
   agentSessionId?: string;
@@ -47,11 +47,29 @@ export interface Workspace {
   previous_response_id: string | null;
   scene_expected?: boolean;
   recovery_note?: string;
+  media_scope?: string;
+  title_source?: "model" | "manual";
+  active_operations?: string[];
+}
+export interface WorkspaceDeletion {
+  id: string;
+  deleted_at: number;
+  deletion: {
+    scope: string;
+    binding: WorkspaceBinding;
+    pending_blobs: Array<{ name: string; etag: string }>;
+    sandbox_pending: boolean;
+    conversation_pending: boolean;
+    error?: string;
+    complete?: boolean;
+  };
 }
 export interface ArchiveStorage {
   read(name: string): Promise<{ value: unknown; etag: string } | null>;
   write(name: string, value: unknown, etag?: string): Promise<void>;
   url(blob: string): Promise<string>;
+  list(prefix: string): Promise<Array<{ name: string; etag: string; leased?: boolean }>>;
+  remove(name: string, etag: string): Promise<void>;
 }
 interface WorkspaceSummary {
   id: string;
@@ -60,6 +78,8 @@ interface WorkspaceSummary {
   updated_at: number;
   resource_count: number;
   thumbnail_blob?: string;
+  deletion_pending?: boolean;
+  deletion_error?: string;
 }
 
 function statusCode(error: unknown): number | undefined {
@@ -116,6 +136,20 @@ class BlobArchiveStorage implements ArchiveStorage {
     }, this.delegation, config.storageAccountName).toString();
     return `https://${config.storageAccountName}.blob.core.windows.net/screenshots/${blob.split("/").map(encodeURIComponent).join("/")}?${sas}`;
   }
+  async list(prefix: string): Promise<Array<{ name: string; etag: string; leased?: boolean }>> {
+    await this.ensurePrivate();
+    const entries = [];
+    for await (const blob of this.container.listBlobsFlat({ prefix })) {
+      if (!blob.properties.etag) throw new Error("Artifact is missing its version.");
+      entries.push({ name: blob.name, etag: blob.properties.etag, leased: blob.properties.leaseStatus === "locked" });
+      if (entries.length > 10_000) throw new Error("Too many artifacts for safe workspace deletion.");
+    }
+    return entries;
+  }
+  async remove(name: string, etag: string): Promise<void> {
+    await this.ensurePrivate();
+    await this.container.getBlobClient(name).deleteIfExists({ conditions: { ifMatch: etag }, deleteSnapshots: "include" });
+  }
 }
 
 export function galleryEnabled(): boolean {
@@ -127,11 +161,18 @@ export function workspaceOwner(key: string): string {
 export function ownerFromCookie(cookie: string | undefined): string | undefined {
   if (!galleryEnabled()) return undefined;
   const key = readBrowserKey(cookie, config.mediaControlSecret);
-  return key ? workspaceOwner(key) : undefined;
+  if (!key) return undefined;
+  const owner = workspaceOwner(key);
+  browserKeys.set(owner, key);
+  return owner;
 }
 function requestOwner(req: Request, res: Response): string {
-  return workspaceOwner(browserKey(req, res, config.mediaControlSecret, new URL(config.clientOrigin).protocol === "https:"));
+  const key = browserKey(req, res, config.mediaControlSecret, new URL(config.clientOrigin).protocol === "https:");
+  const owner = workspaceOwner(key);
+  browserKeys.set(owner, key);
+  return owner;
 }
+const browserKeys = new Map<string, string>();
 
 function recordPath(owner: string, id: string): string {
   if (!/^[a-f0-9]{64}$/.test(owner) || !isUuid(id)) throw new Error("Invalid workspace identity.");
@@ -161,7 +202,28 @@ function validResource(value: unknown): value is WorkspaceResource {
     && /^[A-Za-z0-9_./-]{1,512}$/.test(value.blob) && !value.blob.split("/").some((part) => ["", ".", ".."].includes(part))
     && "created_at" in value && typeof value.created_at === "number" && Number.isFinite(value.created_at);
 }
-
+function isDeletion(value: unknown): value is WorkspaceDeletion {
+  return !!value && typeof value === "object" && "deleted_at" in value && "deletion" in value;
+}
+export function workspaceTitle(text: string): string | undefined {
+  for (const block of text.matchAll(/```(?:workspacetitle|workspace-title)\s*\n([\s\S]*?)```/gi)) {
+    try { return normalizeTitle(JSON.parse(block[1]).title); } catch {}
+  }
+  return undefined;
+}
+export function stripWorkspaceTitle(text: string): string {
+  return text.replace(/```(?:workspacetitle|workspace-title)\s*\n[\s\S]*?```/gi, "").replace(/```(?:workspacetitle|workspace-title)\b[\s\S]*$/i, "").trim();
+}
+function normalizeTitle(value: unknown): string {
+  if (typeof value !== "string") throw new Error("A title is required.");
+  const title = value.trim().replace(/\s+/g, " ");
+  if (!title || title.length > 90 || /[\u0000-\u001f\u007f]/.test(title)) throw new Error("Use a title of 1 to 90 characters.");
+  return title;
+}
+const DELETABLE_STATES = new Set(["completed", "failed", "cancelled", "awaiting_render_approval", "awaiting_seedance_approval"]);
+function ownedArtifact(name: string, scope: string): boolean {
+  return new RegExp(`^(references/${scope}/[a-f0-9]{32}\\.(png|jpg|webp|mp4)|music-audio/${scope}/[a-f0-9]{32}\\.wav|workspace-scenes/${scope}/scene\\.blend|workspace-artifacts/${scope}/[A-Za-z0-9_-]+\\.(png|jpg|webp|blend|glb)|video-jobs/${scope}/[a-f0-9]{32}\\.json(?:\\.lock)?|videos/${scope}/[a-f0-9]{32}/[A-Za-z0-9_-]+\\.(png|mp4|blend))$`).test(name);
+}
 export class WorkspaceArchive {
   constructor(private storage: ArchiveStorage) {}
 
@@ -184,6 +246,7 @@ export class WorkspaceArchive {
   async get(owner: string, id: string): Promise<Workspace | null> {
     const stored = await this.storage.read(recordPath(owner, id));
     if (!stored) return null;
+    if (isDeletion(stored.value)) throw new Error("This workspace was permanently deleted.");
     if (!validWorkspace(stored.value, id)) throw new Error("Invalid stored workspace.");
     return stored.value;
   }
@@ -191,6 +254,7 @@ export class WorkspaceArchive {
     for (let attempt = 0; attempt < 4; attempt++) {
       const path = recordPath(owner, id);
       const stored = await this.storage.read(path);
+      if (stored && isDeletion(stored.value)) throw new Error("This workspace was permanently deleted.");
       if (stored && !validWorkspace(stored.value, id)) throw new Error("Invalid stored workspace.");
       const workspace: Workspace = stored && validWorkspace(stored.value, id) ? stored.value : {
         id, title: "Nouvelle scène", created_at: Date.now(), updated_at: Date.now(),
@@ -231,7 +295,17 @@ export class WorkspaceArchive {
     const stored = await this.storage.read(`webchat-workspaces/${owner}/index.json`);
     if (stored && !Array.isArray(stored.value)) throw new Error("Invalid workspace index.");
     const entries: WorkspaceSummary[] = Array.isArray(stored?.value) ? stored.value : [];
-    return Promise.all(entries.map(async (entry) => ({
+    const live = [];
+    for (const entry of entries) {
+      const record = await this.storage.read(recordPath(owner, entry.id));
+      if (record && !isDeletion(record.value)) live.push(entry);
+      else if (record && isDeletion(record.value) && !record.value.deletion.complete) live.push({
+        ...entry, thumbnail_blob: undefined, resource_count: 0,
+        deletion_pending: true, deletion_error: record.value.deletion.error,
+      });
+    }
+    return Promise.all(live.map(async (entry) => ({
+      ...(entry.deletion_pending ? { deletion_pending: true, deletion_error: entry.deletion_error } : {}),
       id: entry.id, title: entry.title, created_at: entry.created_at, updated_at: entry.updated_at,
       resource_count: entry.resource_count,
       ...(entry.thumbnail_blob ? { thumbnail_url: await this.storage.url(entry.thumbnail_blob) } : {}),
@@ -257,14 +331,14 @@ export class WorkspaceArchive {
     };
   }
   async turn(owner: string, id: string, turn: WorkspaceTurn, replyId: string | null, sceneExpected = false): Promise<void> {
+    const title = turn.status === "done" ? workspaceTitle(turn.assistant) : undefined;
+    turn = { ...turn, assistant: stripWorkspaceTitle(turn.assistant) };
     await this.update(owner, id, (workspace) => {
       if (!workspace.turns.some((entry) => entry.id === turn.id)) workspace.turns.push(turn);
       workspace.previous_response_id = replyId;
       if (sceneExpected) workspace.scene_expected = true;
-      if (workspace.title === "Nouvelle scène" && turn.user.trim()) workspace.title = turn.user.trim().slice(0, 90);
+      if (title && !workspace.title_source) { workspace.title = title; workspace.title_source = "model"; }
       collectResources(workspace, turn.assistant, turn.created_at);
-      const movie = turn.user.startsWith("Extrait musical") ? /\*\*([^*\n]+)\*\*/.exec(turn.assistant)?.[1] : null;
-      if (movie && workspace.title.startsWith("Extrait musical")) workspace.title = movie.slice(0, 90);
       if (turn.audio_blob) addResource(workspace, turn.audio_blob, turn.created_at);
     });
   }
@@ -281,6 +355,125 @@ export class WorkspaceArchive {
     const blob = archiveBlobName(url);
     if (!blob) throw new Error("The musical audio does not belong to the configured artifact store.");
     await this.update(owner, id, (workspace) => addResource(workspace, blob, Date.now()));
+  }
+  async rename(owner: string, id: string, title: unknown): Promise<void> {
+    const normalized = normalizeTitle(title);
+    if (!await this.get(owner, id)) throw new Error("This workspace is not available for this browser.");
+    await this.claim(owner, id);
+    await this.update(owner, id, (workspace) => { workspace.title = normalized; workspace.title_source = "manual"; });
+  }
+  async beginOperation(owner: string, id: string): Promise<() => Promise<void>> {
+    const token = randomUUID();
+    await this.update(owner, id, (workspace) => { (workspace.active_operations ??= []).push(token); });
+    return async () => {
+      await this.update(owner, id, (workspace) => {
+        workspace.active_operations = workspace.active_operations?.filter((entry) => entry !== token);
+      });
+    };
+  }
+  private async saveDeletion(owner: string, id: string, change: (record: WorkspaceDeletion) => void): Promise<WorkspaceDeletion> {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const stored = await this.storage.read(recordPath(owner, id));
+      if (!stored || !isDeletion(stored.value)) throw new Error("Missing workspace deletion record.");
+      change(stored.value);
+      try { await this.storage.write(recordPath(owner, id), stored.value, stored.etag); return stored.value; }
+      catch (error) { if (![409, 412].includes(statusCode(error) ?? 0) || attempt === 3) throw error; }
+    }
+    throw new Error("Deletion changed concurrently. Retry deletion.");
+  }
+  private async removeIndex(owner: string, id: string): Promise<void> {
+    const path = `webchat-workspaces/${owner}/index.json`;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const stored = await this.storage.read(path);
+      if (!stored) return;
+      if (!Array.isArray(stored.value)) throw new Error("Invalid workspace index.");
+      const entries = stored.value.filter((entry: WorkspaceSummary) => entry.id !== id);
+      try { await this.storage.write(path, entries, stored.etag); return; }
+      catch (error) { if (![409, 412].includes(statusCode(error) ?? 0) || attempt === 3) throw error; }
+    }
+  }
+  async delete(owner: string, id: string, scope: string, confirm: unknown, cleanup: {
+    sandbox: (id: string, binding: WorkspaceBinding, scope: string) => Promise<void>;
+    conversation: (binding: WorkspaceBinding) => Promise<void>;
+  }): Promise<void> {
+    if (confirm !== true) throw new Error("Permanent deletion requires confirm: true.");
+    if (!JOB_ID_RE.test(scope)) throw new Error("Invalid workspace media scope.");
+    await this.claim(owner, id);
+    let stored = await this.storage.read(recordPath(owner, id));
+    if (!stored) throw new Error("This workspace is not available for this browser.");
+    if (!isDeletion(stored.value)) {
+      if (!validWorkspace(stored.value, id)) throw new Error("Invalid stored workspace.");
+      const workspace = stored.value;
+      if (workspace.media_scope && workspace.media_scope !== scope) throw new Error("Workspace media scope does not match its verified owner.");
+      if (workspace.active_operations?.length) throw new Error("A workspace operation is still active. Wait for it to finish before deleting.");
+      const artifacts = (await Promise.all(["references", "music-audio", "workspace-scenes", "workspace-artifacts", "video-jobs", "videos"]
+        .map((prefix) => this.storage.list(`${prefix}/${scope}/`)))).flat();
+      if (artifacts.some((entry) => !ownedArtifact(entry.name, scope) && entry.name !== `workspace-scenes/${scope}/deleted.json`)) {
+        throw new Error("Unrecognized workspace artifacts prevent safe deletion.");
+      }
+      const manifests = artifacts.filter((entry) => entry.name.startsWith(`video-jobs/${scope}/`) && entry.name.endsWith(".json"));
+      if (artifacts.some((entry) => entry.leased)) throw new Error("An artifact or video worker is still active. Deletion is blocked.");
+      for (const jobId of workspace.job_ids) {
+        if (!manifests.some((entry) => entry.name === `video-jobs/${scope}/${jobId}.json`)) throw new Error("A video job cannot be verified. Deletion is blocked.");
+      }
+      for (const manifest of manifests) {
+        const job = await this.storage.read(manifest.name);
+        const value = job?.value as Record<string, unknown> | undefined;
+        if (!job || job.etag !== manifest.etag || !value || value.scope !== scope || manifest.name !== `video-jobs/${scope}/${value.id}.json`
+          || !DELETABLE_STATES.has(String(value.state)) || value.state !== "completed" && (value.prediction_id || value.approval)) {
+          throw new Error("A rendering, active, ambiguous or unverifiable paid job prevents deletion.");
+        }
+      }
+      const shared = new Set<string>();
+      const records = await this.storage.list("webchat-workspaces/");
+      for (const entry of records.filter((entry) => /^webchat-workspaces\/[a-f0-9]{64}\/[a-f0-9-]{36}\.json$/.test(entry.name) && entry.name !== recordPath(owner, id))) {
+        const record = await this.storage.read(entry.name);
+        if (!record || isDeletion(record.value)) continue;
+        const other = record.value as Workspace;
+        if (!validWorkspace(other, other.id)) throw new Error("Another workspace cannot be checked for shared resources.");
+        if ((workspace.binding.agentSessionId && other.binding.agentSessionId === workspace.binding.agentSessionId)
+          || (workspace.binding.foundryConversationId && other.binding.foundryConversationId === workspace.binding.foundryConversationId)
+          || other.media_scope === scope) throw new Error("A shared sandbox, conversation or media scope prevents deletion.");
+        other.resources.forEach((resource) => shared.add(resource.blob));
+        other.turns.forEach((turn) => { if (turn.audio_blob) shared.add(turn.audio_blob); });
+      }
+      const record: WorkspaceDeletion = { id, deleted_at: Date.now(), deletion: {
+        scope, binding: workspace.binding, pending_blobs: artifacts.filter((entry) => ownedArtifact(entry.name, scope) && !shared.has(entry.name)),
+        sandbox_pending: config.mode === "local" || !!workspace.binding.agentSessionId, conversation_pending: !!workspace.binding.foundryConversationId,
+      } };
+      await this.storage.write(recordPath(owner, id), record, stored.etag);
+      stored = await this.storage.read(recordPath(owner, id));
+    }
+    if (!stored || !isDeletion(stored.value) || stored.value.deletion.scope !== scope) throw new Error("Invalid workspace deletion scope.");
+    const record = stored.value;
+    if (record.deletion.complete) return;
+    try {
+      const marker = `workspace-scenes/${scope}/deleted.json`;
+      const existingMarker = await this.storage.read(marker);
+      if (!existingMarker) await this.storage.write(marker, { id, deleted_at: record.deleted_at });
+      else if (!existingMarker.value || typeof existingMarker.value !== "object" || !("id" in existingMarker.value) || existingMarker.value.id !== id) {
+        throw new Error("The durable deletion marker does not match this workspace.");
+      }
+      if (record.deletion.sandbox_pending) {
+        await cleanup.sandbox(id, record.deletion.binding, scope);
+        await this.saveDeletion(owner, id, (current) => { current.deletion.sandbox_pending = false; });
+      }
+      if (record.deletion.conversation_pending) {
+        await cleanup.conversation(record.deletion.binding);
+        await this.saveDeletion(owner, id, (current) => { current.deletion.conversation_pending = false; });
+      }
+      for (const blob of record.deletion.pending_blobs) {
+        await this.storage.remove(blob.name, blob.etag);
+        await this.saveDeletion(owner, id, (current) => { current.deletion.pending_blobs = current.deletion.pending_blobs.filter((entry) => entry.name !== blob.name); });
+      }
+      await this.removeIndex(owner, id);
+      await this.saveDeletion(owner, id, (current) => {
+        current.deletion.complete = true; delete current.deletion.error; current.deletion.binding = {};
+      });
+    } catch (error) {
+      await this.saveDeletion(owner, id, (current) => { current.deletion.error = error instanceof Error ? error.message : "Cleanup failed."; });
+      throw new Error("Deletion is recorded, but cleanup failed. Retry deletion to finish removing files and the sandbox.");
+    }
   }
 }
 
@@ -326,12 +519,24 @@ export function getWorkspaceArchive(): WorkspaceArchive {
 }
 export async function registerWorkspace(owner: string | undefined, id: string): Promise<void> {
   if (!owner) return;
+  id = id.toLowerCase();
   if (owners.has(id) && owners.get(id) !== owner) throw new Error("This workspace belongs to another browser.");
   await getWorkspaceArchive().claim(owner, id);
-  await getWorkspaceArchive().update(owner, id, () => {});
+  const key = browserKeys.get(owner);
+  await getWorkspaceArchive().update(owner, id, (workspace) => {
+    if (key) {
+      const scope = scopeFor(key, id);
+      if (workspace.media_scope && workspace.media_scope !== scope) throw new Error("Invalid workspace media ownership.");
+      workspace.media_scope = scope;
+    }
+  });
   owners.set(id, owner);
 }
 export function workspaceRegistered(id: string): boolean { return owners.has(id); }
+export async function beginWorkspaceOperation(id: string): Promise<() => Promise<void>> {
+  const owner = owners.get(id);
+  return owner ? getWorkspaceArchive().beginOperation(owner, id) : async () => {};
+}
 export async function workspaceHistory(id: string): Promise<Array<{ role: "user" | "assistant"; content: string }>> {
   const owner = owners.get(id);
   const workspace = owner ? await getWorkspaceArchive().get(owner, id) : null;
@@ -368,9 +573,10 @@ export async function recoverWorkspaceHistory(id: string, messages: Array<{ role
     const save = () => {
       if (!user && !assistant) return;
       const createdAt = workspace.created_at;
-      workspace.turns.push({ id: randomUUID(), user, assistant, status: assistant ? "done" : "error", created_at: createdAt });
-      collectResources(workspace, assistant, createdAt);
-      if (workspace.title === "Nouvelle scène") workspace.title = user.slice(0, 90) || "Ancienne réalisation";
+      workspace.turns.push({ id: randomUUID(), user, assistant: stripWorkspaceTitle(assistant), status: assistant ? "done" : "error", created_at: createdAt });
+      collectResources(workspace, stripWorkspaceTitle(assistant), createdAt);
+      const title = workspaceTitle(assistant);
+      if (title && !workspace.title_source) { workspace.title = title; workspace.title_source = "model"; }
     };
     for (const message of messages) {
       if (message.role === "user") {
@@ -430,14 +636,41 @@ export class TurnArchiveCollector {
   }
 }
 
-export function registerWorkspaceRoutes(app: Express, onRegister?: (id: string) => Promise<void>): void {
+export async function readWorkspaceDeletionAck(response: globalThis.Response, id: string): Promise<void> {
+  if (!response.ok || !response.body) throw new Error(`Local workspace cleanup failed (${response.status}).`);
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > 1024 * 1024) throw new Error("Local workspace cleanup response is too large.");
+      chunks.push(Buffer.from(value));
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    if (body.error || body.status === "failed" || body.status === "incomplete") throw new Error("Local workspace cleanup failed.");
+    const text = typeof body.output_text === "string" ? body.output_text : Array.isArray(body.output)
+      ? body.output.flatMap((item: { content?: Array<{ text?: unknown }> }) => item.content ?? [])
+        .filter((item: { text?: unknown }) => typeof item.text === "string").map((item: { text: string }) => item.text).join("") : "";
+    const ack = body.workspace_deleted ? body : text ? JSON.parse(text) : null;
+    if (!ack || Object.keys(ack).length !== 1 || ack.workspace_deleted !== id) throw new Error("Local workspace cleanup did not return its exact acknowledgment.");
+  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+}
+
+export function registerWorkspaceRoutes(app: Express, onRegister?: (id: string) => Promise<void>, cleanup?: {
+  sandbox: (id: string, binding: WorkspaceBinding, scope: string) => Promise<void>;
+  conversation: (binding: WorkspaceBinding) => Promise<void>;
+}, suppliedArchive?: WorkspaceArchive): void {
+  const archive = () => suppliedArchive ?? getWorkspaceArchive();
   app.use("/api/workspaces", (_req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     if (!galleryEnabled()) { res.status(503).json({ error: "Galerie indisponible : configurez le stockage privé et MEDIA_CONTROL_SECRET." }); return; }
     next();
   });
   app.get("/api/workspaces", async (req, res) => {
-    try { res.json(await getWorkspaceArchive().list(requestOwner(req, res))); }
+    try { res.json(await archive().list(requestOwner(req, res))); }
     catch (error) { console.error("[workspaces] list failed", error); res.status(502).json({ error: error instanceof Error ? error.message : "Gallery failed" }); }
   });
   app.post("/api/workspaces", requireOrigin(config.clientOrigin), async (req, res) => {
@@ -456,9 +689,31 @@ export function registerWorkspaceRoutes(app: Express, onRegister?: (id: string) 
       const id = String(req.params.id).toLowerCase();
       if (!isUuid(id)) throw new Error("Invalid conversation ID.");
       const owner = requestOwner(req, res);
-      const result = await getWorkspaceArchive().detail(owner, id);
+      const result = await archive().detail(owner, id);
       owners.set(id, owner);
       res.json(result);
     } catch (error) { console.error("[workspaces] read failed", error); res.status(404).json({ error: error instanceof Error ? error.message : "Workspace unavailable" }); }
+  });
+  app.post("/api/workspaces/:id/rename", requireOrigin(config.clientOrigin), async (req, res) => {
+    try {
+      const owner = ownerFromCookie(req.headers.cookie);
+      if (!owner) { res.status(403).json({ error: "Verified browser ownership is required." }); return; }
+      const id = String(req.params.id).toLowerCase();
+      if (!isUuid(id)) throw new Error("Invalid conversation ID.");
+      await archive().rename(owner, id, req.body?.title);
+      res.json({ ok: true });
+    } catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : "Rename failed." }); }
+  });
+  app.post("/api/workspaces/:id/delete", requireOrigin(config.clientOrigin), async (req, res) => {
+    try {
+      const owner = ownerFromCookie(req.headers.cookie);
+      const key = readBrowserKey(req.headers.cookie, config.mediaControlSecret);
+      if (!owner || !key) { res.status(403).json({ error: "Verified browser ownership is required." }); return; }
+      const id = String(req.params.id).toLowerCase();
+      if (!isUuid(id)) throw new Error("Invalid conversation ID.");
+      if (!cleanup) throw new Error("Workspace cleanup is unavailable.");
+      await archive().delete(owner, id, scopeFor(key, id), req.body?.confirm, cleanup);
+      res.json({ ok: true });
+    } catch (error) { res.status(409).json({ error: error instanceof Error ? error.message : "Deletion failed." }); }
   });
 }

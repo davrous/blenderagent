@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { config } from "./config.js";
 import { getBearerToken } from "./auth.js";
 import { voiceMediaContext } from "./mediaSecurity.js";
-import { archiveInputAudio, archiveTurn, ownerFromCookie, registerWorkspace, workspaceHistory, workspaceRegistered, workspaceSceneExpected } from "./workspaces.js";
+import { archiveInputAudio, archiveTurn, beginWorkspaceOperation, ownerFromCookie, registerWorkspace, workspaceHistory, workspaceRegistered, workspaceSceneExpected } from "./workspaces.js";
 import {
   appendConversationItems,
   getOrCreateConversation,
@@ -217,7 +217,7 @@ async function openUpstream(
   );
 }
 
-function relay(
+export function relay(
   browser: WebSocket,
   upstream: WebSocket,
   foundryAgentSessionId?: string,
@@ -225,6 +225,7 @@ function relay(
   mediaContext?: string,
   conversationId?: string,
   inlineHistory?: Array<{ role: "user" | "assistant"; content: string }>,
+  earlyFrames: Array<{ data: RawData; isBinary: boolean }> = [],
 ): void {
   const pending: Array<{ data: RawData; isBinary: boolean }> = [];
   const committedResponses = new Set<string>();
@@ -233,8 +234,23 @@ function relay(
   let inputAudio: string | undefined;
   let turnId = randomUUID();
   let upstreamOpen = false;
+  let pendingBytes = 0;
+  type WorkspaceOperation = Promise<() => Promise<void>>;
+  let activeOperation: WorkspaceOperation | undefined;
+  const operations = new Set<WorkspaceOperation>();
+  const committingOperations = new Set<WorkspaceOperation>();
+  const releaseOperation = async (operation: WorkspaceOperation | undefined) => {
+    if (!operation || !operations.delete(operation)) return;
+    committingOperations.delete(operation);
+    if (activeOperation === operation) activeOperation = undefined;
+    const release = await operation;
+    await release();
+  };
+  let forwarding = Promise.resolve();
+  let forwardingBytes = 0;
+  const ownsWorkspace = !!conversationId && workspaceRegistered(conversationId);
 
-  browser.on("message", (data: RawData, isBinary: boolean) => {
+  const forwardNow = (data: RawData, isBinary: boolean) => {
     if (!isBinary) {
       let frame: unknown;
       try {
@@ -245,7 +261,7 @@ function relay(
       if (frame && typeof frame === "object" && "mode" in frame && frame.mode === "music"
         && (!config.musicEnabled || !mediaContext)) {
         sendTo(browser, Buffer.from(JSON.stringify({ type: "error", message: "Music mode requires enabled, authenticated Webchat media controls." })), false);
-        return;
+        return false;
       }
     }
     const out = injectSession(
@@ -257,17 +273,70 @@ function relay(
       inlineHistory,
     );
     if (upstreamOpen) sendTo(upstream, out.data, out.isBinary);
-    else pending.push({ data: out.data, isBinary: out.isBinary });
-  });
+    else {
+      pendingBytes += Array.isArray(out.data)
+        ? out.data.reduce((sum, part) => sum + part.byteLength, 0) : out.data.byteLength;
+      if (pendingBytes > 4 * 1024 * 1024) {
+        sendTo(browser, Buffer.from(JSON.stringify({ type: "error", message: "Voice startup buffer exceeded its limit. Reconnect and try again." })), false);
+        safeClose(browser, 1000, "startup buffer limit");
+        safeClose(upstream, 1000, "startup buffer limit");
+        return false;
+      }
+      pending.push({ data: out.data, isBinary: out.isBinary });
+    }
+    return true;
+  };
+  const forward = (data: RawData, isBinary: boolean) => {
+    if (!ownsWorkspace || !conversationId) { forwardNow(data, isBinary); return; }
+    const size = Array.isArray(data) ? data.reduce((sum, part) => sum + part.byteLength, 0) : data.byteLength;
+    forwardingBytes += size;
+    if (forwardingBytes > 4 * 1024 * 1024) {
+      sendTo(browser, Buffer.from(JSON.stringify({ type: "error", message: "Voice workspace buffer exceeded its limit." })), false);
+      safeClose(browser, 1000, "workspace buffer limit");
+      safeClose(upstream, 1000, "workspace buffer limit");
+      return;
+    }
+    forwarding = forwarding.then(async () => {
+      forwardingBytes -= size;
+      if (browser.readyState !== WebSocket.OPEN) return;
+      let control: unknown;
+      if (!isBinary) {
+        try { control = JSON.parse(data.toString()); } catch { control = undefined; }
+      }
+      const type = control && typeof control === "object" && "type" in control ? control.type : undefined;
+      if (type === "start") {
+        const previous = activeOperation;
+        activeOperation = beginWorkspaceOperation(conversationId);
+        operations.add(activeOperation);
+        await activeOperation;
+        if (!previous || !committingOperations.has(previous)) await releaseOperation(previous);
+      }
+      const accepted = forwardNow(data, isBinary);
+      if ((type === "cancel" || !accepted) && (!activeOperation || !committingOperations.has(activeOperation))) {
+        await releaseOperation(activeOperation);
+      }
+    }).catch((error) => {
+      console.error("[voice] workspace operation failed:", error);
+      sendTo(browser, Buffer.from(JSON.stringify({ type: "error", message: "Impossible de verrouiller ou libérer cette réalisation pour l'enregistrement." })), false);
+      safeClose(browser, 1011, "workspace operation failed");
+      safeClose(upstream, 1011, "workspace operation failed");
+    });
+  };
+  browser.on("message", forward);
 
-  upstream.on("open", () => {
+  const connected = () => {
+    if (upstreamOpen) return;
     upstreamOpen = true;
     console.log("[voice] upstream connected");
     while (pending.length) {
       const m = pending.shift()!;
       sendTo(upstream, m.data, m.isBinary);
     }
-  });
+    pendingBytes = 0;
+    sendTo(browser, Buffer.from(JSON.stringify({ type: "relay_ready" })), false);
+  };
+  upstream.on("open", connected);
+  for (const frame of earlyFrames) forward(frame.data, frame.isBinary);
 
   upstream.on("message", (data: RawData, isBinary: boolean) => {
     // Surface agent-side error frames in the server log (they otherwise only
@@ -294,7 +363,22 @@ function relay(
         }
         if (obj?.type === "error") {
           console.error("[voice] agent error frame:", obj.message ?? text.slice(0, 400));
-          if (conversationId && finalTranscript) void archiveTurn(conversationId, finalTranscript, finalReply, null, "error", inputAudio, turnId).catch((error) => console.error("[voice] failed turn archive", error));
+          const failedOperation = activeOperation;
+          if (failedOperation) committingOperations.add(failedOperation);
+          void (async () => {
+            try {
+              if (conversationId && finalTranscript) await archiveTurn(conversationId, finalTranscript, finalReply, null, "error", inputAudio, turnId);
+            } catch (error) {
+              console.error("[voice] failed turn archive", error);
+              sendTo(browser, Buffer.from(JSON.stringify({ type: "archive.warning", message: "Ce tour en échec n'a pas pu être archivé." })), false);
+            } finally {
+              try { await releaseOperation(failedOperation); }
+              catch (error) {
+                console.error("[voice] failed operation release", error);
+                sendTo(browser, Buffer.from(JSON.stringify({ type: "archive.warning", message: "Le verrou de la réalisation reste bloqué." })), false);
+              }
+            }
+          })();
         }
         if (
           obj &&
@@ -314,6 +398,8 @@ function relay(
             typeof obj.reply === "string" ? obj.reply : "",
           );
           const completedTurn = { transcript: finalTranscript, reply: typeof obj.reply === "string" ? obj.reply : finalReply, audio: inputAudio, id: turnId };
+          const completedOperation = activeOperation;
+          if (completedOperation) committingOperations.add(completedOperation);
           void (async () => {
             if (requiresVoiceHistoryCommit(obj) && foundryConversationId) {
               try {
@@ -333,6 +419,12 @@ function relay(
               obj.archive_warning = "Ce tour n'a pas pu être sauvegardé dans la galerie. Gardez le travail ouvert.";
               console.error("[voice] workspace archive failed", error);
             }
+            try {
+              await releaseOperation(completedOperation);
+            } catch (error) {
+              obj.archive_warning = "Le verrou de la réalisation n'a pas pu être libéré. Sa suppression reste bloquée.";
+              console.error("[voice] workspace release failed", error);
+            }
             sendTo(browser, Buffer.from(JSON.stringify(obj)), false);
           })();
           return;
@@ -347,6 +439,10 @@ function relay(
   const closeBoth = (code?: number, reason?: string) => {
     safeClose(browser, code, reason);
     safeClose(upstream, code, reason);
+    for (const operation of operations) {
+      if (committingOperations.has(operation)) continue;
+      void releaseOperation(operation).catch((error) => console.error("[voice] operation cleanup failed:", error));
+    }
   };
 
   browser.on("close", (code, reason) => closeBoth(code, reason?.toString()));
@@ -369,9 +465,32 @@ function relay(
     );
     closeBoth(1011, "upstream error");
   });
+  if (upstream.readyState === WebSocket.OPEN) connected();
 }
 
-async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): Promise<void> {
+export async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): Promise<void> {
+  const earlyFrames: Array<{ data: RawData; isBinary: boolean }> = [];
+  let bufferedBytes = 0;
+  const buffer = (data: RawData, isBinary: boolean) => {
+    bufferedBytes += Array.isArray(data) ? data.reduce((sum, part) => sum + part.byteLength, 0) : data.byteLength;
+    if (bufferedBytes > 4 * 1024 * 1024) {
+      sendTo(browser, Buffer.from(JSON.stringify({ type: "error", message: "Voice startup buffer exceeded its limit. Reconnect and try again." })), false);
+      safeClose(browser, 1000, "startup buffer limit");
+      return;
+    }
+    earlyFrames.push({ data, isBinary });
+  };
+  browser.on("message", buffer);
+  const startupError = (error: Error) => {
+    console.error("[voice] browser startup error:", error.message);
+    safeClose(browser, 1011, "browser startup error");
+  };
+  browser.on("error", startupError);
+  browser.once("close", () => {
+    browser.off("message", buffer);
+    browser.off("error", startupError);
+    earlyFrames.length = 0;
+  });
   let conversationId: string | undefined;
   try {
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -435,6 +554,11 @@ async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): 
     }
   }
 
+  const mediaContext = req.headers.origin === new URL(config.clientOrigin).origin
+    ? voiceMediaContext(req.headers.cookie, conversationId, config.mediaControlSecret,
+      conversationId && workspaceRegistered(conversationId) ? { resume: await workspaceSceneExpected(conversationId) } : undefined)
+    : undefined;
+  const history = config.mode === "local" && conversationId ? await workspaceHistory(conversationId) : undefined;
   let upstream: WebSocket;
   try {
     console.log(
@@ -462,12 +586,10 @@ async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): 
     return;
   }
 
-  const mediaContext = req.headers.origin === new URL(config.clientOrigin).origin
-    ? voiceMediaContext(req.headers.cookie, conversationId, config.mediaControlSecret,
-      conversationId && workspaceRegistered(conversationId) ? { resume: await workspaceSceneExpected(conversationId) } : undefined)
-    : undefined;
-  const history = config.mode === "local" && conversationId ? await workspaceHistory(conversationId) : undefined;
-  relay(browser, upstream, foundryAgentSessionId, foundryConversationId, mediaContext, conversationId, history);
+  browser.off("message", buffer);
+  browser.off("error", startupError);
+  if (browser.readyState !== WebSocket.OPEN) { safeClose(upstream); return; }
+  relay(browser, upstream, foundryAgentSessionId, foundryConversationId, mediaContext, conversationId, history, earlyFrames);
 }
 
 /**
@@ -500,7 +622,11 @@ export function attachVoiceRelay(server: Server): void {
   });
 
   voiceWss.on("connection", (browser: WebSocket, req: IncomingMessage) => {
-    void handleVoiceConnection(browser, req);
+    void handleVoiceConnection(browser, req).catch((error) => {
+      console.error("[voice] workspace startup failed:", error);
+      sendTo(browser, Buffer.from(JSON.stringify({ type: "error", message: "Impossible de préparer la session vocale. Réessaie." })), false);
+      safeClose(browser, 1011, "voice startup failed");
+    });
   });
 
   console.log(

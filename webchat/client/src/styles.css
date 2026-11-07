@@ -49,7 +49,14 @@
 .workspace-heading p, .workspace-resources > p { color: var(--text-dim); }
 .workspace-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr)); gap: 18px; }
 .workspace-tile, .workspace-resource { display: flex; flex-direction: column; gap: 10px; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-elev); color: var(--text); min-width: 0; text-align: left; overflow-wrap: anywhere; }
-.workspace-tile { font: inherit; cursor: pointer; }
+.workspace-tile { font: inherit; }
+.workspace-thumbnail { position: relative; }
+.workspace-open { width: 100%; border: 0; padding: 0; background: transparent; cursor: pointer; }
+.workspace-delete { position: absolute; right: 6px; top: 6px; border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; background: var(--bg-elev); color: var(--text); cursor: pointer; }
+.workspace-title, .workspace-title-editor { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.workspace-title strong { flex: 1; }
+.workspace-title-editor input { width: 100%; min-width: 0; }
+.workspace-resume { align-self: flex-start; border: 0; padding: 0; background: transparent; color: var(--accent); font: inherit; cursor: pointer; }
 .workspace-tile:hover:not(:disabled) { border-color: var(--accent); }
 .workspace-tile:disabled { opacity: 0.5; cursor: wait; }
 .workspace-tile img, .workspace-placeholder, .workspace-resource img, .workspace-resource video { width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: var(--bg-elev-2); border-radius: 8px; }

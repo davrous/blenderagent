@@ -153,6 +153,15 @@ try {
   voice.cancel();
   assert.equal(voice.listening, false);
   assert.equal(FakeSocket.instances.at(-1).sent.at(-1).type, "cancel");
+  const beforeCancel = FakeSocket.instances.at(-1).sent.length;
+  await voice.startListening("music");
+  processor.onaudioprocess({ inputBuffer: { getChannelData: () => new Float32Array(24000).fill(0.25) } });
+  voice.cancel();
+  assert.equal(FakeSocket.instances.at(-1).sent.slice(beforeCancel).some((frame) => frame.type === "commit"), false, "cancelled take must never be submitted");
+  await voice.startListening("music");
+  assert.equal(useChatStore.getState().voiceHint, null, "a new take clears previous capture feedback");
+  await voice.stopAndCommit();
+  assert.equal(FakeSocket.instances.at(-1).sent.at(-1).type, "commit", "another take can be submitted after cancellation");
   let resolvePermission;
   permissionRequest = () => new Promise((resolve) => { resolvePermission = resolve; });
   const pending = voice.startListening("music");
