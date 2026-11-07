@@ -36,12 +36,6 @@ $ErrorActionPreference = 'Stop'
 $Image = 'blender-scene-agent'
 $Root = $PSScriptRoot
 
-# Where the Playground POSTs activities, and where the agent posts replies back.
-# `host.docker.internal` (not localhost) because the agent runs in the container:
-# localhost there is the container itself, so replies would never reach us.
-$PlaygroundEndpoint = 'http://localhost:8088/api/messages'
-$PlaygroundServiceUrl = 'http://host.docker.internal:56150/_connector'
-
 function Show-Help {
     @"
 blenderagent — build and run the Blender scene agent container
@@ -57,6 +51,8 @@ Examples
   .\blenderagent.ps1 start -e LOG_LEVEL=DEBUG
 
 The container must already be running (in another terminal) before 'playground'.
+Playground uses a LAN IPv4 address for Docker replies; use only on a trusted network.
+Use 'playground --host <LAN-IP> --port <port>' to override its address or port.
 "@ | Write-Host
 }
 
@@ -122,20 +118,23 @@ function Invoke-Playground {
     if (-not (Get-Command agentsplayground -ErrorAction SilentlyContinue)) {
         throw "agentsplayground was not found on PATH. Install it with 'winget install agentsplayground'."
     }
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+        throw "node was not found on PATH. Install Node.js to select the Playground's Docker-reachable address."
+    }
+
+    $defaults = @(& node (Join-Path $Root 'devTools/playground_args.mjs') @DockerArgs)
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $arguments = $defaults + $DockerArgs
 
     # The Playground only drives an already-running agent; it does not start one.
     try {
-        $null = Invoke-WebRequest -Uri $PlaygroundEndpoint -Method Post -Body '{}' `
-            -ContentType 'application/json' -TimeoutSec 2 -ErrorAction Stop
-    }
-    catch [System.Net.WebException], [Microsoft.PowerShell.Commands.HttpResponseException] {
-        # A 4xx means something IS listening, which is all we wanted to know.
+        $null = Invoke-WebRequest -Uri 'http://localhost:8088/readiness' `
+            -TimeoutSec 2 -ErrorAction Stop
     }
     catch {
-        Write-Warning "Nothing answered on http://localhost:8088 - run '.\blenderagent.ps1 start' in another terminal first."
+        Write-Warning "The agent is not ready on http://localhost:8088 - wait for startup or run '.\blenderagent.ps1 start' in another terminal first. $($_.Exception.Message)"
     }
 
-    $arguments = @('-e', $PlaygroundEndpoint, '--service-url', $PlaygroundServiceUrl) + $DockerArgs
     Write-Host "> agentsplayground $($arguments -join ' ')" -ForegroundColor DarkGray
     & agentsplayground @arguments
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
