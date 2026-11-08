@@ -9,7 +9,7 @@ const { register } = await import(pathToFileURL(require.resolve("tsx/esm/api")).
 register();
 const { parseMusicRequest } = await import("../webchat/server/src/music.ts");
 const { signEnvelope, MEDIA_PREFIX } = await import("../webchat/server/src/mediaSecurity.ts");
-const { isMusicConfirmation } = await import("../webchat/client/src/api/music.ts");
+const { isMusicConfirmation, isMusicComparison } = await import("../webchat/client/src/api/music.ts");
 
 const candidate = { film: "Original space adventure", track: "Space theme", confidence: "low", evidence: "A fanfare melody." };
 const request = { candidate, action: "generate", duration_seconds: 15, render_mode: "standard" };
@@ -18,9 +18,19 @@ assert.deepEqual(parseMusicRequest({ candidate, action: "generate" }), request);
 for (const duration of [5, 10, 15]) for (const mode of ["clay", "standard"]) {
   assert.deepEqual(parseMusicRequest({ ...request, duration_seconds: duration, render_mode: mode }), { ...request, duration_seconds: duration, render_mode: mode });
 }
-for (const invalid of [null, {}, { ...request, action: "approve" }, { ...request, duration_seconds: 7 }, { ...request, duration_seconds: 20 }, { ...request, render_mode: "cycles" }, { ...request, candidate: { ...candidate, film: null } }, { ...request, candidate: { ...candidate, evidence: "" } }]) {
+for (const invalid of [null, {}, { ...request, action: "approve" }, { ...request, source: "invented" }, { ...request, duration_seconds: 7 }, { ...request, duration_seconds: 20 }, { ...request, render_mode: "cycles" }, { ...request, candidate: { ...candidate, film: null, track: null } }, { ...request, candidate: { ...candidate, evidence: "" } }]) {
   assert.throws(() => parseMusicRequest(invalid));
 }
+const acrCandidate = { film: null, track: "Concerning Hobbits", confidence: "low", evidence: "Film non attribué par le catalogue." };
+const comparison = {
+  gpt_audio: { candidate, error: null, metadata: null },
+  acrcloud: { candidate: acrCandidate, error: null, metadata: { title: "Concerning Hobbits", artists: [{ name: "Howard Shore" }], album: { name: "The Fellowship of the Ring" }, score: "0.88" } },
+  summary: "Deux propositions distinctes, à choisir.", summary_error: null,
+};
+assert.equal(isMusicComparison(comparison), true);
+assert.equal(isMusicComparison({ ...comparison, acrcloud: { ...comparison.acrcloud, error: "failed" } }), false);
+assert.equal(isMusicComparison({ ...comparison, acrcloud: { candidate: null, error: null, metadata: null } }), false);
+assert.deepEqual(parseMusicRequest({ candidate: acrCandidate, action: "generate", source: "acrcloud" }).candidate, acrCandidate);
 const envelope = signEnvelope("music-test-secret-".repeat(4), "a".repeat(32), "Oui", undefined, undefined, request);
 assert.deepEqual(JSON.parse(Buffer.from(envelope.slice(MEDIA_PREFIX.length).split(".")[0], "base64url")), { scope: "a".repeat(32), text: "Oui", music: request });
 for (const text of ["oui", "Oui !", "Oui, vas-y", "yes please"]) assert.equal(isMusicConfirmation(text), true);
@@ -74,6 +84,7 @@ voice.init({
   onAgentDelta: (delta) => useChatStore.getState().voiceAppendDelta(delta),
   onAgentDone: (id) => useChatStore.getState().voiceFinalizeTurn(id),
   onMusicResult: (value) => useChatStore.getState().setMusicCandidate(value),
+  onMusicComparison: (value) => useChatStore.getState().setMusicComparison(value),
   onError: (error) => useChatStore.getState().voiceFail(error),
   getConversationId: () => useChatStore.getState().conversationId,
   getPreviousResponseId: () => useChatStore.getState().previousResponseId,
@@ -142,6 +153,67 @@ try {
     useChatStore.getState().setMusicCandidate(candidate);
     useChatStore.getState().setMicMode("voice");
     assert.equal(useChatStore.getState().musicCandidate, null);
+    assert.equal(useChatStore.getState().musicComparison, null);
+
+    useChatStore.getState().setMicMode("music");
+    socket.receive({ type: "stt", mode: "music", text: "Comparaison musicale", final: true });
+    socket.receive({ type: "music_comparison", comparison });
+    assert.equal(useChatStore.getState().musicCandidate, null);
+    useChatStore.getState().selectMusicSource("acrcloud");
+    assert.equal(useChatStore.getState().selectedMusicSource, null, "No selection before recognition finishes");
+    socket.receive({ type: "done", mode: "music", response_id: null });
+    const beforeChoice = requests.length;
+    await useChatStore.getState().send("oui");
+    await useChatStore.getState().confirmMusicScene();
+    assert.equal(requests.length, beforeChoice, "An unqualified yes cannot pick a provider");
+    assert.match(useChatStore.getState().voiceHint, /Choisis/);
+    await useChatStore.getState().send("Pourquoi ces résultats diffèrent-ils ?");
+    assert.equal(requests.at(-1).music.action, "discuss");
+    assert.equal(requests.at(-1).music.candidate.confidence, "unknown");
+    assert.deepEqual(useChatStore.getState().musicComparison, comparison);
+
+    for (const source of ["acrcloud", "gpt_audio"]) {
+      useChatStore.getState().setMusicComparison(comparison);
+      useChatStore.getState().selectMusicSource(source);
+      assert.equal(useChatStore.getState().selectedMusicSource, source);
+      assert.deepEqual(useChatStore.getState().musicCandidate, comparison[source].candidate);
+      if (source === "acrcloud") await useChatStore.getState().confirmMusicScene();
+      else await useChatStore.getState().send("oui");
+      const chosen = requests.at(-1).music;
+      assert.equal(chosen.source, source);
+      assert.deepEqual(chosen.candidate, comparison[source].candidate);
+      assert.equal(chosen.action, "generate");
+      assert.equal("comparison" in chosen, false, "Only selected result is submitted");
+      const signed = signEnvelope("music-test-secret-".repeat(4), "a".repeat(32), "Oui", undefined, undefined, parseMusicRequest(chosen));
+      assert.equal(JSON.parse(Buffer.from(signed.slice(MEDIA_PREFIX.length).split(".")[0], "base64url")).music.source, source);
+      assert.equal(useChatStore.getState().musicComparison, null);
+    }
+    useChatStore.getState().setMusicComparison(comparison);
+    useChatStore.getState().selectMusicSource("acrcloud");
+    const successfulFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response("Generation unavailable", { status: 503 });
+    try {
+      await useChatStore.getState().confirmMusicScene();
+      assert.equal(useChatStore.getState().messages.at(-1).status, "error");
+      assert.deepEqual(useChatStore.getState().musicComparison, comparison);
+      assert.equal(useChatStore.getState().selectedMusicSource, "acrcloud");
+      assert.deepEqual(useChatStore.getState().musicCandidate, acrCandidate);
+    } finally { globalThis.fetch = successfulFetch; }
+    const failed = { ...comparison, acrcloud: { candidate: null, metadata: null, error: "Quota dépassé." } };
+    useChatStore.getState().setMusicComparison(failed);
+    useChatStore.getState().selectMusicSource("acrcloud");
+    assert.equal(useChatStore.getState().musicCandidate, null);
+    assert.deepEqual(useChatStore.getState().musicComparison.gpt_audio, comparison.gpt_audio);
+    await useChatStore.getState().declineMusicScene();
+    assert.equal(useChatStore.getState().musicComparison, null);
+    assert.equal(requests.at(-1).music.action, "discuss");
+    useChatStore.getState().setMusicComparison(comparison);
+    socket.receive({ type: "done", mode: "music", history_commit_failed: true });
+    assert.equal(useChatStore.getState().musicComparison, null);
+    assert.equal(useChatStore.getState().selectedMusicSource, null);
+    useChatStore.getState().setMusicComparison(comparison);
+    useChatStore.getState().setMicMode("voice");
+    assert.equal(useChatStore.getState().musicComparison, null);
     await useChatStore.getState().send("Create a cube");
     assert.equal(requests.at(-1).music, undefined);
   } finally {
@@ -175,4 +247,4 @@ try {
   voice.dispose();
   mock.timers.reset();
 }
-console.log("PASS raw musical capture, exact 30 s cap, cancellation, animated status, hypotheses, confirmation/refusal and normal voice/chat regression");
+console.log("PASS raw musical capture, exact 30 s cap, comparison events, explicit provider selection, signed chosen result, failure/refusal and normal voice/chat regression");

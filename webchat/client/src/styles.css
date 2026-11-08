@@ -613,6 +613,14 @@ html, body, #root {
 .music-confirmation { padding: 10px; border: 1px solid var(--accent); border-radius: 10px; }
 .music-confirmation span { flex: 1 1 250px; }
 .music-controls button:disabled, .music-confirmation button:disabled { opacity: 0.5; cursor: not-allowed; }
+.music-comparison { color: var(--text-dim); font-size: 13px; }
+.music-proposals { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); gap: 10px; margin-bottom: 10px; }
+.music-proposal { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; overflow-wrap: anywhere; }
+.music-proposal p { margin: 0; }
+.music-proposal.is-selected { border-color: var(--accent); }
+.music-proposal button { margin-top: auto; border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; background: var(--bg-elev-2); color: var(--text); cursor: pointer; }
+.music-proposal button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+.music-proposal button:disabled { opacity: 0.5; cursor: not-allowed; }
 .music-notes { display: inline-flex; gap: 5px; }
 .music-notes span { animation: music-note 1.2s ease-in-out infinite; }
 .music-notes span:nth-child(2) { animation-delay: 0.2s; }

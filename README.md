@@ -525,6 +525,42 @@ the pending hypothesis, not the previous audio or conversation. Animated notes a
 Recognition is a best-effort hypothesis, **not audio fingerprinting**; uncertain
 and unidentified clips are explicitly reported.
 
+### Comparing GPT Audio and ACRCloud
+
+To enable a second, independent recognition, set `ACRCLOUD_HOST`,
+`ACRCLOUD_ACCESS_KEY` and `ACRCLOUD_ACCESS_SECRET` in the Python agent's private
+environment. The host is a bare hostname, for example
+`identify-eu-west-1.acrcloud.com`. Never put credentials in Webchat's client,
+commit them, or send them to the LLM. Rotate credentials shared in screenshots.
+Hosted deployments must receive these settings through secure deployment
+configuration; updating the local `.env` does not update a hosted version.
+
+Each submitted musical recording is then sent to **both Azure and ACRCloud**.
+The two requests start concurrently on the same 2-30 second WAV. ACRCloud uses
+[`POST /v1/identify`](https://docs.acrcloud.com/reference/identification-api/identification-api.md)
+with multipart audio and HMAC-SHA1 authentication; the console project ID is
+not required. No SDK, audio fingerprint extraction or new dependency is needed.
+ACRCloud recommends short excerpts (around 10-15 seconds); the chosen project
+engine and catalogue determine coverage. Its Cover Song (humming)
+Identification engine supports covers, live performances and humming.
+
+The existing text LLM then presents the two results without tools, a shared
+conversation mutation, or automatic selection. Original provider titles are
+preserved. Any film association added to ACRCloud's track/album is an explicitly
+uncertain LLM interpretation, not an ACRCloud film identification. ACRCloud's
+raw score is displayed separately and is not a probability comparable to GPT's
+declared confidence. Recognition failures and no-match results remain visible;
+one provider failing does not hide the other's proposal. If presentation fails,
+both raw results remain available with a visible LLM warning.
+
+Choose **GPT Audio** or **ACRCloud**, then confirm scene creation. Only the
+selected candidate and its provider are sent in the signed generation request.
+`oui` cannot generate before a provider is selected, even when results agree.
+Choose **Aucune des deux** or record a new attempt to discard the comparison.
+A matched track without a known film may still be selected; its scene must not
+invent a film association. Leave all ACRCloud settings unset to preserve the
+existing single-provider workflow.
+
 Only after a positive text reply (for example `oui`) or the confirmation button
 does the existing Blender agent create an original, family-friendly developer
 vignette with original caricature designs inspired by the film's character archetypes,

@@ -3,7 +3,7 @@ import { useChatStore } from "../state/chatStore";
 import { voice } from "../api/voice";
 import { Paperclip, X } from "lucide-react";
 import { uploadReference, type ReferenceUpload } from "../api/media";
-import { MUSIC_DURATIONS } from "../api/music";
+import { hasMusicMatch, MUSIC_DURATIONS, MUSIC_SOURCES, MUSIC_SOURCE_LABELS } from "../api/music";
 
 interface ComposerProps {
   voiceAvailable?: boolean;
@@ -39,6 +39,9 @@ export function Composer({ voiceAvailable = false, musicAvailable = false, media
   const micMode = useChatStore((s) => s.micMode);
   const setMicMode = useChatStore((s) => s.setMicMode);
   const musicCandidate = useChatStore((s) => s.musicCandidate);
+  const musicComparison = useChatStore((s) => s.musicComparison);
+  const selectedMusicSource = useChatStore((s) => s.selectedMusicSource);
+  const selectMusicSource = useChatStore((s) => s.selectMusicSource);
   const musicOptions = useChatStore((s) => s.musicOptions);
   const setMusicOptions = useChatStore((s) => s.setMusicOptions);
   const confirmMusicScene = useChatStore((s) => s.confirmMusicScene);
@@ -228,8 +231,36 @@ export function Composer({ voiceAvailable = false, musicAvailable = false, media
           {voiceHint ?? micLabel}
         </div>
       )}
+      {musical && musicComparison && <section className="music-comparison" aria-label="Comparaison des reconnaissances musicales">
+        <p>Deux services, deux propositions. Choisis celle à utiliser ; aucune scène n'est créée à cette étape.</p>
+        {musicComparison.summary_error && <p className="media-error" role="alert">{musicComparison.summary_error}</p>}
+        <div className="music-proposals" role="group" aria-label="Choisir la proposition musicale">
+          {MUSIC_SOURCES.map((source) => {
+            const result = musicComparison[source];
+            const candidate = result.candidate;
+            return <article className={`music-proposal${selectedMusicSource === source ? " is-selected" : ""}`} key={source}>
+              <strong>{MUSIC_SOURCE_LABELS[source]}</strong>
+              {result.error ? <p role="alert">{result.error}</p> : candidate && <>
+                <p>{candidate.film ?? "Film non identifié"}{candidate.track ? ` — ${candidate.track}` : ""}</p>
+                <small>{candidate.evidence}</small>
+                {source === "gpt_audio" && <small>Confiance déclarée par GPT : {candidate.confidence}</small>}
+                {result.metadata && <small>
+                  {result.metadata.artists.map((artist) => artist.name).filter(Boolean).join(", ")}
+                  {result.metadata.album?.name ? ` · ${result.metadata.album.name}` : ""}
+                  {result.metadata.score !== null ? ` · Score ACRCloud brut : ${result.metadata.score} (pas une probabilité)` : ""}
+                </small>}
+              </>}
+              <button type="button" disabled={inputLocked || !candidate || !hasMusicMatch(candidate)}
+                aria-pressed={selectedMusicSource === source} onClick={() => selectMusicSource(source)}>
+                {selectedMusicSource === source ? "Proposition choisie" : `Choisir ${MUSIC_SOURCE_LABELS[source]}`}
+              </button>
+            </article>;
+          })}
+        </div>
+        <button type="button" className="music-cancel" disabled={inputLocked} onClick={() => void declineMusicScene()}>Aucune des deux</button>
+      </section>}
       {musical && musicCandidate && <div className="music-confirmation">
-        <span>Hypothèse : <strong>{musicCandidate.film}</strong>. Créer la séquence Devfest ({musicOptions.duration_seconds} s, rendu {musicOptions.render_mode === "clay" ? "Clay" : "complet"}) ?</span>
+        <span>Hypothèse{selectedMusicSource ? ` ${MUSIC_SOURCE_LABELS[selectedMusicSource]}` : ""} : <strong>{musicCandidate.film ?? musicCandidate.track}</strong>. Créer la séquence Devfest ({musicOptions.duration_seconds} s, rendu {musicOptions.render_mode === "clay" ? "Clay" : "complet"}) ?</span>
         <button type="button" disabled={inputLocked} onClick={() => void confirmMusicScene()}>Oui, créer la scène 🎬</button>
         <button type="button" disabled={inputLocked} onClick={() => void declineMusicScene()}>Non</button>
       </div>}

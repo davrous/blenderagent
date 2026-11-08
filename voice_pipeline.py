@@ -893,7 +893,8 @@ class VoiceSession:
         self._turn_task = asyncio.create_task(self._run_music(pcm, transcript))
 
     async def _run_music(self, pcm: bytes, transcript: str) -> None:
-        from music import archive_music_audio, recognize_music, recognition_reply
+        from music import (archive_music_audio, recognize_music, recognition_reply,
+                           acrcloud_enabled, recognize_music_comparison, comparison_reply)
 
         try:
             if self._media_context:
@@ -906,13 +907,20 @@ class VoiceSession:
                 except Exception:
                     logger.warning("Could not archive musical input audio.", exc_info=True)
                     await self._send_text({"type": "archive.warning", "message": "L'extrait audio n'a pas pu être sauvegardé. La reconnaissance continue, mais cet audio ne sera pas rejouable dans la galerie."})
-            candidate = await recognize_music(pcm)
-            logger.info("Music recognition completed: confidence=%s.", candidate.confidence)
+            if acrcloud_enabled():
+                comparison = await recognize_music_comparison(pcm, self._agent)
+                reply = comparison_reply(comparison)
+                result_frame = {"type": "music_comparison", "comparison": comparison.model_dump()}
+                logger.info("Music comparison completed.")
+            else:
+                candidate = await recognize_music(pcm)
+                reply = recognition_reply(candidate)
+                result_frame = {"type": "music_result", "candidate": candidate.model_dump()}
+                logger.info("Music recognition completed: confidence=%s.", candidate.confidence)
             if self._cancelled:
                 return
-            reply = recognition_reply(candidate)
             await self._send_text({"type": "delta", "text": reply})
-            await self._send_text({"type": "music_result", "candidate": candidate.model_dump()})
+            await self._send_text(result_frame)
             if _is_hosted() and not self._foundry_conversation_id:
                 self._fallback_history.extend([
                     {"role": "user", "content": transcript},

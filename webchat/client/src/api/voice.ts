@@ -14,7 +14,7 @@
  * server-side Blender scene.
  */
 
-import { isMusicCandidate, type MicMode, type MusicCandidate } from "./music";
+import { isMusicCandidate, isMusicComparison, type MicMode, type MusicCandidate, type MusicComparison } from "./music";
 
 export type VoiceStatus =
   | "idle"
@@ -31,6 +31,7 @@ export interface VoiceHandlers {
   onAgentDelta: (text: string) => void;
   onAgentDone: (responseId: string | null) => void;
   onMusicResult: (candidate: MusicCandidate) => void;
+  onMusicComparison?: (comparison: MusicComparison) => void;
   onInputAudio?: (url: string) => void;
   onArchiveWarning?: (message: string) => void;
   onError: (message: string) => void;
@@ -441,6 +442,10 @@ class VoiceController {
       case "music_result":
         if (isMusicCandidate(frame.candidate)) h.onMusicResult(frame.candidate);
         else h.onError("The audio service returned an invalid music result.");
+        break;
+      case "music_comparison":
+        if (isMusicComparison(frame.comparison) && h.onMusicComparison) h.onMusicComparison(frame.comparison);
+        else h.onError("Le service a retourne une comparaison musicale invalide.");
         break;
       case "input_audio":
         if (typeof frame.audio_url === "string") h.onInputAudio?.(frame.audio_url);

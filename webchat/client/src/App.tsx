@@ -41,6 +41,7 @@ export function App() {
       onAgentDelta: (d) => useChatStore.getState().voiceAppendDelta(d),
       onAgentDone: (rid) => useChatStore.getState().voiceFinalizeTurn(rid),
       onMusicResult: (candidate) => useChatStore.getState().setMusicCandidate(candidate),
+      onMusicComparison: (comparison) => useChatStore.getState().setMusicComparison(comparison),
       onInputAudio: (url) => useChatStore.getState().voiceInputAudio(url),
       onArchiveWarning: (message) => useChatStore.getState().setWorkspaceError(message),
       onError: (m) => useChatStore.getState().voiceFail(m),

@@ -40,6 +40,9 @@ environment_variables:
     value: "{{MUSIC_AUDIO_ENDPOINT}}"
   - name: MUSIC_MODEL_DEPLOYMENT_NAME
     value: "{{MUSIC_MODEL_DEPLOYMENT_NAME}}"
+  # Optional parallel ACRCloud comparison: inject ACRCLOUD_HOST,
+  # ACRCLOUD_ACCESS_KEY and ACRCLOUD_ACCESS_SECRET via deployment configuration.
+  # Do not put project credentials in this manifest or the browser environment.
   - name: AUTH_DIAGNOSTICS_ENABLED
     value: "true"
   - name: BLENDER_HOST

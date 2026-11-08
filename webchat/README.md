@@ -90,6 +90,17 @@ uses click-to-start/click-to-stop, recording 2-30 seconds without speech noise
 suppression. Musical notes animate during analysis, followed by a proposed
 film/title and uncertainty. No Blender tools run during recognition.
 
+When the Python agent has `ACRCLOUD_HOST`, `ACRCLOUD_ACCESS_KEY` and
+`ACRCLOUD_ACCESS_SECRET`, the same recorded WAV is also sent to ACRCloud in
+parallel. Keep these credentials server-side, not in this Webchat environment
+or any `VITE_*` setting. The LLM presents one proposal per service, and the
+composer displays two choice cards, including errors and no-match results.
+Select a provider first, then confirm creation; `oui` without a selection cannot
+start a scene. ACRCloud scores and GPT confidence are not comparable probabilities.
+**Aucune des deux**, a new recording, Reset or switching to dialogue discards
+the pending choice. Only the chosen result is signed and sent for generation.
+The selected ACRCloud project controls the recognition engine and catalogue.
+
 Use the confirmation button or type `oui` to create the original developer
 vignette with original film-inspired caricatures (choose 5, 10 or 15 seconds,
 Devfest Toulouse

@@ -16,14 +16,18 @@ from unittest.mock import AsyncMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import httpx
+from azure.core.exceptions import ClientAuthenticationError
 import music
 import voice_pipeline as vp
-from agent_framework import AgentResponse, AgentResponseUpdate, Content, Message, ResponseStream
+from agent_framework import Agent, AgentResponse, AgentResponseUpdate, ChatResponse, Content, Message, ResponseStream
 from media_control import MediaMiddleware, decode_envelope, start_animation_render
 from media_analysis import render_settings
 from video_jobs import video_scope
 
-ENV = {"MUSIC_AUDIO_ENDPOINT": "https://test.cognitiveservices.azure.com", "MUSIC_MODEL_DEPLOYMENT_NAME": "audio-test"}
+ENV = {"MUSIC_AUDIO_ENDPOINT": "https://test.cognitiveservices.azure.com", "MUSIC_MODEL_DEPLOYMENT_NAME": "audio-test",
+       "ACRCLOUD_HOST": "", "ACRCLOUD_ACCESS_KEY": "", "ACRCLOUD_ACCESS_SECRET": ""}
+ACR_ENV = {"ACRCLOUD_HOST": "identify-eu-west-1.acrcloud.com",
+           "ACRCLOUD_ACCESS_KEY": "test-access", "ACRCLOUD_ACCESS_SECRET": "test-secret"}
 CANDIDATE = music.MusicCandidate(film="An original space adventure", track="Space theme", confidence="low", evidence="Une melodie de fanfare.")
 PCM = b"\x01\x00" * music.SAMPLE_RATE * 2
 
@@ -89,6 +93,171 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
                 await music.recognize_music(PCM)
 
 
+class ComparisonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_acrcloud_signed_multipart_contains_exact_same_wav(self):
+        calls = []
+
+        def respond(request):
+            calls.append(request)
+            return httpx.Response(200, json={"status": {"code": 0}, "metadata": {"music": [
+                {"title": "Concerning Hobbits", "artists": [{"name": "Howard Shore"}],
+                 "album": {"name": "The Fellowship of the Ring"}, "score": 98},
+                {"title": "Another suggestion"},
+            ]}})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        with patch.dict(os.environ, ACR_ENV), patch.object(music.httpx, "AsyncClient", return_value=client), patch.object(music.time, "time", return_value=123456):
+            result = await music.recognize_acrcloud(PCM)
+        self.assertEqual(result.title, "Concerning Hobbits")
+        self.assertEqual(str(calls[0].url), "https://identify-eu-west-1.acrcloud.com/v1/identify")
+        self.assertIn("multipart/form-data", calls[0].headers["content-type"])
+        wav = music.pcm_to_wav(PCM)
+        self.assertIn(wav, calls[0].content)
+        signature = base64.b64encode(hmac.new(b"test-secret", b"POST\n/v1/identify\ntest-access\naudio\n1\n123456", hashlib.sha1).digest())
+        for name, value in (("signature", signature), ("sample_bytes", str(len(wav)).encode()),
+                            ("data_type", b"audio"), ("timestamp", b"123456"), ("access_key", b"test-access")):
+            self.assertIn(f'name="{name}"\r\n\r\n'.encode() + value + b"\r\n", calls[0].content)
+        self.assertNotIn(b"test-secret", calls[0].content)
+
+    async def test_acrcloud_no_match_and_humming_metadata(self):
+        for payload, expected in (
+            ({"status": {"code": 1001}}, None),
+            ({"status": {"code": 0}, "metadata": {"humming": [{"title": "A hummed theme", "score": "0.88"}]}}, "A hummed theme"),
+        ):
+            client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload)))
+            with patch.dict(os.environ, ACR_ENV), patch.object(music.httpx, "AsyncClient", return_value=client):
+                result = await music.recognize_acrcloud(PCM)
+            self.assertEqual(result.title if result else None, expected)
+
+    async def test_acrcloud_errors_are_not_no_match_or_secret_dumps(self):
+        for payload in ({"status": {"code": 3014, "msg": "test-secret"}},
+                        {"status": {"code": 0}}, {"status": {"code": 0}, "metadata": {"music": [{"title": 123}]}}):
+            client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload)))
+            with patch.dict(os.environ, ACR_ENV), patch.object(music.httpx, "AsyncClient", return_value=client):
+                result = await music._music_provider(PCM, "acrcloud")
+            self.assertIsNone(result.candidate)
+            self.assertTrue(result.error)
+            self.assertNotIn("test-secret", result.error)
+
+    async def test_acrcloud_invalid_and_partial_config_never_make_request(self):
+        for host in ("evil.example", "identify-eu-west-1.acrcloud.com/path",
+                     "identify-eu-west-1.acrcloud.com:443", "user@identify-eu-west-1.acrcloud.com"):
+            with patch.dict(os.environ, {**ACR_ENV, "ACRCLOUD_HOST": host}), patch.object(music.httpx, "AsyncClient") as client:
+                with self.assertRaises(ValueError):
+                    await music.recognize_acrcloud(PCM)
+                client.assert_not_called()
+        with patch.dict(os.environ, {**ACR_ENV, "ACRCLOUD_ACCESS_SECRET": ""}):
+            self.assertTrue(music.acrcloud_enabled())
+            result = await music._music_provider(PCM, "acrcloud")
+        self.assertIn("Configure ACRCLOUD", result.error)
+
+    async def test_both_providers_start_before_either_finishes_and_llm_preserves_titles(self):
+        gpt_started, acr_started = asyncio.Event(), asyncio.Event()
+
+        async def gpt(pcm):
+            self.assertEqual(pcm, PCM)
+            gpt_started.set()
+            await acr_started.wait()
+            return CANDIDATE
+
+        async def acr(pcm):
+            self.assertEqual(pcm, PCM)
+            acr_started.set()
+            await gpt_started.wait()
+            return music.ACRCloudTrack(title="Concerning Hobbits", score=98)
+
+        presenter = SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(text=json.dumps({
+            "summary": "GPT propose un theme spatial; ACRCloud propose une autre piste. Choisis.",
+            "acrcloud_film": "Le Seigneur des Anneaux", "acrcloud_evidence": "Association au film a confirmer.",
+        }))))
+        with patch.object(music, "recognize_music", side_effect=gpt), patch.object(music, "recognize_acrcloud", side_effect=acr), patch.object(music, "Agent", return_value=presenter) as wrapper:
+            result = await asyncio.wait_for(music.recognize_music_comparison(PCM, SimpleNamespace(client="existing-client")), timeout=2)
+        self.assertEqual(result.gpt_audio.candidate, CANDIDATE)
+        self.assertEqual(result.acrcloud.candidate.track, "Concerning Hobbits")
+        self.assertEqual(result.acrcloud.candidate.film, "Le Seigneur des Anneaux")
+        self.assertEqual(result.acrcloud.metadata.score, 98)
+        self.assertEqual(wrapper.call_args.kwargs["client"], "existing-client")
+        self.assertEqual(wrapper.call_args.kwargs["default_options"]["tool_choice"], "none")
+        self.assertNotIn("tools", wrapper.call_args.kwargs)
+        self.assertNotIn("test-secret", presenter.run.call_args.args[0])
+        self.assertIn("Choisis", music.comparison_reply(result))
+
+    async def test_failed_provider_and_failed_presenter_keep_other_result(self):
+        for source in ("gpt_audio", "acrcloud"):
+            with patch.object(music, "recognize_music", AsyncMock(side_effect=ValueError("bad") if source == "gpt_audio" else None, return_value=CANDIDATE)), \
+                 patch.object(music, "recognize_acrcloud", AsyncMock(side_effect=ValueError("bad") if source == "acrcloud" else None, return_value=music.ACRCloudTrack(title="A track"))), \
+                 patch.object(music, "Agent", return_value=SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(text="invalid JSON")))):
+                result = await music.recognize_music_comparison(PCM, SimpleNamespace(client=None))
+            self.assertTrue(getattr(result, source).error)
+            other = result.acrcloud if source == "gpt_audio" else result.gpt_audio
+            self.assertIsNotNone(other.candidate)
+            self.assertTrue(result.summary_error)
+            self.assertIn("Indisponible", music.comparison_reply(result))
+
+    async def test_comparison_cancellation_cancels_both_provider_requests(self):
+        entered = [asyncio.Event(), asyncio.Event()]
+        cancelled = [False, False]
+
+        async def wait(index):
+            entered[index].set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled[index] = True
+
+        async def gpt(pcm):
+            await wait(0)
+
+        async def acr(pcm):
+            await wait(1)
+
+        with patch.object(music, "recognize_music", side_effect=gpt), patch.object(music, "recognize_acrcloud", side_effect=acr):
+            task = asyncio.create_task(music.recognize_music_comparison(PCM, SimpleNamespace(client=None)))
+            await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered)), timeout=2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(cancelled, [True, True])
+
+    async def test_azure_authentication_failure_does_not_hide_acrcloud(self):
+        with patch.object(music, "recognize_music", AsyncMock(side_effect=ClientAuthenticationError("private-token"))), \
+             patch.object(music, "recognize_acrcloud", AsyncMock(return_value=music.ACRCloudTrack(title="A catalogue track"))), \
+             patch.object(music, "Agent", return_value=SimpleNamespace(run=AsyncMock(side_effect=ClientAuthenticationError("private-token")))):
+            result = await music.recognize_music_comparison(PCM, SimpleNamespace(client=None))
+        self.assertIn("Authentification Azure", result.gpt_audio.error)
+        self.assertEqual(result.acrcloud.candidate.track, "A catalogue track")
+        self.assertTrue(result.summary_error)
+        self.assertNotIn("private-token", result.model_dump_json())
+
+    async def test_real_framework_presenter_is_tool_free_and_preserves_provider_data(self):
+        calls = []
+
+        class LocalTextClient:
+            async def get_response(self, messages, *, options=None, **kwargs):
+                calls.append((messages, options))
+                text = json.dumps({"summary": "Deux propositions a choisir.", "acrcloud_film": None,
+                                   "acrcloud_evidence": "Film inconnu.", "title": "Deux pistes musicales a comparer"})
+                return ChatResponse(messages=[Message(role="assistant", contents=[Content.from_text(text)])])
+
+        agent = Agent(client=LocalTextClient(), instructions="Original Blender instructions")
+        with patch.object(music, "recognize_music", AsyncMock(return_value=CANDIDATE)), \
+             patch.object(music, "recognize_acrcloud", AsyncMock(return_value=music.ACRCloudTrack(title="A catalogue track", score="0.88"))):
+            result = await music.recognize_music_comparison(PCM, agent)
+        self.assertIsNone(result.summary_error)
+        self.assertEqual(result.acrcloud.candidate.track, "A catalogue track")
+        self.assertIsNone(result.acrcloud.candidate.film)
+        self.assertEqual(result.acrcloud.metadata.score, "0.88")
+        self.assertEqual(calls[0][1]["tool_choice"], "none")
+        self.assertFalse(calls[0][1]["store"])
+        self.assertNotIn("Original Blender instructions", str(calls[0][0]))
+        self.assertIn("```workspacetitle", music.comparison_reply(result))
+
+    def test_track_only_match_can_be_selected_without_inventing_a_film(self):
+        candidate = music.MusicCandidate(film=None, track="A known melody", confidence="low", evidence="Catalogue match.")
+        request = music.MusicRequest(candidate=candidate, source="acrcloud", action="generate")
+        self.assertIn("do not invent a film", music.music_instructions(request))
+
+
 class CaptureTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.frames = []
@@ -130,6 +299,26 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
             await self.session.on_control({"type": "start"})
             stt.assert_awaited_once()
         self.assertEqual(self.session._capture_mode, "voice")
+
+    async def test_comparison_commits_both_results_without_selecting_or_creating(self):
+        comparison = music.MusicComparison(
+            gpt_audio=music.MusicProviderResult(candidate=CANDIDATE),
+            acrcloud=music.MusicProviderResult(error="Quota depasse."),
+            summary="Choisis une proposition.",
+        )
+        with patch.dict(os.environ, {**ENV, **ACR_ENV}), patch.object(music, "recognize_music_comparison", AsyncMock(return_value=comparison)) as recognize, patch.object(self.session, "_run_turn", AsyncMock()) as blender, patch.object(vp, "_is_hosted", return_value=True):
+            await self.session.on_control({"type": "start", "mode": "music"})
+            await self.session.on_audio(PCM)
+            await self.session.on_control({"type": "commit"})
+            await self.session._turn_task
+        recognize.assert_awaited_once_with(PCM, self.session._agent)
+        blender.assert_not_awaited()
+        frame = next(frame for frame in self.frames if frame["type"] == "music_comparison")
+        self.assertEqual(frame["comparison"], comparison.model_dump())
+        self.assertNotIn("selected", frame)
+        self.assertIn("GPT Audio", self.frames[-1]["reply"])
+        self.assertIn("ACRCloud", self.frames[-1]["reply"])
+        self.assertTrue(self.frames[-1]["history_commit_required"])
 
     async def test_short_oversize_and_invalid_pcm_are_explicit_errors(self):
         with patch.dict(os.environ, ENV):
