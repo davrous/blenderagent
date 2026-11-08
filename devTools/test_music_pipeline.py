@@ -20,7 +20,7 @@ from azure.core.exceptions import ClientAuthenticationError
 import music
 import voice_pipeline as vp
 from agent_framework import Agent, AgentResponse, AgentResponseUpdate, ChatResponse, Content, Message, ResponseStream
-from media_control import MediaMiddleware, decode_envelope, start_animation_render
+from media_control import MediaMiddleware, apply_camera_path, decode_envelope, start_animation_render
 from media_analysis import render_settings
 from video_jobs import video_scope
 
@@ -427,7 +427,9 @@ class ScopedSceneTests(unittest.IsolatedAsyncioTestCase):
             await MediaMiddleware(inner).process(context, AsyncMock())
 
     async def test_render_enforces_duration_style_and_no_paid_finishing(self):
-        token = music.music_scene.set(music.MusicRequest(candidate=CANDIDATE, action="generate"))
+        request = music.MusicRequest(candidate=CANDIDATE, action="generate")
+        request._static_preview_ready = True
+        token = music.music_scene.set(request)
         try:
             for settings in ({"duration_seconds": 14}, {"duration_seconds": 18}, {"duration_seconds": 21}, {"duration_seconds": 15, "mode": "clay"}, {"duration_seconds": 15, "engine": "CYCLES"}, {"duration_seconds": 15, "seedance": True}, {"duration_seconds": 15, "fps": 12}, {"duration_seconds": 15, "resolution": "720p"}):
                 with self.assertRaises(ValueError):
@@ -449,6 +451,7 @@ class ScopedSceneTests(unittest.IsolatedAsyncioTestCase):
             for mode in ("clay", "standard"):
                 request = music.MusicRequest(candidate=CANDIDATE, action="generate",
                                              duration_seconds=duration, render_mode=mode)
+                request._static_preview_ready = True
                 token = music.music_scene.set(request)
                 scope = video_scope.set("a" * 32)
                 jobs = SimpleNamespace(create=lambda _scope, settings, _snapshot, **kwargs: dict(settings, **kwargs))
@@ -473,6 +476,146 @@ class ScopedSceneTests(unittest.IsolatedAsyncioTestCase):
         signature = hmac.new(secret.encode(), part.encode(), hashlib.sha256).hexdigest()
         with self.assertRaises(ValueError):
             decode_envelope(f"BLENDER_MEDIA_V1:{part}.{signature}", secret)
+
+
+class CinematicSceneTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        import main
+        self.main = main
+        self.request = music.MusicRequest(candidate=CANDIDATE, action="generate")
+        self.token = music.music_scene.set(self.request)
+
+    def tearDown(self):
+        music.music_scene.reset(self.token)
+
+    def test_cinematic_brief_orders_concept_assets_static_preview_then_animation(self):
+        prompt = music.music_instructions(self.request)
+        stages = ("1. CONCEPT:", "2. ASSET SCOUTING:", "3. STATIC SCENE:", "4. STATIC PREVIEW:", "5. ANIMATION:")
+        self.assertEqual([prompt.index(stage) for stage in stages], sorted(prompt.index(stage) for stage in stages))
+        for requirement in ("AT MOST 3", "foreground/midground/background", "rim/fill",
+                            "recognizable even in Clay", "Do NOT add new animation",
+                            "preview_static_scene ONCE", "EXACTLY 15 seconds", "awaiting_render_approval"):
+            self.assertIn(requirement, prompt)
+        self.assertIn("No music generation or reuse", prompt)
+        self.assertIn("not a bare platform", prompt)
+
+    def test_budget_is_three_total_across_models_and_textures_and_resets_next_turn(self):
+        with patch.object(self.main.httpx, "Client") as factory:
+            client = factory.return_value.__enter__.return_value
+            client.post.return_value.json.return_value = {"Result": {}}
+            client.get.return_value.json.return_value = {}
+            self.assertEqual(self.main.list_available_models(query="dinosaur"), "[]")
+            self.assertEqual(self.main.list_available_textures(query="jungle"), "[]")
+            self.assertEqual(self.main.list_available_models(query="jeep"), "[]")
+            self.assertIn("three asset searches", self.main.list_available_models(query="gate"))
+            self.assertEqual(factory.call_count, 3)
+            self.assertEqual(self.request._asset_searches, 3)
+            self.assertNotIn("_asset_searches", self.request.model_dump())
+            token = music.music_scene.set(music.MusicRequest(candidate=CANDIDATE, action="generate"))
+            try:
+                self.assertEqual(self.main.list_available_models(query="dinosaur"), "[]")
+            finally:
+                music.music_scene.reset(token)
+            self.assertEqual(factory.call_count, 4)
+            token = music.music_scene.set(None)
+            try:
+                for _ in range(4):
+                    self.main.list_available_models(query="chair")
+            finally:
+                music.music_scene.reset(token)
+            self.assertEqual(factory.call_count, 8, "Ordinary browsing has no music budget")
+
+    def test_search_failures_consume_budget_and_late_searches_are_blocked(self):
+        with patch.object(self.main.httpx, "Client", side_effect=httpx.ConnectError("offline")) as factory:
+            for _ in range(3):
+                self.assertTrue(self.main.list_available_models(query="dinosaur").startswith("ERROR:"))
+            self.assertIn("three asset searches", self.main.list_available_models(query="jeep"))
+            self.assertEqual(factory.call_count, 3)
+        self.request._static_preview_ready = True
+        with patch.object(self.main.httpx, "Client") as factory:
+            self.assertIn("already previewed", self.main.list_available_textures(query="rock"))
+            factory.assert_not_called()
+
+    async def test_static_preview_is_required_and_a_failed_capture_does_not_unlock_animation(self):
+        with patch("media_control.get_blender_connection") as blender:
+            with self.assertRaisesRegex(ValueError, "preview_static_scene"):
+                apply_camera_path([], duration_seconds=15, fps=25)
+            with self.assertRaisesRegex(ValueError, "preview_static_scene"):
+                await start_animation_render(duration_seconds=15, fps=25, mode="standard")
+            blender.assert_not_called()
+        with patch.object(self.main, "get_viewport_screenshot", return_value="Screenshot error: capture failed"):
+            with self.assertRaisesRegex(ValueError, "preview failed"):
+                self.main.preview_static_scene()
+        self.assertFalse(self.request._static_preview_ready)
+        image = "Screenshot captured (800x450 pixels).\n\n![screenshot](https://teststorage.blob.core.windows.net/static.png)"
+        with patch.object(self.main, "get_viewport_screenshot", return_value=image) as capture:
+            self.assertEqual(self.main.preview_static_scene(), image)
+            capture.assert_called_once_with(max_size=800)
+        self.request.require_static_preview()
+        keys = [{"time": 0, "position": [6, -8, 4], "target": [0, 0, 1], "lens": 35},
+                {"time": 15, "position": [4, -6, 3], "target": [0, 0, 1], "lens": 40}]
+        with patch("media_control.get_blender_connection") as blender:
+            blender.return_value.send_command.return_value = {"success": True}
+            self.assertIn("true", apply_camera_path(keys, duration_seconds=15, fps=25))
+            blender.return_value.send_command.assert_called_once()
+
+    def test_model_import_cannot_run_without_thumbnail_but_ordinary_import_is_unchanged(self):
+        url = "https://models.example/dinosaur.glb"
+        with patch.object(self.main, "get_blender_connection") as blender:
+            self.assertIn("thumbnail", self.main.download_model(model_url=url, name="dinosaur"))
+            blender.assert_not_called()
+            self.request._previewed_model_urls.add(url)
+            blender.return_value.send_command.return_value = {"success": True, "imported_objects": ["dinosaur"]}
+            self.assertIn("preview_static_scene", self.main.download_model(model_url=url, name="dinosaur"))
+            token = music.music_scene.set(None)
+            try:
+                self.assertIn("single viewport screenshot", self.main.download_model(model_url=url, name="dinosaur"))
+            finally:
+                music.music_scene.reset(token)
+            self.assertEqual(blender.return_value.send_command.call_count, 2)
+
+    async def test_thumbnail_and_static_screenshot_are_streamed_before_import_and_animation(self):
+        model = {"name": "Original dinosaur", "imageUrl": "https://models.example/dinosaur.png",
+                 "modelUrl": "https://models.example/dinosaur.glb"}
+        call = Content.from_function_call
+        result = Content.from_function_result
+
+        def update(content):
+            return AgentResponseUpdate(role="assistant", contents=[content])
+
+        async def source():
+            yield update(Content.from_text("Je propose une aventure de dinosaures dans une jungle miniature."))
+            yield update(call("search", "list_available_models", arguments={"query": "dinosaur"}))
+            yield update(result("search", result=json.dumps([model])))
+            yield update(result("search", result=json.dumps([model])))
+            yield update(call("import", "download_model", arguments=json.dumps({"model_url": model["modelUrl"], "name": "dinosaur"})))
+            self.assertIn(model["modelUrl"], self.request._previewed_model_urls)
+            yield update(result("import", result="Imported dinosaur."))
+            yield update(call("static", "execute_blender_code", arguments={"code": "build_static_scene()"}))
+            yield update(result("static", result="Static scene built."))
+            yield update(call("preview", "preview_static_scene", arguments={}))
+            self.request._static_preview_ready = True
+            yield update(result("preview", result="Screenshot captured.\n\n![screenshot](https://teststorage.blob.core.windows.net/static.png)"))
+            yield update(result("preview", result="Screenshot captured.\n\n![screenshot](https://teststorage.blob.core.windows.net/static.png)"))
+            yield update(call("animate", "execute_blender_code", arguments={"code": "animate_objects()"}))
+            yield update(call("camera", "apply_camera_path", arguments={}))
+            yield update(call("snapshot", "start_animation_render", arguments={}))
+
+        context = SimpleNamespace(stream=True, result=ResponseStream(source(), finalizer=AgentResponse.from_updates), session=None)
+        await self.main.ToolStatusMiddleware().process(context, AsyncMock())
+        updates = [entry async for entry in context.result]
+        text = "\n".join(entry.text for entry in updates if entry.text)
+        self.assertEqual(text.count(model["imageUrl"]), 1)
+        self.assertEqual(text.count("![screenshot]"), 1)
+        self.assertIn("Construction de la scène statique", text)
+        self.assertIn("Conception et animation des objets", text)
+        self.assertIn("fichier Blender animé à inspecter", text)
+        thumbnail = next(i for i, entry in enumerate(updates) if model["imageUrl"] in entry.text)
+        import_call = next(i for i, entry in enumerate(updates) if any(c.type == "function_call" and c.name == "download_model" for c in entry.contents))
+        screenshot = next(i for i, entry in enumerate(updates) if "![screenshot]" in entry.text)
+        animation = next(i for i, entry in enumerate(updates) if any(c.type == "function_call" and c.call_id == "animate" for c in entry.contents))
+        self.assertLess(thumbnail, import_call)
+        self.assertLess(screenshot, animation)
 
 
 if __name__ == "__main__":

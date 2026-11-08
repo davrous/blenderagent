@@ -108,13 +108,20 @@ greeting). The musical-mode selectors choose **Clay** (neutral gray, fast)
 or **Complet** (materials and lighting); defaults are 15 seconds and full rendering.
 The options are signed with the confirmation request and enforced on the camera,
 timeline and saved snapshot, not applied as a later truncation.
+After confirmation, the agent proposes a cinematic scene, makes at most three
+asset searches, and shows each selected model's real thumbnail before import.
+It then builds the complete static scene mostly procedurally and sends a
+viewport screenshot **before** working on object/camera animation. These are
+progress updates, not another approval step. Failed searches fall back to
+procedural construction. A failed static screenshot must be fixed before
+camera animation or snapshot preparation can continue.
 The existing viewport shows the scene, and the video card first offers
 a packed `.blend` download. A frame-1 viewport screenshot appears above the card
 and opens in the existing lightbox. It is captured during preparation, not left
 to a discretionary model tool call. Open the `.blend` in Blender and play the timeline, then check
 the inspection confirmation to launch the **480p / 25 fps** render. No render
-starts automatically during preparation or status polling, apart from the single
-fast viewport still. Clicking the render button immediately changes its label
+starts automatically during preparation or status polling, apart from the static
+progress image and the animated frame-1 preview. Clicking the render button immediately changes its label
 and shows a spinner/status message while the server validates the request.
 Only after acknowledgement does the UI show accepted/queued, rendering or
 encoding. Duplicate clicks cannot send a second action.

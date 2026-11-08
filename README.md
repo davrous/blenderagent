@@ -568,6 +568,30 @@ exaggerated silhouettes, expressions, costume palettes and gestures, plus a Devf
 Toulouse closing greeting. Discussion and refusal turns
 disable model tool calls. The opt-in creative brief is scoped to that turn;
 switching back to **Dialogue vocal** or Reset discards the pending hypothesis.
+The confirmed generation follows a staged cinematic brief:
+
+1. Propose the concept in French: a film-inspired world, strong hero subject,
+   distinctive silhouettes, developer gag and readable payoff.
+2. Scout up to **three asset searches total**, across the model library and
+   optional textures, using concrete keywords rather than film titles.
+   The budget is enforced per confirmed turn, including failed requests.
+   The agent may autonomously select one or two relevant models; their real
+   thumbnails are streamed before import. No additional asset approval is
+   required. Empty/failed searches lead to procedural construction, not retries
+   beyond the budget.
+3. Build the complete static composition, mostly procedurally, with layered
+   terrain/architecture, coherent scale, lighting and original characters.
+   No new object/camera keyframes are added in this stage.
+4. Call `preview_static_scene`: its viewport screenshot is streamed immediately
+   as a progress image. A failed capture does not unlock animation; camera
+   animation and snapshot preparation require a successful static preview.
+5. Animate objects and camera in a separate pass, then prepare the inspectable
+   animated `.blend` with the existing job card. Its automatic frame-1 image
+   is a second, distinct preview, not a repeated static screenshot.
+
+Ordinary model browsing still presents a user-selectable gallery, and ordinary
+scene turns retain their existing screenshot behavior. These staged exceptions
+apply only to signed, confirmed music generation.
 Scene generation preserves existing objects and uses the existing viewport,
 camera-path and snapshot/video-job tools. The first step only prepares a **packed,
 downloadable `.blend`** containing the camera and object keyframes. Open it in Blender

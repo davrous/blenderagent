@@ -267,6 +267,8 @@ def apply_camera_path(keyframes: list[dict], duration_seconds: float = 5, fps: i
     request = music_scene.get()
     if request and (duration_seconds != request.duration_seconds or fps != 25):
         raise ValueError(f"Devfest camera animation must match the selected {request.duration_seconds} seconds at 25 fps.")
+    if request:
+        request.require_static_preview()
     keys = validate_camera_path(keyframes, duration_seconds, fps, interpolation)
     settings = render_settings(duration_seconds, fps)
     result = get_blender_connection().send_command("apply_camera_path", {
@@ -286,6 +288,8 @@ async def start_animation_render(duration_seconds: float = 5, fps: int = 24, res
         or engine != "BLENDER_EEVEE_NEXT" or seedance or fps != 25 or resolution != "480p"
     ):
         raise ValueError(f"Prepare the selected {request.duration_seconds}-second {request.render_mode} Devfest animation at 480p/25 fps, without Seedance.")
+    if request:
+        request.require_static_preview()
     scope = require_scope()
     settings = render_settings(duration_seconds, fps, resolution, mode, engine, samples)
     jobs = get_video_jobs()

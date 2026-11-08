@@ -19,13 +19,14 @@ import httpx
 from agent_framework import Agent, AgentFrameworkException
 from azure.core.exceptions import AzureError, ClientAuthenticationError
 from azure.identity.aio import DefaultAzureCredential
-from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, PrivateAttr, model_validator
 from artifact_storage import ArtifactStorage
 
 SAMPLE_RATE = 24000
 MIN_SECONDS = 2
 MAX_SECONDS = 30
 MAX_PCM_BYTES = SAMPLE_RATE * 2 * MAX_SECONDS
+MAX_MUSIC_ASSET_SEARCHES = 3
 logger = logging.getLogger("blender_agent.music")
 
 
@@ -53,12 +54,27 @@ class MusicRequest(BaseModel):
     duration_seconds: Literal[5, 10, 15] = 15
     render_mode: Literal["clay", "standard"] = "standard"
     source: Literal["gpt_audio", "acrcloud"] | None = None
+    _asset_searches: int = PrivateAttr(default=0)
+    _static_preview_ready: bool = PrivateAttr(default=False)
+    _previewed_model_urls: set[str] = PrivateAttr(default_factory=set)
 
     @model_validator(mode="after")
     def check_generation(self):
         if self.action == "generate" and self.candidate.confidence == "unknown":
             raise ValueError("Confirm identified music before generating a scene.")
         return self
+
+    def reserve_asset_search(self) -> None:
+        if self._static_preview_ready:
+            raise ValueError("The static scene is already previewed; animate the existing scene instead of searching for more assets.")
+        if self._asset_searches >= MAX_MUSIC_ASSET_SEARCHES:
+            raise ValueError("The three asset searches for this music scene are exhausted. Continue procedurally with the available assets.")
+        self._asset_searches += 1
+
+    def require_static_preview(self) -> None:
+        if not self._static_preview_ready:
+            logger.warning("Music animation requested before the static scene preview.")
+            raise ValueError("Finish the static scene and call preview_static_scene successfully before starting animation.")
 
 
 class ACRCloudName(BaseModel):
@@ -374,10 +390,53 @@ def music_instructions(request: MusicRequest) -> str:
         "Explain briefly the character inspirations. Keep the designs original and transformative, not "
         "exact character models, actor likenesses, logos, movie scenes, dialogue, lyrics or the score. "
         "No music generation or reuse of the recorded audio. "
-        "Check the existing scene first; preserve existing user objects. Put this new vignette in its "
-        "own collection rather than clearing the conversation's scene. Build the set, original characters, "
-        "materials and lighting with the existing Blender tools, preferably one batched execute_blender_code. "
-        "Animate OBJECTS as well as the camera, with keyframes spanning the entire timeline. "
+        "\nFOLLOW THESE STAGES IN ORDER, IN THIS SAME TURN. Do not pause for another approval between stages:\n"
+        "1. CONCEPT: Before any construction, propose the scene in 2-4 vivid French sentences. "
+        "Explain the film-inspired environment, the hero subject, the developer gag, and the animation payoff. "
+        "Use 2-3 distinctive visual cues of the selected film's WORLD (landscape, scale, architecture, "
+        "creature archetypes, vehicles, lighting and color palette), not just a label or a few generic props. "
+        "Make it a spectacular cinematic miniature with a coherent story, not a bare platform, scattered "
+        "primitives or text standing in for the setting. For a dinosaur adventure, for example, propose "
+        "a towering original dinosaur silhouette, dense layered jungle, a tiny expedition vehicle and "
+        "a playful build/deploy mishap; do not copy a movie shot, franchise gate/logo or exact character.\n"
+        "2. ASSET SCOUTING: Search list_available_models with short concrete English noun phrases "
+        "for the selected film's most distinctive subjects (e.g. 'dinosaur', 'jungle', 'jeep'). "
+        f"Use AT MOST {MAX_MUSIC_ASSET_SEARCHES} asset-search requests TOTAL, including any texture searches; "
+        "stop early once useful models are found. Do not search the film title, page through results, "
+        "or waste queries on generic office clutter. Prefer procedural materials over texture searches. "
+        "Inspect results and select at most 1-2 genuinely relevant models with useful silhouettes; "
+        "explain briefly which you will use. When you call download_model, the middleware immediately "
+        "shares that selected model's real thumbnail before its import. Do not repeat those images "
+        "or models/texture gallery blocks. "
+        "This is NOT an ordinary browse-only gallery turn: you may choose and download useful assets "
+        "yourself without waiting for another user choice. Use only returned modelUrl values, never "
+        "invent asset URLs or claim an import succeeded without checking the result. If search/import "
+        "fails or nothing fits, say so briefly and continue procedurally; never stall or keep searching.\n"
+        "3. STATIC SCENE: Check the existing scene; preserve existing user objects. Put the new "
+        "vignette in its own collection rather than clearing the conversation's scene. Import useful "
+        "assets with download_model, then build as much of the environment, original characters, "
+        "props and visual storytelling as possible procedurally in a coherent batched execute_blender_code. "
+        "Respect the scale and orientation of imported models; retain their hierarchy and materials. "
+        "Build a strong foreground/midground/background composition, contrasting large and small "
+        "silhouettes, an obvious focal point, rich but controlled colors, believable ground contact, "
+        "film-inspired architecture/terrain and carefully placed secondary details. Use a cinematic "
+        "hero camera, directional key light, rim/fill separation and atmospheric depth where practical. "
+        "Use modest geometry, instancing and simple materials to remain renderable on the CPU container; "
+        "avoid heavy simulations, huge subdivisions and excessive volumetrics. Make the environment "
+        "recognizable even in Clay through shape, scale and composition rather than color alone. "
+        "Set up the static camera and selected render appearance now. Do NOT add new animation "
+        "keyframes, camera paths or start a render while building this static composition. "
+        "Defer intermediate screenshots after individual imports/objects until the whole static scene is ready.\n"
+        "4. STATIC PREVIEW: Once the complete static scene is ready, call preview_static_scene ONCE. "
+        "The middleware immediately sends its real viewport screenshot to the chat, before animation "
+        "work begins. Do not repeat the returned image markdown yourself. If preview fails, fix the "
+        "problem and retry; never pretend an image was sent or skip this stage. Do not request approval "
+        "here: this is a progress image, not a render authorization.\n"
+        "5. ANIMATION: Only AFTER the successful static preview, announce in French that you are "
+        "animating the scene. In a separate procedural pass animate OBJECTS as well as the camera, "
+        "with keyframes spanning the entire timeline. Use readable, expressive object motion, anticipation, "
+        "the comic event and a settled payoff; group imported assets under simple motion controllers "
+        "rather than rebuilding them. Avoid clipping, floating props and camera views that miss the action. "
         f"Duration MUST be EXACTLY {duration} seconds: {duration * 25} frames at 25 fps, 480p, 8 samples. "
         f"The user selected mode='{mode}'. {appearance} "
         "Adapt the pacing and the comic payoff to this exact duration; do not simply truncate a longer animation. "
@@ -387,7 +446,8 @@ def music_instructions(request: MusicRequest) -> str:
         f"Call start_animation_render with duration_seconds={duration}, fps=25, resolution='480p', mode='{mode}', "
         "engine='BLENDER_EEVEE_NEXT', seedance=False. In this Devfest turn the tool only PREPARES and "
         "packs a downloadable .blend snapshot and captures ONE viewport screenshot automatically: "
-        "it returns awaiting_render_approval, NOT a running render. Do not call a separate "
+        "it returns awaiting_render_approval, NOT a running render. This animated frame-1 preview "
+        "is distinct from the earlier STATIC PREVIEW. Do not call a separate "
         "get_viewport_screenshot for this preparation, to avoid duplicate images. "
         "The .blend must contain the complete animated objects and camera, frames 1 to duration*25, "
         "and start at frame 1 so the user can open it in Blender and press Play to inspect the proposed animation. "

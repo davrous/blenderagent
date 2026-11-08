@@ -41,6 +41,7 @@ from auth_diagnostics import start_auth_diagnostics
 from blender_connection import get_blender_connection, close_blender_connection, is_blender_socket_ready
 from conversation_telemetry import FoundryConversationTelemetryAgent
 from scene_manager import SceneManager, workspace_scene
+from music import music_scene
 from media_control import (
     MediaMiddleware, analyze_reference_media, apply_camera_path, configure_vision,
     get_video_job_status, start_animation_render, start_seedance_finish,
@@ -874,9 +875,33 @@ def get_viewport_screenshot(
         return f"Error capturing screenshot: {str(e)}"
 
 
+@tool(approval_mode="never_require")
+def preview_static_scene(max_size: Annotated[int, "Maximum viewport preview dimension in pixels."] = 800) -> str:
+    """Show the COMPLETE static Devfest music scene before adding object/camera animation. This is a progress preview, not render approval."""
+    request = music_scene.get()
+    if request is None:
+        raise ValueError("preview_static_scene is reserved for confirmed music scene generation; use get_viewport_screenshot otherwise.")
+    result = get_viewport_screenshot(max_size=max_size)
+    if not result.startswith("Screenshot captured"):
+        logger.warning("Static music scene preview failed.")
+        raise ValueError(f"The static scene preview failed: {result}")
+    request._static_preview_ready = True
+    return result
+
+
 # ──────────────────────────────────────────────
 # Agent tools - 3D model library (Microsoft)
 # ──────────────────────────────────────────────
+
+def _music_asset_search_error() -> str | None:
+    request = music_scene.get()
+    if request:
+        try:
+            request.reserve_asset_search()
+        except ValueError as exc:
+            logger.warning("Music asset search blocked: %s", exc)
+            return f"ERROR: {exc}"
+    return None
 
 
 @tool(approval_mode="never_require")
@@ -897,6 +922,9 @@ def list_available_models(
     Returns "[]" when nothing matches, or a string starting with "ERROR:" on failure.
     """
     logger.info("Tool called: list_available_models(query=%r)", query)
+    blocked = _music_asset_search_error()
+    if blocked:
+        return blocked
     payload = {
         "type": "Search",
         "pageSize": MODEL_SEARCH_PAGE_SIZE,
@@ -961,6 +989,10 @@ def download_model(
     with "Error"/"Blender crashed" on failure.
     """
     logger.info("Tool called: download_model(name=%r, url=%r)", name, model_url)
+    request = music_scene.get()
+    if request and model_url not in request._previewed_model_urls:
+        logger.warning("Music model import blocked before thumbnail presentation.")
+        return "Error: choose a model returned by list_available_models and show its thumbnail before importing it."
     try:
         blender = get_blender_connection()
         result = blender.send_command(
@@ -974,9 +1006,13 @@ def download_model(
         if result.get("success"):
             imported = ", ".join(result.get("imported_objects", [])) or name
             logger.info("download_model succeeded: %s", imported)
+            next_step = (
+                "Finish the complete static composition, then call preview_static_scene before animating."
+                if music_scene.get() else "Now take a single viewport screenshot so the user can see it."
+            )
             return (
                 f"Imported the model into the scene as: {imported}. "
-                f"Now take a single viewport screenshot so the user can see it."
+                f"{next_step}"
             )
         logger.warning("download_model failed: %s", result.get("message", "Unknown error"))
         return f"Failed to import model: {result.get('message', 'Unknown error')}"
@@ -1040,6 +1076,9 @@ def list_available_textures(
     Returns "[]" when nothing matches, or a string starting with "ERROR:" on failure.
     """
     logger.info("Tool called: list_available_textures(query=%r)", query)
+    blocked = _music_asset_search_error()
+    if blocked:
+        return blocked
     try:
         with httpx.Client(timeout=30.0) as client:
             response = client.get(
@@ -1578,6 +1617,9 @@ _TOOL_STATUS_MESSAGES: dict[str, str] = {
     "apply_material": "Applying material…",
     "execute_blender_code": "Executing Blender code…",
     "get_viewport_screenshot": "Capturing viewport screenshot…",
+    "preview_static_scene": "Scène statique terminée : capture du viewport avant l'animation…",
+    "apply_camera_path": "Animating the camera…",
+    "start_animation_render": "Preparing the animation snapshot…",
     "list_available_models": "Searching the 3D model library…",
     "download_model": "Importing the 3D model…",
     "list_available_textures": "Searching Poly Haven textures…",
@@ -1600,7 +1642,7 @@ class ToolStatusMiddleware(AgentMiddleware):
     _LINK_RE = re.compile(r"\[[^\]]+\]\([^)]+\)")
 
     # Tools whose function_result may contain an image to surface
-    _IMAGE_TOOLS = {"get_viewport_screenshot", "render_preview", "render_final"}
+    _IMAGE_TOOLS = {"get_viewport_screenshot", "preview_static_scene", "render_preview", "render_final"}
 
     # Tools whose function_result contains a download link to surface
     _LINK_TOOLS = {"save_scene_for_download", "export_scene_as_glb_for_download"}
@@ -1609,6 +1651,7 @@ class ToolStatusMiddleware(AgentMiddleware):
         "render_preview": "Here's a quick preview while the final render is in progress:",
         "render_final": "Here's the rendered image:",
         "get_viewport_screenshot": "Here's the current viewport:",
+        "preview_static_scene": "La scène statique est prête. Voici le viewport avant la conception de l'animation :",
     }
 
     async def process(self, context: AgentContext, call_next) -> None:
@@ -1629,6 +1672,8 @@ class ToolStatusMiddleware(AgentMiddleware):
             image_call_ids: dict[str, str] = {}
             # Track call_ids for link-producing tools → tool name
             link_call_ids: dict[str, str] = {}
+            model_search_call_ids: set[str] = set()
+            available_models: dict[str, dict[str, str]] = {}
             # call_ids already surfaced early, so a re-emitted function_result
             # (the framework can send the same result in multiple chunks) is
             # never surfaced twice.
@@ -1706,24 +1751,72 @@ class ToolStatusMiddleware(AgentMiddleware):
                         # ── Status messages before each tool call ──
                         if content.type == "function_call":
                             call_id = content.call_id or content.name
+                            music_request = music_scene.get()
+                            if music_request and content.name == "list_available_models" and call_id:
+                                model_search_call_ids.add(call_id)
+                            if music_request and content.name == "download_model":
+                                arguments = content.arguments
+                                if isinstance(arguments, str):
+                                    try:
+                                        arguments = json.loads(arguments)
+                                    except json.JSONDecodeError:
+                                        arguments = None
+                                model_url = arguments.get("model_url") if isinstance(arguments, dict) else None
+                                model = available_models.get(model_url) if isinstance(model_url, str) else None
+                                if model and model_url not in music_request._previewed_model_urls:
+                                    # Yield the preview before advancing the stream that executes the import.
+                                    yield AgentResponseUpdate(
+                                        contents=[Content.from_text(
+                                            f"\n\nModèle retenu pour la scène : {model['name']}\n\n"
+                                            f"![Asset 3D retenu]({model['imageUrl']})\n\n"
+                                        )], role="assistant", message_id=f"music-asset-{call_id}",
+                                    )
+                                    music_request._previewed_model_urls.add(model_url)
                             if content.name in self._IMAGE_TOOLS and call_id:
                                 image_call_ids[call_id] = content.name
                             if content.name in self._LINK_TOOLS and call_id:
                                 link_call_ids[call_id] = content.name
-                            if content.name and content.name not in announced_names:
-                                announced_names.add(content.name)
+                            status_key = content.name
+                            if music_request and content.name == "execute_blender_code":
+                                status_key = f"{content.name}:{'animation' if music_request._static_preview_ready else 'static'}"
+                            if content.name and status_key not in announced_names:
+                                announced_names.add(status_key)
                                 status = _TOOL_STATUS_MESSAGES.get(
                                     content.name, "Working on it…"
                                 )
+                                if music_request:
+                                    status = {
+                                        "list_available_models": "Recherche de modèles 3D pour illustrer le film…",
+                                        "download_model": "Import du modèle retenu pour la scène…",
+                                        "execute_blender_code": "Conception et animation des objets…"
+                                        if music_request._static_preview_ready else "Construction de la scène statique…",
+                                        "apply_camera_path": "Conception de l'animation et des mouvements de caméra…",
+                                        "start_animation_render": "Préparation du fichier Blender animé à inspecter avant le rendu…",
+                                    }.get(content.name, status)
                                 yield AgentResponseUpdate(
                                     contents=[Content.from_text(f"\n\n*{status}*\n\n")],
                                     role="assistant",
-                                    message_id=f"status-{content.name}",
+                                    message_id=f"status-{status_key}",
                                 )
 
                         # ── Stream images from tool results immediately ──
                         if content.type == "function_result":
                             cid = content.call_id or ""
+                            if cid in model_search_call_ids:
+                                text = content.result
+                                if isinstance(text, str) and not text.startswith("ERROR:"):
+                                    try:
+                                        models = json.loads(text)
+                                    except json.JSONDecodeError:
+                                        logger.warning("Music model search returned invalid gallery JSON.")
+                                    else:
+                                        if isinstance(models, list):
+                                            for model in models:
+                                                if isinstance(model, dict) and all(
+                                                    isinstance(model.get(key), str) and model[key]
+                                                    for key in ("name", "imageUrl", "modelUrl")
+                                                ):
+                                                    available_models[model["modelUrl"]] = model
                             if cid in image_call_ids and cid not in surfaced_call_ids:
                                 match = self._IMAGE_RE.search(
                                     content.result or ""
@@ -2353,6 +2446,7 @@ async def main():
 - Call get_scene_info() at the start of every continuation turn (any user message after the first one in a conversation) to see what objects already exist before adding or modifying. Skip it only on the very first turn of a fresh scene.
 - **Relative transforms (resize / move / rotate by a factor or offset):** `modify_object` takes ABSOLUTE values, not relative ones. When the user asks for a relative change (e.g. "reduce the size by 5x", "move it 2m to the right", "rotate 90° more"), you MUST first call `get_object_info(object_name=…)` to read the current scale/location/rotation, compute the new absolute value yourself, then pass that to `modify_object`. Calling `modify_object` with only `object_name` and no transform parameters will fail.
 - Take ONE viewport screenshot at the very end after ALL changes are complete, or when the user explicitly asks. NEVER take intermediate screenshots between steps.
+- Exception: for an explicitly confirmed Devfest music-generation turn, follow its injected staged brief instead. Propose the concept, scout at most three assets, build the static scene, call preview_static_scene before any new animation keyframes, then animate and prepare the inspectable .blend. The static progress screenshot does not authorize rendering.
 - For batch operations (multiple objects, materials, transforms), prefer a single execute_blender_code() call with one combined Python script instead of many sequential tool calls.
 - When creating an object that needs a color, call create_object() then apply_material() — but batch multiple such pairs into one execute_blender_code() call when possible.
 - Use setup_scene() to initialize camera and lighting when starting a new scene.
@@ -2372,6 +2466,7 @@ You have two asset libraries. The web chat renders picture galleries the user ca
 
 ### Ready-made 3D models (Microsoft library)
 - `list_available_models(query)` — search the library. Returns a JSON array of models, each with `name`, `imageUrl` (a thumbnail) and `modelUrl`.
+- In confirmed Devfest music generation ONLY, the browse-only rules below do not apply: choose relevant assets autonomously and continue building in this same turn, without another approval. The middleware streams the chosen model thumbnail before download_model imports it. Do not duplicate those previews or gallery blocks. Finish the whole static scene before preview_static_scene; do not take an extra screenshot after each import.
 - `download_model(model_url, name)` — downloads a chosen GLB and imports it into the Blender scene.
 
 Workflow:
@@ -2472,6 +2567,7 @@ This environment runs **Blender 4.4**. The following Blender 3.x APIs were remov
             apply_material,
             execute_blender_code,
             get_viewport_screenshot,
+            preview_static_scene,
             list_available_models,
             download_model,
             list_available_textures,
