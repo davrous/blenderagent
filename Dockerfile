@@ -10,7 +10,24 @@ ENV DISPLAY=:99
 ENV PYTHONUNBUFFERED=1
 
 # ── 1. System packages ──
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Mirror sync errors require a fresh index download, not just a transfer retry.
+RUN set -eu; \
+    for attempt in 1 2 3 4 5; do \
+        if apt-get -o Acquire::Retries=3 update --error-on=any; then \
+            break; \
+        else \
+            status=$?; \
+        fi; \
+        if [ "$attempt" -eq 5 ]; then \
+            echo "apt-get update failed after $attempt attempts; aborting build." >&2; \
+            exit "$status"; \
+        fi; \
+        delay=$((attempt * 15)); \
+        echo "apt-get update failed (attempt $attempt/5); clearing indexes and retrying in ${delay}s." >&2; \
+        rm -rf /var/lib/apt/lists/*; \
+        sleep "$delay"; \
+    done; \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     # Python 3 + pip
     python3 python3-pip python3-venv \
     # Virtual framebuffer for headless Blender GUI

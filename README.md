@@ -344,6 +344,25 @@ separately for browser/proxy changes.
 > export AI_FOUNDRY_ACR_BUILD_WAIT_UNTIL_DONE=true
 > ```
 
+### Ubuntu package mirror errors during the image build
+
+An ACR build failure at `apt-get update` with `File has unexpected size`,
+`Mirror sync in progress?`, or an index hash mismatch indicates inconsistent
+Ubuntu repository metadata/downloads, before the agent starts. Retry the
+deployment after the mirror has synchronized; this is not a Foundry runtime or
+agent authentication error.
+
+The [Dockerfile](Dockerfile) retries the initial index refresh up to five times,
+clearing partial indexes and waiting 15, 30, 45, then 60 seconds between attempts.
+APT also retries failed transfers three times. Any index download error makes
+the refresh fail; packages are installed only after a successful refresh, and
+exhausted retries fail the build. Signature and hash verification remain enabled.
+If the error persists, inspect Ubuntu mirror/network health rather than disabling
+package verification.
+
+Run `node devTools/test_docker_apt.mjs` to check the retry and failure paths without
+Docker or network access.
+
 ## Teams Setup and Usage
 
 
@@ -1273,31 +1292,43 @@ Then, in **two terminals**:
 
 The rest of this section explains what the `playground` verb does for you, which is what you need if you want to run it by hand.
 
+The shortcut requires Node.js and selects the first non-loopback IPv4 address,
+skipping common VPN and virtual interfaces. It binds Playground to that address and advertises the same address
+for replies. **Playground is accessible on that network: use a trusted LAN
+only.** To select another interface or port, use
+`./blenderagent playground --host <LAN-IP> --port 56151` (or the PowerShell
+equivalent). The reply URL follows those options automatically; an explicit
+`--service-url` is also respected without adding a duplicate flag. An occupied
+port causes an error rather than allowing Playground to choose a different port
+and leave the reply URL pointing at the old one.
+
+The startup check uses `GET /readiness`, not an empty activity POST: `{}` is
+not a valid activity and produces an error even when the agent is running.
+Launcher regression checks: `node devTools/test_playground.mjs`.
+
 Run the container exactly as documented in [Build & Run](#run-the-container) (port `8088` is all that's needed for text), then run the Playground manually:
 
 ```powershell
-agentsplayground -e http://localhost:8088/api/messages --service-url http://host.docker.internal:56150/_connector
+agentsplayground -e http://localhost:8088/api/messages --host <LAN-IP> --service-url http://<LAN-IP>:56150/_connector
 ```
 
-Both flags matter, because the Activity protocol is **bidirectional** and the agent runs in Docker:
+Replace `<LAN-IP>` with your host's LAN IPv4 address. All three flags matter,
+because the Activity protocol is **bidirectional** and the agent runs in Docker:
 
 - **Inbound** (`-e`) — the Playground POSTs the activity to the agent: `http://localhost:8088/api/messages`. Works out of the box, since `-p 8088:8088` publishes the port.
-- **Outbound** (`--service-url`) — the agent posts its replies back to the `serviceUrl` carried in the activity. The Playground defaults that to `http://localhost:56150/_connector`, and **inside the container `localhost` is the container itself**, so without the flag the reply fails with:
+- **Listener** (`--host`) — Playground listens on the host's LAN address instead of its default `127.0.0.1`. Its Host-header validation also accepts this explicitly configured address.
+- **Outbound** (`--service-url`) — the agent posts its replies back to the `serviceUrl` carried in the activity. Use the same LAN address as `--host`. The default `http://localhost:56150/_connector` points back into the container, not at Playground.
 
-  ```
-  ClientConnectorError: Cannot connect to host localhost:56150
-  ConnectionRefusedError: [Errno 111] Connect call failed ('127.0.0.1', 56150)
-  ```
+Playground 0.2.29 rejects the former `host.docker.internal` callback URL with
+`403 Invalid Host header`. The agent can finish its turn while none of its
+replies appear. Merely adding `--host 0.0.0.0` does not allow that hostname;
+using a matching LAN address for the listener and callback fixes both problems.
 
-  The agent turn actually ran fine (you'll see the tools execute in the logs) — only the reply was undeliverable, so the Playground shows nothing. Pointing `--service-url` at `host.docker.internal` makes the Playground advertise the host address instead.
-
-`host.docker.internal` resolves to the host gateway from inside Docker Desktop containers with no extra flags. Verify it if replies still don't arrive:
+Verify the advertised address from inside the container if replies still don't arrive:
 
 ```powershell
-docker exec <container-id> sh -c "nc -z -w 3 host.docker.internal 56150 && echo REACHABLE || echo UNREACHABLE"
+docker exec <container-id> sh -c "nc -z -w 3 <LAN-IP> 56150 && echo REACHABLE || echo UNREACHABLE"
 ```
-
-On a Docker engine without Docker Desktop's magic hostname, add `--add-host=host.docker.internal:host-gateway` to your `docker run`.
 
 > Running the agent **outside** Docker (`python main.py --port 8088`) needs no `--service-url` at all — plain `agentsplayground -e http://localhost:8088/api/messages` works, because both sides share the same `localhost`. That path still requires a reachable Blender on port 9876.
 

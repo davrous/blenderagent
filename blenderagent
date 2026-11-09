@@ -21,12 +21,6 @@ set -euo pipefail
 IMAGE="blender-scene-agent"
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# Where the Playground POSTs activities, and where the agent posts replies back.
-# `host.docker.internal` (not localhost) because the agent runs in the container:
-# localhost there is the container itself, so replies would never reach us.
-PLAYGROUND_ENDPOINT="http://localhost:8088/api/messages"
-PLAYGROUND_SERVICE_URL="http://host.docker.internal:56150/_connector"
-
 DIM="$(printf '\033[2m')"
 YELLOW="$(printf '\033[33m')"
 RESET="$(printf '\033[0m')"
@@ -46,6 +40,8 @@ Examples
   ./blenderagent start -e LOG_LEVEL=DEBUG
 
 The container must already be running (in another terminal) before 'playground'.
+Playground uses a LAN IPv4 address for Docker replies; use only on a trusted network.
+Use 'playground --host <LAN-IP> --port <port>' to override its address or port.
 EOF
 }
 
@@ -102,16 +98,27 @@ start() {
 playground() {
     command -v agentsplayground >/dev/null 2>&1 ||
         die "agentsplayground was not found on PATH. Install it with 'winget install agentsplayground' (Windows) or see the M365 Agents Playground docs."
+    command -v node >/dev/null 2>&1 ||
+        die "node was not found on PATH. Install Node.js to select the Playground's Docker-reachable address."
+
+    local defaults
+    defaults="$(node "$ROOT/devTools/playground_args.mjs" "$@")" || exit "$?"
+    local arguments=()
+    if [ -n "$defaults" ]; then
+        while IFS= read -r argument; do
+            arguments+=("$argument")
+        done <<< "$defaults"
+    fi
+    arguments+=("$@")
 
     # The Playground only drives an already-running agent; it does not start one.
-    if ! curl -fsS -o /dev/null --max-time 2 "http://localhost:8088/api/messages" -X POST -d '{}' -H 'Content-Type: application/json' 2>/dev/null; then
-        printf '%swarning: nothing answered on http://localhost:8088 — run "./blenderagent start" in another terminal first.%s\n' \
+    if ! curl -fsS -o /dev/null --max-time 2 "http://localhost:8088/readiness"; then
+        printf '%swarning: the agent is not ready on http://localhost:8088 — wait for startup or run "./blenderagent start" in another terminal first.%s\n' \
             "$YELLOW" "$RESET" >&2
     fi
 
-    printf '%s> agentsplayground -e %s --service-url %s %s%s\n' \
-        "$DIM" "$PLAYGROUND_ENDPOINT" "$PLAYGROUND_SERVICE_URL" "$*" "$RESET"
-    agentsplayground -e "$PLAYGROUND_ENDPOINT" --service-url "$PLAYGROUND_SERVICE_URL" "$@"
+    printf '%s> agentsplayground %s%s\n' "$DIM" "${arguments[*]}" "$RESET"
+    agentsplayground "${arguments[@]}"
 }
 
 cd "$ROOT"
