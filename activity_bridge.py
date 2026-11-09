@@ -140,13 +140,11 @@ _KEEPALIVE_SECONDS = float(os.environ.get("ACTIVITY_KEEPALIVE_SECONDS", "20"))
 _KEEPALIVE_POLL_SECONDS = 2.0
 _KEEPALIVE_FALLBACK_TEXT = "Working on your scene"
 _TEAMS_STATUS_INTERVAL = 1.0
+_TEAMS_STATUS_MAX_SECONDS = 540.0
 
-# Teams enforces a hard two-minute lifetime on a streamed message and then
-# rejects everything further with 403 ContentStreamNotAllowed ("Content stream
-# finished due to exceeded streaming time") — including the final message, so
-# the whole reply is lost. Close the stream before that and keep going with
-# ordinary messages. MUST stay below 120: a larger value disables the guard
-# entirely and hands the turn back to the failure it exists to prevent.
+# Keep the legacy SDK path below its two-minute channel limit. Native Teams
+# informative updates have a separate nine-minute guard before their ten-minute
+# platform deadline.
 _STREAM_MAX_SECONDS = min(
     float(os.environ.get("ACTIVITY_STREAM_MAX_SECONDS", "90")), 110.0
 )
@@ -156,8 +154,8 @@ _STREAM_CONTINUED_TEXT = "Still working on it — I'll send the rest right here.
 # The platform in front of the container gives up on the inbound request after
 # roughly 45s and shows an error in the client, even though the agent is still
 # working. Turns that pass this mark therefore stop replying *to the request*:
-# the live response is closed with a "this will take a while" note, the request
-# completes, and the result is delivered later as a proactive message.
+# legacy responses close with a handover note; native Teams statuses stay live
+# without a chat message. The request completes and the result arrives later.
 # Set to 0 to disable and always answer in-request.
 _PROACTIVE_AFTER_SECONDS = float(
     os.environ.get("ACTIVITY_PROACTIVE_AFTER_SECONDS", "35")
@@ -1686,11 +1684,12 @@ class _TeamsStatusEmitter(_ProactiveEmitter):
         super().__init__(context, previous)
         self._status_lock = asyncio.Lock()
         self._stream_id: str | None = None
+        self._stream_started: float | None = None
+        self._stream_closed = False
         self._sequence = 0
         self._last_post = 0.0
         self._native = True
         self._finished = False
-        self._handed_over = False
 
     async def _deliver_direct(self, activity: Any) -> bool:
         return (await self._post_activity(activity, to_conversation=True)) is not False
@@ -1710,6 +1709,7 @@ class _TeamsStatusEmitter(_ProactiveEmitter):
             delay = _TEAMS_STATUS_INTERVAL - (time.monotonic() - self._last_post)
             if delay > 0:
                 await asyncio.sleep(delay)
+            posted_at = time.monotonic()
             async with asyncio.timeout(10):
                 response = await self._post_activity(activity, to_conversation=True)
             if response is False:
@@ -1718,24 +1718,35 @@ class _TeamsStatusEmitter(_ProactiveEmitter):
                 stream_id = getattr(response, "id", None)
                 if not isinstance(stream_id, str) or not stream_id:
                     self._native = False
-                    logger.warning("Teams returned no status stream ID; continuing with ordinary messages")
+                    logger.warning(
+                        "Teams returned no status stream ID; suppressing chat statuses "
+                        "and keeping the complete answer for ordinary delivery"
+                    )
                     return False
                 self._stream_id = stream_id
+                self._stream_started = posted_at
             self._last_post = time.monotonic()
             self._touch()
             if kind == "final":
                 self._native = False
+                self._stream_closed = True
             return True
         except Exception as error:
             self._native = False
             logger.warning(
-                "Native Teams %s delivery failed (%s); continuing with ordinary messages",
+                "Native Teams %s delivery failed (%s); suppressing chat statuses "
+                "and retaining the complete answer for final delivery",
                 kind, type(error).__name__,
             )
             return False
 
     async def _expire(self) -> None:
-        if self._native and self.elapsed > _STREAM_MAX_SECONDS:
+        if (
+            self._native
+            and self._stream_started is not None
+            and time.monotonic() - self._stream_started >= _TEAMS_STATUS_MAX_SECONDS
+        ):
+            logger.info("Native Teams status stream reached its nine-minute safety deadline")
             if self._stream_id:
                 await self._try_stream("final", _STREAM_CONTINUED_TEXT)
             self._native = False
@@ -1745,10 +1756,8 @@ class _TeamsStatusEmitter(_ProactiveEmitter):
             if self._finished or not self._current():
                 return
             await self._expire()
-            if self._native and await self._try_stream("informative", text):
-                return
-            if await self._send(Activity(type="message", text=text)):
-                self._touch()
+            if self._native:
+                await self._try_stream("informative", text)
 
     async def status(self, text: str) -> None:
         self._last_status = text
@@ -1762,30 +1771,17 @@ class _TeamsStatusEmitter(_ProactiveEmitter):
             if not self._finished and self._current():
                 await self._expire()
 
-    async def handover(self) -> None:
-        async with self._status_lock:
-            if self._finished or not self._current():
-                return
-            self._handed_over = True
-            body = "".join(self._parts).strip() + _HANDOVER_TEXT
-            attachments = self._attachments
-            self._parts = []
-            self._attachments = []
-            await self._send(Activity(type="message", text=body, attachments=attachments))
-
     async def progress(self) -> None:
-        if self._handed_over:
-            await super().progress()
+        return None
 
     async def finish(self) -> None:
         async with self._status_lock:
             if self._finished or not self._current():
                 return
             self._finished = True
-            await self._expire()
             body = "".join(self._parts).strip()
             body = body or (_GALLERY_ONLY_TEXT if self._attachments else _EMPTY_REPLY_TEXT)
-            if self._native and self._stream_id:
+            if self._stream_id and not self._stream_closed:
                 if await self._try_stream("final", body, self._attachments):
                     return
             await self._send(Activity(type="message", text=body, attachments=self._attachments))
@@ -1838,15 +1834,14 @@ class _Relay:
         await self._inner.finish()
 
     async def detach(self, context: Any) -> None:
-        """Close out the live response and continue in the background."""
+        """Release the request, retaining native Teams status delivery."""
         if self._detached:
             return
         previous = self._inner
         if isinstance(previous, _TeamsStatusEmitter):
-            # This emitter already uses fresh clients; only the HTTP request
-            # detaches. Its informative-update stream can stay alive.
+            # Only the HTTP request detaches. Keep statuses native and retain
+            # the answer buffer instead of publishing a handover or preview.
             self._detached = True
-            await previous.handover()
             return
         # Swap FIRST, before any await. `detach` runs on the request task while
         # the turn task is still streaming, and closing the live response below

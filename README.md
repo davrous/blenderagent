@@ -607,9 +607,9 @@ this is a client-side status timer, not proof of server-side progress.
 | `BLENDER_AGENT_LOG_LEVEL` | No | `INFO` | Agent logging verbosity |
 | `AUTH_DIAGNOSTICS_ENABLED` | No | `false` in code | Hosted credential probes; current `agent.yaml` explicitly enables them for investigation |
 | `ENABLE_ACTIVITY` | No | `true` | Enable Teams/M365 Activity routing alongside Responses and optional voice |
-| `ACTIVITY_KEEPALIVE_SECONDS` | No | `20` | Status keep-alive interval while an Activity turn is attached |
+| `ACTIVITY_KEEPALIVE_SECONDS` | No | `20` | Status keep-alive interval; native Teams updates also continue after HTTP detachment |
 | `ACTIVITY_PROACTIVE_AFTER_SECONDS` | No | `35` | Detach slow Activity turns and deliver their result proactively |
-| `ACTIVITY_STREAM_MAX_SECONDS` | No | `90` | Close a Teams stream before its channel deadline; capped at 110 seconds |
+| `ACTIVITY_STREAM_MAX_SECONDS` | No | `90` | Legacy SDK stream guard, capped at 110 seconds; native Teams statuses use a separate nine-minute guard |
 | `BLENDER_HOST` | No | `localhost` | Blender socket server host |
 | `BLENDER_PORT` | No | `9876` | Blender socket server port |
 | `ENABLE_VOICE` | No | `true` | Enable the voice path (speech-in / speech-out). Voice only activates when Speech is also configured below. |
@@ -983,11 +983,14 @@ stream ID; subsequent updates retain it, increment the sequence and respect
 Teams' one-request-per-second limit. The final message has no stream sequence.
 
 The emitter uses fresh connector clients even after the inbound request is
-detached, preserving native action updates during slow renders. If Teams refuses
-an update, returns no initial stream ID, or rejects stream finalization, the
-bridge logs the failure and uses ordinary messages, including a complete final
-answer. The conservative `ACTIVITY_STREAM_MAX_SECONDS` safety deadline still
-closes a live stream before switching to ordinary status/result messages.
+detached, preserving native action updates during slow renders. HTTP detachment
+does not publish a handover notice or flush the buffered answer. If Teams refuses
+an update or returns no initial stream ID, the bridge logs the failure and
+suppresses further statuses rather than posting chat countdowns. A known stream
+is still finalized with the complete answer when possible; a rejected final is
+retried as an ordinary complete answer. The separate nine-minute native-stream
+guard closes a genuinely long-running stream with one continuation notice, then
+waits for the final result without posting ordinary statuses.
 History, scene affinity and in-place video card updates are unchanged.
 
 `supportsTargetedMessages` in the preview manifest opts in to receiving private
@@ -1008,14 +1011,19 @@ Two independent limits bite on turns that take a while, and both are handled in 
 **Silence.** Teams and M365 Copilot abandon a turn that produces no traffic for roughly 45 s, and a single tool call (a final render, a model import) routinely takes longer. Status updates only fire when a tool *starts*, so a keep-alive pump (`_keepalive_pump`, `ACTIVITY_KEEPALIVE_SECONDS`, default 20 s) re-states the **current** status whenever nothing has gone out for that long — `Rendering the final image — still working (63s)`. It runs as a task alongside the agent stream and is cancelled before the final message so a keep-alive can never interleave with it.
 
 - Native Teams turns get informative updates, including after request detachment, without streaming intermediate answer text. Legacy streaming paths also keep keep-alive noise out of answer text.
-- Non-streaming channels (M365 Copilot, or Teams after a native-status failure/deadline) get short ordinary status messages.
+- Non-streaming paths such as M365 Copilot retain short ordinary status messages.
+  A native Teams turn never falls back to chat status/countdown messages after a
+  status failure or deadline; only the final answer uses ordinary delivery.
 
 **Stream lifetime.** Older Teams experiences rejected streams after two minutes;
-the current REST documentation describes a ten-minute limit. The bridge keeps its
-conservative `ACTIVITY_STREAM_MAX_SECONDS` guard (default 90, capped at 110) for
-compatibility. Every pump poll checks the deadline. Native Teams status streams
-are closed before the guard and later output uses ordinary messages; a failed
-stream finalization is retried as a complete ordinary answer.
+the current REST documentation describes a ten-minute limit. Native Teams
+informative updates therefore use a separate nine-minute safety guard, measured
+from their first update rather than from turn creation. They remain native
+through the 35-second HTTP detach and beyond the old 90-second guard. Every pump
+poll checks the deadline. At nine minutes, the stream closes with one continuation
+notice and the eventual complete answer is sent ordinarily, without chat
+countdowns. The legacy SDK path retains `ACTIVITY_STREAM_MAX_SECONDS` (default 90,
+capped at 110); a failed native finalization is still retried as an ordinary answer.
 
 ### Adaptive Card galleries
 
@@ -1053,11 +1061,19 @@ So a slow turn must stop trying to answer *the request* and instead answer *the 
 The bridge runs the turn as a task and waits on it for `ACTIVITY_PROACTIVE_AFTER_SECONDS` (default 35):
 
 - **Under the mark** — asset searches, small scenes — nothing changes: the turn finishes in-request with live streaming.
-- **Over it**, the turn is *detached*. `_Relay.detach()` writes *"⏳ This task requires time — I'll keep working on it in the background and message you here as soon as it's ready"* onto the live response, closes it, and swaps the emitter for a `_ProactiveEmitter`. The handler returns, so the request completes well inside the platform's window. The task keeps running.
+- **Over it**, the turn is *detached*. For legacy/non-native paths,
+  `_Relay.detach()` writes *"⏳ This task requires time — I'll keep working on it
+  in the background and message you here as soon as it's ready"* onto the live
+  response, closes it, and swaps the emitter for a `_ProactiveEmitter`. The
+  handler returns, so the request completes well inside the platform's window.
+  The task keeps running.
 
 For native Teams action updates, the emitter already uses fresh clients, so only
-the HTTP request detaches: the handover note is an ordinary message and the
-informative-update stream remains open until completion or its safety deadline.
+the HTTP request detaches, silently. The informative-update stream stays open,
+and text, images and cards remain buffered for the complete final answer.
+Neither detachment nor render progress generates a chat handover/countdown.
+
+The following diagram illustrates the legacy/non-native handover:
 
 ```mermaid
 sequenceDiagram
@@ -1066,7 +1082,7 @@ sequenceDiagram
     participant T as Turn task
     U->>H: "create a cabin and render it"
     H->>T: start (detached after 35s)
-    H-->>U: 1. ⏳ This task requires time… (native status stream stays open)
+    H-->>U: 1. ⏳ This task requires time… (legacy stream closed)
     Note over H: HTTP request completes — no client timeout
     T-->>U: 2. 🖼️ viewport screenshot (proactive)
     Note over T: render_final runs (~40s)
@@ -1077,7 +1093,10 @@ sequenceDiagram
 
 ### Two proactive messages for a render, not one
 
-A detached turn would otherwise be silent from the handover until the render lands — a minute of nothing after a promise. So a render produces **two** proactive messages:
+On legacy/non-native paths, a detached turn would otherwise be silent from the
+handover until the render lands. A render therefore produces **two** proactive
+messages there. Native Teams turns instead keep their informative status control
+and send one complete answer:
 
 | # | When | What it carries | Why |
 |---|---|---|---|

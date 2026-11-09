@@ -417,22 +417,45 @@ async def test_native_teams_status():
 
     send.reset_mock(side_effect=True)
     send.return_value = SimpleNamespace(id="after-detach")
-    relay = ab._Relay(ab._TeamsStatusEmitter(context, ab._Emitter(context)))
+    emitter = ab._TeamsStatusEmitter(context, ab._Emitter(context))
+    relay = ab._Relay(emitter)
     with patch.object(ab, "_TEAMS_STATUS_INTERVAL", 0):
         await relay.status("Inspecting...")
         await relay.text("Viewport ready.")
         await relay.detach(context)
+        _check("native HTTP detach sends no chat message", send.await_count, 1)
         context.send_activity = AsyncMock(side_effect=RuntimeError("Inbound context closed"))
         await relay.status("Rendering...")
-        await relay.keepalive()
+        await relay.card(SimpleNamespace(content_type="card"))
+        await relay.progress()
+        _check("native render progress stays in status control", send.await_count, 2)
+        for elapsed in (35, 57, 77, 100, 180, 500):
+            now = ab.time.monotonic()
+            emitter._started = now - elapsed
+            emitter._stream_started = now - elapsed
+            await relay.tick()
+            await relay.keepalive()
         await relay.text("Render ready.")
+        await relay.finish()
+        completed_count = send.await_count
+        await relay.keepalive()
+        await relay.status("Already done")
+        await relay.progress()
         await relay.finish()
     activities = [call.args[1] for call in send.await_args_list]
     _check("native turn detaches", relay.detached, True)
-    _check("native handover does not close status stream", activities[1].text, "Viewport ready." + ab._HANDOVER_TEXT)
-    _check("native actions survive detach", activities[2].text, "Rendering...")
-    _check("native keepalive survives detach", "still working" in activities[3].text, True)
-    _check("native final after detach", activities[4].text, "Render ready.")
+    _check("native actions survive detach", activities[1].text, "Rendering...")
+    _check("native long-turn keepalives never become chat messages",
+           [item.type for item in activities], ["typing"] * 8 + ["message"])
+    _check("native long-turn status sequences stay continuous",
+           [item.entities[0]["streamSequence"] for item in activities if item.type == "typing"],
+           list(range(1, 9)))
+    _check("native final after detach preserves the full answer", activities[-1].text,
+           "Viewport ready.Render ready.")
+    _check("native final after detach preserves cards", len(activities[-1].attachments), 1)
+    _check("native final after detach closes the status control", activities[-1].entities,
+           [{"type": "streaminfo", "streamType": "final", "streamId": "after-detach"}])
+    _check("native completed turn sends nothing else", send.await_count, completed_count)
     _check("native detached turn never reuses inbound context", context.send_activity.await_count, 0)
     _check("native detached result keeps thread", {call.args[0] for call in send.await_args_list},
            {context.activity.conversation.id})
@@ -445,8 +468,8 @@ async def test_native_teams_status_failures():
     client = SimpleNamespace(conversations=SimpleNamespace(send_to_conversation=send), close=AsyncMock())
     context.turn_state["factory"] = SimpleNamespace(create_connector_client=AsyncMock(return_value=client))
     for label, responses in [
-        ("initial 404", [RuntimeError("404"), SimpleNamespace(id="plain"), SimpleNamespace(id="answer")]),
-        ("missing stream ID", [None, SimpleNamespace(id="plain"), SimpleNamespace(id="answer")]),
+        ("initial 404", [RuntimeError("404"), SimpleNamespace(id="answer")]),
+        ("missing stream ID", [None, SimpleNamespace(id="answer")]),
         ("final 403", [SimpleNamespace(id="stream"), RuntimeError("403"), SimpleNamespace(id="answer")]),
     ]:
         send.reset_mock(side_effect=True)
@@ -454,26 +477,74 @@ async def test_native_teams_status_failures():
         emitter = ab._TeamsStatusEmitter(context, ab._Emitter(context))
         with patch.object(ab, "_TEAMS_STATUS_INTERVAL", 0):
             await emitter.status("Inspecting...")
+            if label != "final 403":
+                await emitter.status("Rendering...")
+                await emitter.keepalive()
             await emitter.text("The complete answer.")
+            await emitter.card(SimpleNamespace(content_type="card"))
             await emitter.finish()
-        final = send.await_args_list[-1].args[1]
+        activities = [call.args[1] for call in send.await_args_list]
+        final = activities[-1]
         _check(f"{label} keeps the complete answer", final.text, "The complete answer.")
+        _check(f"{label} keeps final attachments", len(final.attachments), 1)
         _check(f"{label} falls back without stream metadata", getattr(final, "entities", None), None)
+        _check(f"{label} never sends ordinary status text",
+               [item.text for item in activities if item.type == "message" and not getattr(item, "entities", None)],
+               ["The complete answer."])
+
+    send.reset_mock(side_effect=True)
+    send.side_effect = [
+        SimpleNamespace(id="stream"), RuntimeError("403"), SimpleNamespace(id="final"),
+    ]
+    emitter = ab._TeamsStatusEmitter(context, ab._Emitter(context))
+    with patch.object(ab, "_TEAMS_STATUS_INTERVAL", 0):
+        await emitter.status("Inspecting...")
+        await emitter.status("Rendering...")
+        await emitter.keepalive()
+        await emitter.progress()
+        await emitter.text("Recovered answer.")
+        await emitter.finish()
+    activities = [call.args[1] for call in send.await_args_list]
+    _check("failed native update never becomes a chat countdown",
+           [item.type for item in activities], ["typing", "typing", "message"])
+    _check("native final still closes after an informative failure", activities[-1].entities,
+           [{"type": "streaminfo", "streamType": "final", "streamId": "stream"}])
+    _check("native recovery preserves the answer", activities[-1].text, "Recovered answer.")
 
     send.reset_mock(side_effect=True)
     send.return_value = SimpleNamespace(id="stream")
     emitter = ab._TeamsStatusEmitter(context, ab._Emitter(context))
     with patch.object(ab, "_TEAMS_STATUS_INTERVAL", 0):
         await emitter.status("Inspecting...")
-        emitter._started -= ab._STREAM_MAX_SECONDS + 1
+        assert emitter._stream_started is not None
+        emitter._stream_started -= ab._TEAMS_STATUS_MAX_SECONDS + 1
         await emitter.tick()
         await emitter.status("Rendering...")
+        await emitter.keepalive()
+        await emitter.progress()
         await emitter.text("Late answer.")
         await emitter.finish()
     activities = [call.args[1] for call in send.await_args_list]
     _check("native deadline closes status stream", activities[1].entities[0]["streamType"], "final")
-    _check("native deadline keeps later statuses ordinary", getattr(activities[2], "entities", None), None)
-    _check("native deadline preserves late answer", activities[3].text, "Late answer.")
+    _check("native deadline closes only once without ordinary statuses", len(activities), 3)
+    _check("native deadline preserves late answer", activities[-1].text, "Late answer.")
+    _check("native deadline sends the late answer without stream metadata",
+           getattr(activities[-1], "entities", None), None)
+    _check("native deadline leaves a minute before the platform limit", ab._TEAMS_STATUS_MAX_SECONDS, 540)
+
+    send.reset_mock(side_effect=True)
+    emitter = ab._TeamsStatusEmitter(context, ab._Emitter(context))
+    emitter._started -= 1000
+    with patch.object(ab, "_TEAMS_STATUS_INTERVAL", 0):
+        await emitter.status("Inspecting after a long queue...")
+        await emitter.tick()
+        await emitter.text("Queued answer.")
+        await emitter.finish()
+    activities = [call.args[1] for call in send.await_args_list]
+    _check("native stream clock starts at its first update, not at turn creation",
+           [item.type for item in activities], ["typing", "message"])
+    _check("queued native turn still finalizes its own stream", activities[-1].entities,
+           [{"type": "streaminfo", "streamType": "final", "streamId": "stream"}])
 
     send.reset_mock(side_effect=True)
     send.return_value = SimpleNamespace(id="stream")
@@ -489,6 +560,10 @@ async def test_native_teams_status_failures():
 
 async def test_native_teams_turns():
     class StatusAgent(_Agent):
+        def __init__(self):
+            super().__init__()
+            self.ready = asyncio.Event()
+
         def run(self, messages, stream=True, options=None):
             updates = super().run(messages, stream=stream, options=options)
 
@@ -497,6 +572,7 @@ async def test_native_teams_turns():
                     message_id="status-get_scene_info",
                     contents=[SimpleNamespace(type="text", text="Inspecting the scene...")],
                 )
+                await self.ready.wait()
                 async for update in updates:
                     yield update
 
@@ -506,7 +582,14 @@ async def test_native_teams_turns():
         conversation = f"19:native-{kind};messageid=100"
         _reset(conversation)
         agent = StatusAgent()
-        send = AsyncMock(return_value=SimpleNamespace(id="native-stream"))
+        completed = asyncio.Event()
+
+        async def post(_conversation_id, activity):
+            if activity.type == "message" and activity.text.startswith("reply-"):
+                completed.set()
+            return SimpleNamespace(id="native-stream")
+
+        send = AsyncMock(side_effect=post)
         client = SimpleNamespace(
             conversations=SimpleNamespace(
                 send_to_conversation=send,
@@ -519,8 +602,10 @@ async def test_native_teams_turns():
             patch.object(ab, "_supports_streaming", _supports_streaming),
             patch.object(ab, "_StreamingEmitter", side_effect=AssertionError("Use native action updates")),
             patch.object(ab, "_TEAMS_STATUS_INTERVAL", 0),
+            patch.object(ab, "_PROACTIVE_AFTER_SECONDS", 0.01),
         ):
             for index, text in enumerate(("first request", "follow-up request")):
+                completed.clear()
                 context = _Context(conversation, text)
                 context.activity.id = str(100 + index)
                 context.activity.channel_id = ab.Channels.ms_teams
@@ -529,6 +614,12 @@ async def test_native_teams_turns():
                 context.activity.is_agentic_request = lambda: False
                 context.turn_state["factory"] = factory
                 await ab._run_turn(agent, context, _State({}))
+                if index == 0:
+                    _check(f"{kind} first request detaches before the slow tool completes", completed.is_set(), False)
+                    context.send_activity = AsyncMock(side_effect=RuntimeError("Inbound context closed"))
+                    agent.ready.set()
+                    await asyncio.wait_for(completed.wait(), timeout=2)
+                    _check(f"{kind} detached answer never reuses inbound context", context.send_activity.await_count, 0)
         activities = [call.args[1] for call in send.await_args_list]
         _check(f"{kind} routes two turns through native status delivery",
                [item.type for item in activities], ["typing", "message", "typing", "message"])

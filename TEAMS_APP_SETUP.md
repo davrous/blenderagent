@@ -8,12 +8,6 @@
 Two manual steps remain: (A) create a Teams app package, then (B) upload it.
 They are the same for any activity-protocol agent.
 
-For this deployed bot, a branded package with channel/group support and six
-conversation starters is available in [m365sideloadmanifest](m365sideloadmanifest/README.md).
-Build it with `pwsh -NoProfile -File .\m365sideloadmanifest\build_package.ps1`,
-then upload `m365sideloadmanifest\build\blender-agent.zip` using step B below.
-The manual examples that follow are a minimal personal-chat alternative.
-
 ## A. Create the Teams app package
 
 Pick ONE of the two ways below.
