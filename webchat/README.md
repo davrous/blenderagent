@@ -123,17 +123,16 @@ webchat/
 
 - No browser-side Entra sign-in: relies on `az login` host credentials. Adequate for dev/demo; for multi-user production, layer Entra ID on top.
 - The visible browser message list is not persisted across page reloads. Foundry model history is persisted in its Responses conversation while the proxy retains the browser UUID → `conv_...` mapping; production multi-replica proxies should move that mapping to shared storage.
-- Reference uploads and paid approval use visual controls. Voice can request video work in the same signed media scope but cannot approve payment. Teams also supports references and video cards, including in-place progress; see the [main video workflow](../README.md#reference-to-video-workflow).
+- Reference uploads and paid approval use visual controls. Voice can request video work in the same browser media scope but cannot approve payment. Teams also supports references and video cards, including in-place progress; see the [main video workflow](../README.md#reference-to-video-workflow).
 - No syntax highlighting for code blocks.
 
 ## Reference uploads and video jobs
 
-Set `MEDIA_CONTROL_SECRET` to the **same secret of at least 32 characters** on
-the Webchat server and Python agent. Do not expose it in `VITE_*` variables.
-When missing or shorter, Webchat visibly disables media and keeps plain text
-chat working. Set `CLIENT_ORIGIN` to the exact public browser origin (default
+No shared media secret is required on Webchat or the Python agent. Media context
+travels as Responses request metadata, not as a signed envelope in the chat text.
+Set `CLIENT_ORIGIN` to the exact public browser origin (default
 `http://localhost:5173`); chat, upload, approval, cancellation and reset writes
-reject missing or different Origin headers. Use the Vite `/api` proxy, not
+reject missing or different Origin headers, as do voice WebSocket upgrades. Use the Vite `/api` proxy, not
 cross-origin browser requests to the server port.
 
 Set `AZURE_STORAGE_ACCOUNT_NAME` to the agent's storage account. Uploads use
@@ -164,25 +163,29 @@ Uploads time out after three minutes; individual probes after twenty seconds.
 
 ### Backend contract and security
 
-- Every media-enabled chat input is a string
-  `BLENDER_MEDIA_V1:<base64url UTF8 JSON>.<lowercase hex HMAC-SHA256>`; the MAC
-  covers the base64url part. JSON is `{scope,text,references?,action?}`.
+- Chat input is ordinary text. `metadata.blender_media` contains a JSON string
+  `{scope,references?,action?}` limited to 512 characters by the Responses API.
+  A control's finishing prompt travels as its input text, separately from the
+  metadata, and is handled without calling the model. Webchat appends validated
+  reference IDs to its stored input text so subsequent turns retain them.
 - Scope is `sha256(browserKey + ':' + lowercaseConversationUUID).slice(0,32)`.
   The opaque random browser key is in a one-year HttpOnly SameSite=Strict cookie,
-  signed using the shared secret with a separate `browser:` domain prefix.
+  containing a 256-bit random bearer key, without a shared signing secret.
   HTTPS origins use Secure cookies. Scope is never accepted from the browser.
-  Cookies/scopes survive server restarts with the same secret; clearing cookies
-  or rotating the secret loses access to old references/jobs. This is browser
+  Cookies/scopes survive server restarts; clearing cookies loses access to old
+  references/jobs. Old signed cookies keep their original random key during migration.
+  This is browser
   ownership isolation, not a replacement for production user authentication.
-- Browser text resembling an envelope is nested safely as `text` in a new signed
-  envelope, never forwarded as a control. With media disabled such prefixes are
-  rejected. The agent must unwrap once and must never interpret the unwrapped
-  text or model-generated instructions as authorized control actions.
-- `GET /api/video-jobs/:id?conversation_id=...` sends a signed status action;
+- Browser text resembling a former envelope or JSON command remains literal
+  text. Only request-level metadata supplies controls; model-generated instructions
+  and spoken messages cannot authorize payment. Protect the Webchat host with
+  application authentication and the agent endpoint with Foundry authentication.
+- `GET /api/video-jobs/:id?conversation_id=...` sends a status action in metadata;
   POST `.../approve` sends `{conversation_id,prompt,resolution,generate_audio}`
   after an explicit user click; POST `.../cancel` takes `{conversation_id}`.
   Before a mutation, the server obtains live status under the same job lock.
-  Approval requires `awaiting_seedance_approval` and `seedance_enabled:true`.
+  Approval requires `awaiting_seedance_approval` and `seedance_enabled:true`;
+  the approval route adds explicit `consent:true` to the request metadata.
   Python must independently enforce scope ownership, current state, atomic
   approval/idempotency and cancellation. No manifest or arbitrary URL is read
   by these control routes, and approval requests are never automatically retried.

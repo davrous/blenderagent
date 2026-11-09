@@ -32,7 +32,6 @@ from agent_framework import (
     tool,
 )
 from agent_framework.foundry import FoundryChatClient
-from agent_framework_foundry_hosting import ResponsesHostServer
 
 from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
 from artifact_storage import ArtifactStorage
@@ -44,6 +43,7 @@ from scene_manager import SceneManager
 from media_control import (
     MediaMiddleware, analyze_reference_media, apply_camera_path, configure_vision,
     get_video_job_status, start_animation_render, start_seedance_finish,
+    MediaResponsesHost as ResponsesHostServer, response_conversation,
 )
 
 # Module-level reference so _do_render can recover the scene after a Blender crash.
@@ -1862,6 +1862,9 @@ class SceneIsolationMiddleware(AgentMiddleware):
     def _get_conversation_id(context: AgentContext) -> str | None:
         """Resolve a stable conversation/scene id for this turn.
 
+        The Responses owner captured by MediaResponsesHost takes precedence
+        over the framework fallback sources below.
+
         Lookup order (most-stable first — IMPORTANT for idle/restore
         survival; ``context.session.session_id`` is REGENERATED on every
         container restart because ``InMemoryAgentSessionRepository`` is
@@ -1880,6 +1883,9 @@ class SceneIsolationMiddleware(AgentMiddleware):
           5. ``context.session.session_id`` — LAST resort; volatile.
           6. None — caller skips activation/save and emits a warning.
         """
+        request_conversation = response_conversation.get()
+        if request_conversation:
+            return request_conversation
         stable_val, stable_src = SceneIsolationMiddleware._scan_for_stable_conv_id(context)
         if stable_val:
             logger.info(

@@ -8,14 +8,15 @@
 Two manual steps remain: (A) create a Teams app package, then (B) upload it.
 They are the same for any activity-protocol agent.
 
-Follow **A**, then **B**, for the recommended portal-based path. Manual packaging
-and command-line installation are optional alternatives at the end. The bot above
-belongs to this environment; substitute your deployed bot ID for another environment.
+For this deployed bot, a branded package with channel/group support and six
+conversation starters is available in [m365sideloadmanifest](m365sideloadmanifest/README.md).
+Build it with `pwsh -NoProfile -File .\m365sideloadmanifest\build_package.ps1`,
+then upload `m365sideloadmanifest\build\blender-agent.zip` using step B below.
+The manual examples that follow are a minimal personal-chat alternative.
 
 ## A. Create the Teams app package
 
-Use the Developer Portal steps below. If you need to maintain the manifest yourself,
-use [manual packaging](#alternative-build-the-app-package-by-hand) instead, then return to step B.
+Pick ONE of the two ways below.
 
 ### Easiest — Teams Developer Portal (no files by hand)
 
@@ -27,21 +28,7 @@ use [manual packaging](#alternative-build-the-app-package-by-hand) instead, then
 
 Developer Portal guide: https://learn.microsoft.com/microsoftteams/platform/concepts/build-and-test/teams-developer-portal
 
-## B. Upload (sideload) the app — just for yourself
-
-You do NOT need a Teams admin to try it yourself:
-
-1. In Teams, go to **Apps** -> **Manage your apps** -> **Upload an app**.
-2. Select **Upload a custom app**, choose your .zip, then **Add**.
-3. Select **Open**, then send a message to talk to your agent.
-
-Upload a custom app guide: https://learn.microsoft.com/microsoftteams/platform/concepts/deploy-and-publish/apps-upload
-
-If **Upload a custom app** is missing or greyed out, custom app upload is turned off for
-your tenant, or you want everyone in your org to get it from the org app catalog. Both need
-a Teams admin: https://learn.microsoft.com/microsoftteams/platform/concepts/build-and-test/prepare-your-o365-tenant
-
-## Alternative: Build the App Package by Hand
+### Or by hand — build the .zip yourself
 
 Put these three files in a folder and zip them at the **root** (not inside a subfolder):
 
@@ -69,9 +56,6 @@ Put these three files in a folder and zip them at the **root** (not inside a sub
 }
 ```
 
-After creating the ZIP, return to [step B](#b-upload-sideload-the-app--just-for-yourself)
-to install it, or use the optional command-line path below.
-
 Note: `id` is a NEW GUID for the app itself (generate one) — it is NOT the Bot ID.
 Only `bots[].botId` uses the Bot ID above.
 
@@ -79,12 +63,26 @@ Only `bots[].botId` uses the Bot ID above.
 - Manifest schema reference: https://learn.microsoft.com/microsoftteams/platform/resources/schema/manifest-schema
 - Validate your .zip before uploading: https://dev.teams.microsoft.com/tools/store-validation
 
+## B. Upload (sideload) the app — just for yourself
+
+You do NOT need a Teams admin to try it yourself:
+
+1. In Teams, go to **Apps** -> **Manage your apps** -> **Upload an app**.
+2. Select **Upload a custom app**, choose your .zip, then **Add**.
+3. Select **Open**, then send a message to talk to your agent.
+
+Upload a custom app guide: https://learn.microsoft.com/microsoftteams/platform/concepts/deploy-and-publish/apps-upload
+
+If **Upload a custom app** is missing or greyed out, custom app upload is turned off for
+your tenant, or you want everyone in your org to get it from the org app catalog. Both need
+a Teams admin: https://learn.microsoft.com/microsoftteams/platform/concepts/build-and-test/prepare-your-o365-tenant
+
 ## C. Optional — do both from the command line
 
 Steps A and B can be scripted. This is a convenience path for repeat runs; it needs extra
 tooling and does NOT bypass the tenant custom-app-upload setting above.
 
-Package: put the manifest.json from the manual-packaging section (with your bot ID) next to your
+Package: put the manifest.json from section A (its Bot ID is already filled in) next to your
 two icons, then zip the three files at the root:
 
 ```sh

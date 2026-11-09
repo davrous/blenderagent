@@ -1,7 +1,7 @@
 import type { Express, Request, Response } from "express";
 import { randomUUID } from "node:crypto";
 import { config } from "./config.js";
-import { browserKey, isUuid, JOB_ID_RE, mediaEnabled, requireOrigin, scopeFor, signEnvelope, type MediaAction } from "./mediaSecurity.js";
+import { browserKey, isUuid, JOB_ID_RE, requireOrigin, scopeFor, type MediaAction, type MediaContext } from "./mediaSecurity.js";
 import { storeReference, withReferenceUpload } from "./referenceUploads.js";
 
 export const JOB_STATES = ["queued", "rendering", "encoding", "awaiting_seedance_approval", "wavespeed_uploading", "wavespeed_submitting", "wavespeed_processing", "submission_unknown", "completed", "failed", "cancelled"] as const;
@@ -90,7 +90,7 @@ export async function readJobStream(response: globalThis.Response, id: string): 
   }
 }
 
-type UpstreamBuilder = (body: { conversation_id?: string }, input: string, control?: boolean) => Promise<{ url: string; headers: Record<string, string>; payload: Record<string, unknown> }>;
+type UpstreamBuilder = (body: { conversation_id?: string }, input: string, control?: boolean, media?: MediaContext) => Promise<{ url: string; headers: Record<string, string>; payload: Record<string, unknown> }>;
 
 export function withDeadline<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -103,7 +103,7 @@ export function withDeadline<T>(pending: Promise<T>, signal: AbortSignal): Promi
 
 export function requestScope(req: Request, res: Response, conversation: unknown): string {
   if (!isUuid(conversation)) throw new Error("conversation_id (UUID) is required");
-  return scopeFor(browserKey(req, res, config.mediaControlSecret, new URL(config.clientOrigin).protocol === "https:"), conversation);
+  return scopeFor(browserKey(req, res, new URL(config.clientOrigin).protocol === "https:"), conversation);
 }
 
 export function registerMediaRoutes(app: Express, build: UpstreamBuilder, upload = storeReference): void {
@@ -112,7 +112,6 @@ export function registerMediaRoutes(app: Express, build: UpstreamBuilder, upload
   const origin = requireOrigin(config.clientOrigin);
   app.use(["/api/references", "/api/video-jobs"], (_req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
-    if (!mediaEnabled(config.mediaControlSecret)) { res.status(503).json({ error: "Media disabled: MEDIA_CONTROL_SECRET must contain at least 32 characters" }); return; }
     next();
   });
 
@@ -159,7 +158,9 @@ export function registerMediaRoutes(app: Express, build: UpstreamBuilder, upload
     const timer = setTimeout(() => controller.abort(), 45_000);
     res.on("close", () => { if (!res.writableEnded) controller.abort(); });
     const call = async (operation: MediaAction) => {
-      const upstream = await withDeadline(build({ conversation_id: conversation }, signEnvelope(config.mediaControlSecret, scope, "", undefined, operation), true), controller.signal);
+      const { prompt = "", ...action } = operation;
+      const upstream = await withDeadline(build({ conversation_id: conversation }, prompt, true,
+        { scope, action: { ...action, ...(action.type === "approve" ? { consent: true } : {}) } }), controller.signal);
       controller.signal.throwIfAborted();
       const response = await fetch(upstream.url, { method: "POST", headers: upstream.headers, body: JSON.stringify(upstream.payload), signal: controller.signal });
       return readJobStream(response, id);

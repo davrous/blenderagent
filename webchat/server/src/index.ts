@@ -12,7 +12,7 @@ import {
   deleteSession,
 } from "./sessions.js";
 import { attachVoiceRelay } from "./voice.js";
-import { MEDIA_PREFIX, browserKey, isUuid, mediaEnabled, ownedReferences, requireOrigin, signEnvelope } from "./mediaSecurity.js";
+import { browserKey, isUuid, mediaMetadata, ownedReferences, requireOrigin, type MediaContext } from "./mediaSecurity.js";
 import { registerMediaRoutes, requestScope } from "./videoJobs.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -43,7 +43,7 @@ app.use(
 
 app.get("/api/health", (req, res) => {
   res.setHeader("Cache-Control", "no-store");
-  if (mediaEnabled(config.mediaControlSecret)) browserKey(req, res, config.mediaControlSecret, new URL(config.clientOrigin).protocol === "https:");
+  browserKey(req, res, new URL(config.clientOrigin).protocol === "https:");
   res.json({
     mode: config.mode,
     agentUrl: config.agentUrl,
@@ -51,8 +51,7 @@ app.get("/api/health", (req, res) => {
     apiVersion: config.mode === "foundry" ? config.apiVersion : undefined,
     model: config.modelName,
     voiceEnabled: config.voiceEnabled,
-    mediaEnabled: mediaEnabled(config.mediaControlSecret),
-    mediaDisabledReason: mediaEnabled(config.mediaControlSecret) ? undefined : "Media disabled: MEDIA_CONTROL_SECRET must contain at least 32 characters on Webchat and the agent.",
+    mediaEnabled: true,
   });
 });
 
@@ -166,6 +165,7 @@ async function buildUpstreamRequest(
   body: ChatRequestBody,
   input: string,
   control = false,
+  media?: MediaContext,
 ): Promise<{ url: string; headers: Record<string, string>; payload: Record<string, unknown>; conversationId?: string }> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -193,6 +193,7 @@ async function buildUpstreamRequest(
       // Without this, the middleware logs `session=None` and the scene is
       // never saved to blob storage, so it cannot survive container recycle.
       agent_session_id: conversationId,
+      metadata: { conversation_id: conversationId, ...(media ? { blender_media: mediaMetadata(media) } : {}) },
     };
     if (control) payload.store = false;
     if (!control && body.previous_response_id) {
@@ -233,7 +234,7 @@ async function buildUpstreamRequest(
     // the standard OpenAI `user` and `metadata` fields so SceneIsolationMiddleware
     // can recover a stable scene key.
     user: conversationId,
-    metadata: { conversation_id: conversationId },
+    metadata: { conversation_id: conversationId, ...(media ? { blender_media: mediaMetadata(media) } : {}) },
   };
 
   console.log(
@@ -248,6 +249,7 @@ registerMediaRoutes(app, buildUpstreamRequest);
 app.post("/api/chat", requireOrigin(config.clientOrigin), async (req, res) => {
   const body = req.body as ChatRequestBody;
   let input = typeof body?.input === "string" ? body.input : "";
+  let media: MediaContext;
   if (!input.trim() && !(Array.isArray(body?.references) && body.references.length)) {
     res.status(400).json({ error: "input is required" });
     return;
@@ -255,11 +257,13 @@ app.post("/api/chat", requireOrigin(config.clientOrigin), async (req, res) => {
 
   try {
     if (!isUuid(body.conversation_id)) throw new Error("conversation_id (UUID) is required");
-    if (mediaEnabled(config.mediaControlSecret)) {
-      const scope = requestScope(req, res, body.conversation_id);
-      input = signEnvelope(config.mediaControlSecret, scope, input, ownedReferences(body.references, scope));
-    } else if (body.references !== undefined || input.trimStart().startsWith(MEDIA_PREFIX)) {
-      throw new Error("Media is disabled; reference IDs and media envelopes are not accepted");
+    if (input.length > 32000) throw new Error("The message is too long");
+    const scope = requestScope(req, res, body.conversation_id);
+    const references = ownedReferences(body.references, scope);
+    media = { scope };
+    if (!input.trim()) input = "Analyze the attached reference and propose a Blender blockout.";
+    if (references.length) {
+      input += "\nStored reference IDs (analyze_reference_media before reconstruction):\n" + references.join("\n");
     }
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : "Invalid media input" });
@@ -268,7 +272,7 @@ app.post("/api/chat", requireOrigin(config.clientOrigin), async (req, res) => {
 
   let upstreamReq: Awaited<ReturnType<typeof buildUpstreamRequest>>;
   try {
-    upstreamReq = await buildUpstreamRequest(body, input);
+    upstreamReq = await buildUpstreamRequest(body, input, false, media);
   } catch (err) {
     console.error("Failed to build upstream request:", err);
     res.status(500).json({

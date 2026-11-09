@@ -21,7 +21,9 @@ ONE multi-protocol server, so a single container serves:
 
 The Activity handler runs the *same* ``agent_framework`` ``Agent`` — same
 tools, same ``SceneIsolationMiddleware(ToolStatusMiddleware(), …)`` stack — and
-maps the streamed ``AgentResponseUpdate``s onto native Activity constructs:
+maps the streamed ``AgentResponseUpdate``s onto native Activity constructs.
+Teams uses explicit informative-update requests plus one complete final answer.
+Other streaming clients use the SDK queue:
 
     message_id "status-*" / "scene-status-*" → queue_informative_update()
     everything else (model text, tool images, download links, error text)
@@ -33,11 +35,12 @@ we still have the structured update objects.
 
 Non-streaming fallback
 ----------------------
-``StreamingResponse`` silently drops informative updates on channels that don't
-support streaming, and the M365 SDK explicitly disables streaming for *agentic*
-requests — which is the M365 Copilot path. On those channels each status is
-sent as its own message activity instead, so the custom waiting text is still
-visible (chattier, but visible).
+The current Teams API supports informative updates in channel threads and group
+chats too, but requires POST /activities with replyToId in the body. The SDK's
+nested reply endpoint caused 404s on follow-ups, so Teams status requests bypass
+that routing and use fresh connector clients, including after request detach.
+If Teams rejects a stream, statuses and the complete final answer fall back to
+ordinary messages. M365 Copilot's agentic requests keep the plain-message path.
 
 Everything here is optional: ``main.py`` falls back to a responses-only host if
 the imports fail or ``ENABLE_ACTIVITY`` is turned off, mirroring how
@@ -136,6 +139,7 @@ _ERROR_TEXT = (
 _KEEPALIVE_SECONDS = float(os.environ.get("ACTIVITY_KEEPALIVE_SECONDS", "20"))
 _KEEPALIVE_POLL_SECONDS = 2.0
 _KEEPALIVE_FALLBACK_TEXT = "Working on your scene"
+_TEAMS_STATUS_INTERVAL = 1.0
 
 # Teams enforces a hard two-minute lifetime on a streamed message and then
 # rejects everything further with 403 ContentStreamNotAllowed ("Content stream
@@ -181,7 +185,7 @@ _IMPORT_ERROR: Exception | None = None
 
 try:
     from agent_framework import Content, Message
-    from agent_framework_foundry_hosting import ResponsesHostServer
+    from media_control import MediaResponsesHost as ResponsesHostServer
     from azure.ai.agentserver.activity import ActivityAgentServerHost
     from azure.ai.agentserver.invocations import InvocationAgentServerHost
     from microsoft_agents.activity import Activity, Attachment, Channels, DeliveryModes
@@ -420,12 +424,24 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
 
     scope = conversation_scope(scene_key) if scene_key else None
     streaming = _supports_streaming(context)
+    native_status = (
+        _channel(context) == Channels.ms_teams
+        and not context.activity.is_agentic_request()
+        and bool(getattr(context.activity, "id", None))
+        and context.turn_state.get(
+            getattr(context.adapter, "CHANNEL_SERVICE_FACTORY_KEY", "")
+        ) is not None
+    )
     logger.info(
-        "Activity turn started: channel=%s conversation=%s generation=%d scene_key=%s streaming=%s",
-        _channel(context), conversation_id, generation, scene_key, streaming,
+        "Activity turn started: channel=%s conversation=%s generation=%d scene_key=%s streaming=%s native_status=%s",
+        _channel(context), conversation_id, generation, scene_key, streaming, native_status,
     )
 
-    emitter = _StreamingEmitter(context) if streaming else _FallbackEmitter(context)
+    if native_status:
+        emitter = _TeamsStatusEmitter(context, _Emitter(context))
+        emitter._current = lambda: slot.epoch == inbound_epoch
+    else:
+        emitter = _StreamingEmitter(context) if streaming else _FallbackEmitter(context)
     relay = _Relay(emitter)
     notifier = _capture_video_notifier(context, emitter, slot, inbound_epoch, scope)
     gallery = _GalleryFilter(scope)
@@ -710,7 +726,8 @@ def _capture_video_notifier(context, previous, slot, epoch, scope):
         return None
     sender._current = lambda: slot.epoch == epoch
     seen = set()
-    live = _channel(context) == Channels.ms_teams and _supports_streaming(context)
+    # Editing an ordinary card works in channels too; text streaming does not.
+    live = _channel(context) == Channels.ms_teams and not context.activity.is_agentic_request()
 
     async def notify(value, refresh=False):
         from teams_media import video_attachments
@@ -1321,7 +1338,7 @@ class _StreamingEmitter(_Emitter):
 
 
 class _FallbackEmitter(_Emitter):
-    """Non-streaming channels — notably M365 Copilot's agentic requests.
+    """Non-streaming channels — Teams threads/groups and M365 Copilot.
 
     Informative updates are dropped on these channels, so each status becomes
     its own message activity. That is chattier than a live status line, but it
@@ -1506,6 +1523,9 @@ class _ProactiveEmitter(_Emitter):
                 await client.close()
 
     async def _deliver_direct(self, activity: Any) -> bool:
+        return (await self._post_activity(activity)) is not False
+
+    async def _post_activity(self, activity: Any, *, to_conversation: bool = False) -> Any:
         """Post the activity with a connector client built like the inbound one.
 
         This is the primary path because `continue_conversation*` cannot work
@@ -1539,18 +1559,24 @@ class _ProactiveEmitter(_Emitter):
             activity.apply_conversation_reference(self._reference)
             activity.id = None
             conversation_id = self._reference.conversation.id
+            if to_conversation:
+                # The stream API requires POST /activities with the user anchor
+                # in the body, not the SDK adapter's /activities/{replyToId}.
+                activity.reply_to_id = getattr(self._context.activity, "id", None)
+                return await client.conversations.send_to_conversation(
+                    conversation_id, activity
+                )
             if activity.reply_to_id:
-                await client.conversations.reply_to_activity(
+                return await client.conversations.reply_to_activity(
                     conversation_id, activity.reply_to_id, activity
                 )
             else:
-                await client.conversations.send_to_conversation(
+                return await client.conversations.send_to_conversation(
                     conversation_id, activity
                 )
         finally:
             with contextlib.suppress(Exception):
                 await client.close()
-        return True
 
     def _continuation(self) -> Any:
         activity = self._reference.get_continuation_activity()
@@ -1653,6 +1679,118 @@ class _ProactiveEmitter(_Emitter):
         return False
 
 
+class _TeamsStatusEmitter(_ProactiveEmitter):
+    """Native action updates, followed by one complete answer, even after detach."""
+
+    def __init__(self, context: Any, previous: _Emitter) -> None:
+        super().__init__(context, previous)
+        self._status_lock = asyncio.Lock()
+        self._stream_id: str | None = None
+        self._sequence = 0
+        self._last_post = 0.0
+        self._native = True
+        self._finished = False
+        self._handed_over = False
+
+    async def _deliver_direct(self, activity: Any) -> bool:
+        return (await self._post_activity(activity, to_conversation=True)) is not False
+
+    async def _try_stream(self, kind: str, text: str, attachments: list[Any] | None = None) -> bool:
+        entity: dict[str, Any] = {"type": "streaminfo", "streamType": kind}
+        if self._stream_id:
+            entity["streamId"] = self._stream_id
+        if kind != "final":
+            self._sequence += 1
+            entity["streamSequence"] = self._sequence
+        activity = Activity(
+            type="message" if kind == "final" else "typing",
+            text=text, entities=[entity], attachments=attachments or [],
+        )
+        try:
+            delay = _TEAMS_STATUS_INTERVAL - (time.monotonic() - self._last_post)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            async with asyncio.timeout(10):
+                response = await self._post_activity(activity, to_conversation=True)
+            if response is False:
+                return False
+            if self._stream_id is None:
+                stream_id = getattr(response, "id", None)
+                if not isinstance(stream_id, str) or not stream_id:
+                    self._native = False
+                    logger.warning("Teams returned no status stream ID; continuing with ordinary messages")
+                    return False
+                self._stream_id = stream_id
+            self._last_post = time.monotonic()
+            self._touch()
+            if kind == "final":
+                self._native = False
+            return True
+        except Exception as error:
+            self._native = False
+            logger.warning(
+                "Native Teams %s delivery failed (%s); continuing with ordinary messages",
+                kind, type(error).__name__,
+            )
+            return False
+
+    async def _expire(self) -> None:
+        if self._native and self.elapsed > _STREAM_MAX_SECONDS:
+            if self._stream_id:
+                await self._try_stream("final", _STREAM_CONTINUED_TEXT)
+            self._native = False
+
+    async def _inform(self, text: str) -> None:
+        async with self._status_lock:
+            if self._finished or not self._current():
+                return
+            await self._expire()
+            if self._native and await self._try_stream("informative", text):
+                return
+            if await self._send(Activity(type="message", text=text)):
+                self._touch()
+
+    async def status(self, text: str) -> None:
+        self._last_status = text
+        await self._inform(text)
+
+    async def keepalive(self) -> None:
+        await self._inform(self._keepalive_text())
+
+    async def tick(self) -> None:
+        async with self._status_lock:
+            if not self._finished and self._current():
+                await self._expire()
+
+    async def handover(self) -> None:
+        async with self._status_lock:
+            if self._finished or not self._current():
+                return
+            self._handed_over = True
+            body = "".join(self._parts).strip() + _HANDOVER_TEXT
+            attachments = self._attachments
+            self._parts = []
+            self._attachments = []
+            await self._send(Activity(type="message", text=body, attachments=attachments))
+
+    async def progress(self) -> None:
+        if self._handed_over:
+            await super().progress()
+
+    async def finish(self) -> None:
+        async with self._status_lock:
+            if self._finished or not self._current():
+                return
+            self._finished = True
+            await self._expire()
+            body = "".join(self._parts).strip()
+            body = body or (_GALLERY_ONLY_TEXT if self._attachments else _EMPTY_REPLY_TEXT)
+            if self._native and self._stream_id:
+                if await self._try_stream("final", body, self._attachments):
+                    return
+            await self._send(Activity(type="message", text=body, attachments=self._attachments))
+
+
 class _Relay:
     """Indirection so a running turn can change where its output goes.
 
@@ -1704,6 +1842,12 @@ class _Relay:
         if self._detached:
             return
         previous = self._inner
+        if isinstance(previous, _TeamsStatusEmitter):
+            # This emitter already uses fresh clients; only the HTTP request
+            # detaches. Its informative-update stream can stay alive.
+            self._detached = True
+            await previous.handover()
+            return
         # Swap FIRST, before any await. `detach` runs on the request task while
         # the turn task is still streaming, and closing the live response below
         # takes a couple of network round trips. If the swap happened after
@@ -1778,18 +1922,20 @@ def _channel(context: Any) -> Any:
 
 
 def _supports_streaming(context: Any) -> bool:
-    """Mirror ``StreamingResponse._set_defaults`` without reading private state.
+    """Keep the legacy SDK text-stream path restricted to personal Teams chats.
 
-    Teams supports streaming *except* for agentic requests (the M365 Copilot
-    path), where the SDK disables it.
+    Normal Teams turns prefer _TeamsStatusEmitter instead. Groups must never
+    fall back to the SDK's nested reply endpoint for streaming.
     """
     activity = context.activity
     channel = _channel(context)
     if channel == Channels.ms_teams:
-        try:
-            return not activity.is_agentic_request()
-        except Exception:  # pragma: no cover - defensive
-            return True
+        conversation = getattr(activity, "conversation", None)
+        return (
+            getattr(conversation, "conversation_type", None) == "personal"
+            and not getattr(conversation, "is_group", False)
+            and not activity.is_agentic_request()
+        )
     if channel in (Channels.webchat, Channels.direct_line):
         return True
     return activity.delivery_mode == DeliveryModes.stream

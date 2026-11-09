@@ -1,0 +1,102 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/vdevPreview/MicrosoftTeams.schema.json",
+  "manifestVersion": "devPreview",
+  "version": "1.1.0",
+  "id": "22ce0d24-dea1-4bb2-b4c5-8a32bdae3902",
+  "developer": {
+    "name": "David Rousset",
+    "websiteUrl": "https://www.davrous.com",
+    "privacyUrl": "https://www.davrous.com",
+    "termsOfUseUrl": "https://www.davrous.com"
+  },
+  "name": {
+    "short": "Blender Agent",
+    "full": "Blender Agent - Your 3D Scene Studio"
+  },
+  "description": {
+    "short": "Create, refine and render 3D scenes in Blender, directly from Teams.",
+    "full": "Turn your ideas into 3D scenes without leaving Teams. Blender Agent is a conversational creative assistant powered by Microsoft Foundry and a real Blender environment.\n\nDescribe a fantasy castle, a cozy village, a product display or an abstract composition. The agent builds the scene, adds objects and materials, positions cameras and lights, and shares viewport previews so you can guide the next step. Continue in the same conversation or channel thread to refine the existing scene instead of starting again.\n\nExplore a searchable 3D model library and Poly Haven textures, import assets, change colors and materials, and ask for a still render. Download the editable Blender scene as a .blend file, or export a .glb model for use in compatible 3D viewers and applications.\n\nWhere the host supports attachment delivery, share PNG, JPEG or WebP images and MP4 clips as visual references. Reference analysis proposes approximate scene layouts and camera motion; it is not exact 3D reconstruction. Create short camera animations and review standard-material or neutral clay video previews. Optional Seedance finishing uses a paid external service and requires explicit approval through the job's approval controls; a chat message alone does not authorize payment.\n\nUse Blender Agent in a personal chat, group chat or team channel. In shared conversations, mention the agent and keep follow-up requests in the same thread. Long tasks can continue with proactive result messages while the hosted runtime remains available. Send /clear to discard the current conversation's scene and start fresh.\n\nAI-generated scenes and renders can contain mistakes: inspect the results before use. Uploaded references and generated files are processed by configured cloud services and may be stored in Azure Blob Storage with time-limited download links. Do not upload secrets or content you are not authorized to share. Available capabilities depend on deployment configuration, host support and tenant policies. Blender Agent is an independent project, not an official Blender product."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#0B143D",
+  "validDomains": [
+    "msdavrous.blob.core.windows.net"
+  ],
+  "bots": [
+    {
+      "botId": "27d67f5b-b7cc-4935-b979-0fdb47ccf365",
+      "scopes": [
+        "personal",
+        "team",
+        "groupChat",
+        "copilot"
+      ],
+      "supportsFiles": true,
+      "supportsTargetedMessages": true,
+      "isNotificationOnly": false,
+      "commandLists": [
+        {
+          "scopes": [
+            "personal",
+            "team",
+            "groupChat",
+            "copilot"
+          ],
+          "commands": [
+            {
+              "title": "Create a fantasy castle",
+              "description": "Build a colorful castle and inspect its first viewport preview.",
+              "type": "prompt",
+              "prompt": "Create a fantasy castle with colorful towers, a drawbridge, a rocky island and a few trees. Show me a viewport screenshot before doing a final render."
+            },
+            {
+              "title": "Build a cozy village",
+              "description": "Create a small world with houses, trees and a walkable path.",
+              "type": "prompt",
+              "prompt": "Build a cozy village for kids with six houses, ten trees and a walkable path connecting the houses. Add warm materials and show me a viewport screenshot."
+            },
+            {
+              "title": "Render the current scene",
+              "description": "Turn the scene we are working on into a polished still image.",
+              "type": "prompt",
+              "prompt": "Render the current Blender scene with cinematic lighting and a camera angle that frames the main subject. Share the rendered image without replacing the existing scene."
+            },
+            {
+              "title": "Find a 3D model",
+              "description": "Browse assets to enrich a new scene or the current one.",
+              "type": "prompt",
+              "prompt": "Find wooden tables in the 3D model library and show me a selection. Let me choose one before importing it into the current scene."
+            },
+            {
+              "title": "Animate a camera orbit",
+              "description": "Preview a short animation without paid external processing.",
+              "type": "prompt",
+              "prompt": "Create a five-second camera orbit around the main subject of the current scene. Render a standard-material MP4 preview. Do not submit anything to Seedance or any paid external service."
+            },
+            {
+              "title": "Download the Blender scene",
+              "description": "Keep an editable copy of the scene for your own Blender workflow.",
+              "type": "prompt",
+              "prompt": "Save the current Blender scene as a .blend file and share a download link. Keep the existing scene intact so we can continue working on it."
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "supportsChannelFeatures": "tier1",
+  "copilotAgents": {
+    "customEngineAgents": [
+      {
+        "id": "27d67f5b-b7cc-4935-b979-0fdb47ccf365",
+        "type": "bot",
+        "disclaimer": {
+          "text": "AI-generated 3D scenes may contain mistakes. References and generated files are processed by configured cloud services and may be stored in Azure Blob Storage. Only upload content you are authorized to share. Paid external video processing requires explicit approval through the job controls."
+        }
+      }
+    ]
+  }
+}

@@ -1,66 +1,114 @@
-"""Authenticated channel controls kept outside model tool-call authority."""
+"""Request-level media controls kept outside model tool-call authority."""
 
 import asyncio
-import base64
-import hashlib
-import hmac
+import contextvars
 import json
-import os
+import logging
 import re
 import tempfile
+import uuid
 from pathlib import Path
+from collections.abc import AsyncIterable
+from typing import Any
 
 from agent_framework import AgentMiddleware, AgentResponse, AgentResponseUpdate, Content, Message, ResponseStream, tool
 from pydantic import BaseModel, Field
+from agent_framework_foundry_hosting import ResponsesHostServer
+from azure.ai.agentserver.responses import ResponseContext
+from azure.ai.agentserver.responses.models import CreateResponse, ResponseStreamEvent
 
 from artifact_storage import conversation_scope
 from blender_connection import get_blender_connection
 from media_analysis import render_settings, sample_reference, validate_camera_path
 from video_jobs import descriptor, get_video_jobs, video_scope
 
-PREFIX = "BLENDER_MEDIA_V1:"
+logger = logging.getLogger("blender_agent.media")
+response_conversation: contextvars.ContextVar[str | None] = contextvars.ContextVar("response_conversation", default=None)
+response_media: contextvars.ContextVar[dict | None] = contextvars.ContextVar("response_media", default=None)
 _vision_client = None
 
 
-def decode_envelope(text: str, secret: str | None = None) -> dict:
-    secret = secret if secret is not None else os.getenv("MEDIA_CONTROL_SECRET", "")
-    if len(secret) < 32 or not text.startswith(PREFIX) or len(text) > 100_000:
-        raise ValueError("Media control is unavailable or invalid.")
-    parts = text[len(PREFIX):].split(".")
-    if len(parts) != 2 or not re.fullmatch(r"[A-Za-z0-9_-]+", parts[0]) or not re.fullmatch(r"[a-f0-9]{64}", parts[1]):
-        raise ValueError("Invalid media control signature.")
-    expected = hmac.new(secret.encode(), parts[0].encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(parts[1], expected):
-        raise ValueError("Invalid media control signature.")
-    value = json.loads(base64.urlsafe_b64decode(parts[0] + "=" * (-len(parts[0]) % 4)))
-    if not isinstance(value, dict) or not re.fullmatch(r"[a-f0-9]{32}", value.get("scope", "")) or not isinstance(value.get("text"), str):
-        raise ValueError("Invalid media control envelope.")
-    if len(value["text"]) > 32000:
-        raise ValueError("The message is too long.")
+def decode_media_context(text: str) -> dict:
+    if not isinstance(text, str) or len(text) > 512:
+        raise ValueError("Invalid media request metadata.")
+    value = json.loads(text)
+    if (not isinstance(value, dict) or set(value) - {"scope", "references", "action"}
+            or not isinstance(value.get("scope"), str) or not re.fullmatch(r"[a-f0-9]{32}", value["scope"])):
+        raise ValueError("Invalid media request scope.")
     references = value.get("references", [])
     if not isinstance(references, list) or len(references) > 4 or any(
         not isinstance(name, str) or not re.fullmatch(r"references/" + value["scope"] + r"/[a-f0-9]{32}\.(png|jpg|webp|mp4)", name)
         for name in references
     ):
         raise ValueError("Reference does not belong to this conversation.")
+    action = value.get("action")
+    if action is not None:
+        if (not isinstance(action, dict) or set(action) - {"type", "job_id", "resolution", "generate_audio", "consent"}
+                or action.get("type") not in ("status", "approve", "cancel")
+                or not isinstance(action.get("job_id"), str) or not re.fullmatch(r"[a-f0-9]{32}", action["job_id"])):
+            raise ValueError("Invalid video action metadata.")
+        if action["type"] == "approve" and action.get("consent") is not True:
+            raise ValueError("Paid finishing requires explicit user consent.")
     return value
 
 
-def encode_voice_input(transcript: str, context: str) -> str:
-    secret = os.getenv("MEDIA_CONTROL_SECRET", "")
-    value = decode_envelope(context, secret)
-    if set(value) != {"scope", "text"} or value["text"] != "Voice request follows.":
+def voice_media_context(text: str) -> dict:
+    value = decode_media_context(text)
+    if set(value) != {"scope"}:
         raise ValueError("Invalid voice media context: only a conversation scope is allowed.")
-    payload = json.dumps({"scope": value["scope"], "text": transcript}).encode()
-    part = base64.urlsafe_b64encode(payload).decode().rstrip("=")
-    signature = hmac.new(secret.encode(), part.encode(), hashlib.sha256).hexdigest()
-    return f"{PREFIX}{part}.{signature}"
+    return value
+
+
+def sandbox_media_scope() -> str:
+    path = Path.home() / ".blender_media_scope"
+    try:
+        with path.open("x") as target:
+            scope = uuid.uuid4().hex
+            target.write(scope)
+    except FileExistsError:
+        scope = path.read_text().strip()
+    if not re.fullmatch(r"[a-f0-9]{32}", scope):
+        raise ValueError("Invalid persisted sandbox media scope.")
+    return scope
+
+
+class MediaResponsesHost(ResponsesHostServer):
+    """Bind request context before the framework adapter discards metadata."""
+
+    async def _handle_response(self, request: CreateResponse, context: ResponseContext,
+                               cancellation_signal: asyncio.Event) -> AsyncIterable[ResponseStreamEvent | dict[str, Any]]:
+        metadata = request.metadata or {}
+        media = decode_media_context(metadata["blender_media"]) if "blender_media" in metadata else {}
+        owner = metadata.get("conversation_id") or context.conversation_id
+        scope = media.get("scope") or (conversation_scope(owner) if owner else sandbox_media_scope())
+        if not owner and not media.get("scope"):
+            logger.info("Responses conversation ID unavailable; using persistent sandbox media scope.")
+        action = media.get("action")
+        if action is not None:
+            if request.store is not False:
+                raise ValueError("Video controls require store=false.")
+            media = {**media, "action": {**action, "prompt": await context.get_input_text()}}
+        stream = await super()._handle_response(request, context, cancellation_signal)
+
+        async def scoped_stream():
+            scope_token = video_scope.set(scope)
+            media_token = response_media.set(media)
+            conversation_token = response_conversation.set(owner)
+            try:
+                async for event in stream:
+                    yield event
+            finally:
+                response_conversation.reset(conversation_token)
+                response_media.reset(media_token)
+                video_scope.reset(scope_token)
+
+        return scoped_stream()
 
 
 def require_scope():
     scope = video_scope.get()
     if not scope:
-        raise ValueError("Video tools require a media-enabled Webchat or Teams conversation.")
+        raise ValueError("Video tools require a Responses or Activity conversation context.")
     return scope
 
 
@@ -86,25 +134,12 @@ class MediaMiddleware(AgentMiddleware):
     async def process(self, context, call_next):
         scope = video_scope.get()
         latest = next((message for message in reversed(context.messages) if message.role == "user"), None)
-        action = None
-        for message in context.messages:
-            if message.role != "user":
-                continue
-            for content in message.contents:
-                if content.type != "text" or not content.text or not content.text.startswith(PREFIX):
-                    continue
-                try:
-                    value = decode_envelope(content.text)
-                except ValueError:
-                    if message is latest:
-                        raise
-                    continue
-                if message is latest:
-                    scope = value["scope"]
-                    action = value.get("action")
-                content.text = value["text"] or "Analyze the attached reference and propose a Blender blockout."
-                if value.get("references"):
-                    content.text += "\nStored reference IDs (analyze_reference_media before reconstruction):\n" + "\n".join(value["references"])
+        media = response_media.get() or {}
+        action = media.get("action")
+        if media.get("references") and latest:
+            latest.contents.append(Content.from_text(
+                "Stored reference IDs (analyze_reference_media before reconstruction):\n" + "\n".join(media["references"])
+            ))
         if action is not None:
             value = await asyncio.to_thread(control_action, scope, action)
             update = AgentResponseUpdate(contents=[Content.from_text(descriptor(value))], role="assistant", message_id="video-control")
@@ -125,6 +160,8 @@ class MediaMiddleware(AgentMiddleware):
             video_scope.reset(token)
         if context.stream:
             original = context.result
+            if not isinstance(original, ResponseStream):
+                raise RuntimeError("The media middleware expected a streaming agent response.")
             async def scoped_stream():
                 stream_token = video_scope.set(scope)
                 try:

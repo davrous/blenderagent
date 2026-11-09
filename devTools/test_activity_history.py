@@ -26,6 +26,7 @@ import media_analysis as ma
 from artifact_storage import conversation_scope
 
 _supports_streaming = ab._supports_streaming
+_FallbackEmitter = ab._FallbackEmitter
 
 
 class _Activity(SimpleNamespace):
@@ -289,8 +290,262 @@ async def test_detach_race():
         ab._ProactiveEmitter = original
 
 
+def test_streaming_capabilities():
+    cases = [
+        ("personal Teams chat", ab.Channels.ms_teams, "personal", False, False, None, True),
+        ("Teams channel", ab.Channels.ms_teams, "channel", True, False, None, False),
+        ("Teams group chat", ab.Channels.ms_teams, "groupChat", True, False, None, False),
+        ("Teams missing conversation type", ab.Channels.ms_teams, None, None, False, None, False),
+        ("Teams contradictory group flag", ab.Channels.ms_teams, "personal", True, False, None, False),
+        ("Teams channel explicitly requesting streaming", ab.Channels.ms_teams, "channel", True, False, ab.DeliveryModes.stream, False),
+        ("M365 Copilot", ab.Channels.ms_teams, "personal", False, True, None, False),
+        ("WebChat", ab.Channels.webchat, None, None, False, None, True),
+        ("DirectLine", ab.Channels.direct_line, None, None, False, None, True),
+        ("other streaming channel", "other", None, None, False, ab.DeliveryModes.stream, True),
+        ("ordinary emulator", "emulator", None, None, False, None, False),
+    ]
+    for label, channel, kind, group, agentic, delivery, expected in cases:
+        context = _Context("streaming-capabilities")
+        context.activity.channel_id = SimpleNamespace(channel=channel)
+        context.activity.conversation.conversation_type = kind
+        context.activity.conversation.is_group = group
+        context.activity.is_agentic_request = lambda: agentic
+        context.activity.delivery_mode = delivery
+        _check(f"{label} streaming support", _supports_streaming(context), expected)
+
+
+async def test_teams_thread_turns():
+    class ThreadAgent:
+        def __init__(self):
+            self.seen = []
+            self.scene_keys = []
+
+        async def run(self, messages, stream=True, options=None):
+            self.seen.append([m.contents[0].text for m in messages])
+            self.scene_keys.append(options["user"])
+            yield SimpleNamespace(
+                message_id="status-get_scene_info",
+                contents=[SimpleNamespace(type="text", text="\n\n*Inspecting the scene...*\n\n")],
+            )
+            reply = (
+                "![viewport](https://files.example/viewport.png)"
+                if len(self.seen) == 1
+                else "[Download scene](https://files.example/castle.blend)"
+            )
+            yield SimpleNamespace(
+                message_id="answer",
+                contents=[SimpleNamespace(type="text", text=reply)],
+            )
+
+    conversation = "19:test-channel@thread.tacv2;messageid=100"
+    _reset(conversation)
+    agent = ThreadAgent()
+    contexts = []
+    with (
+        patch.object(ab, "_supports_streaming", _supports_streaming),
+        patch.object(ab, "_FallbackEmitter", _FallbackEmitter),
+        patch.object(ab, "_StreamingEmitter", side_effect=AssertionError("Threads must not open a stream")),
+    ):
+        for index, text in enumerate(["create a fantasy castle", "download the Blender scene"]):
+            context = _Context(conversation, text)
+            context.activity.id = str(100 + index)
+            context.activity.channel_id = ab.Channels.ms_teams
+            context.activity.conversation.conversation_type = "channel"
+            context.activity.conversation.is_group = True
+            context.activity.is_agentic_request = lambda: False
+            contexts.append(context)
+            await ab._run_turn(agent, context, _State({}))
+
+    first_reply = "![viewport](https://files.example/viewport.png)"
+    _check("thread first reply is a complete ordinary message", contexts[0].sent[-1].text, first_reply)
+    _check("thread follow-up delivers download", contexts[1].sent[-1].text,
+           "[Download scene](https://files.example/castle.blend)")
+    _check("thread status is sent without streaming", contexts[1].sent[0], "Inspecting the scene...")
+    _check("thread follow-up replays history", agent.seen[1],
+           ["create a fantasy castle", first_reply, "download the Blender scene"])
+    _check("thread follow-up keeps scene affinity", agent.scene_keys[0], agent.scene_keys[1])
+
+    context = contexts[1]
+    send = AsyncMock(return_value=SimpleNamespace(id="result"))
+    client = SimpleNamespace(conversations=SimpleNamespace(send_to_conversation=send), close=AsyncMock())
+    context.turn_state["factory"] = SimpleNamespace(create_connector_client=AsyncMock(return_value=client))
+    relay = ab._Relay(_FallbackEmitter(context))
+    await relay.text("Preview ready.")
+    await relay.detach(context)
+    await relay.text("Render ready.")
+    await relay.finish()
+    _check("thread handover closes with ordinary message", context.sent[-1].text,
+           "Preview ready." + ab._HANDOVER_TEXT)
+    _check("thread proactive result stays in original thread", send.await_args.args[0], conversation)
+    _check("thread proactive result is delivered", send.await_args.args[1].text, "Render ready.")
+    _check("thread proactive client is closed", client.close.await_count, 1)
+
+
+async def test_native_teams_status():
+    context = _Context("19:status@thread.tacv2;messageid=100")
+    context.activity.id = "follow-up-200"
+    context.activity.channel_id = ab.Channels.ms_teams
+    context.activity.is_agentic_request = lambda: False
+    send = AsyncMock(side_effect=[SimpleNamespace(id="status-stream"), None, None, None])
+    reply = AsyncMock(side_effect=AssertionError("Streaming must post to /activities, not /activities/id"))
+    client = SimpleNamespace(
+        conversations=SimpleNamespace(send_to_conversation=send, reply_to_activity=reply),
+        close=AsyncMock(),
+    )
+    context.turn_state["factory"] = SimpleNamespace(create_connector_client=AsyncMock(return_value=client))
+    emitter = ab._TeamsStatusEmitter(context, ab._Emitter(context))
+    with patch.object(ab, "_TEAMS_STATUS_INTERVAL", 0):
+        await emitter.status("Inspecting the scene...")
+        await emitter.status("Rendering the image...")
+        await emitter.text("![render](https://files.example/render.png)")
+        await emitter.card(SimpleNamespace(content_type="card"))
+        await emitter.finish()
+    activities = [call.args[1] for call in send.await_args_list]
+    _check("native status uses conversation endpoint", reply.await_count, 0)
+    _check("native status retains follow-up anchor", [item.reply_to_id for item in activities],
+           ["follow-up-200"] * 3)
+    _check("native updates use typing activities", [item.type for item in activities], ["typing", "typing", "message"])
+    _check("native initial sequence", activities[0].entities[0],
+           {"type": "streaminfo", "streamType": "informative", "streamSequence": 1})
+    _check("native subsequent sequence retains stream ID", activities[1].entities[0],
+           {"type": "streaminfo", "streamType": "informative", "streamSequence": 2, "streamId": "status-stream"})
+    _check("native final omits sequence", activities[2].entities[0],
+           {"type": "streaminfo", "streamType": "final", "streamId": "status-stream"})
+    _check("native final keeps complete image reply", activities[2].text, "![render](https://files.example/render.png)")
+    _check("native final keeps cards", len(activities[2].attachments), 1)
+    _check("native status connector clients close", client.close.await_count, 3)
+
+    send.reset_mock(side_effect=True)
+    send.return_value = SimpleNamespace(id="after-detach")
+    relay = ab._Relay(ab._TeamsStatusEmitter(context, ab._Emitter(context)))
+    with patch.object(ab, "_TEAMS_STATUS_INTERVAL", 0):
+        await relay.status("Inspecting...")
+        await relay.text("Viewport ready.")
+        await relay.detach(context)
+        context.send_activity = AsyncMock(side_effect=RuntimeError("Inbound context closed"))
+        await relay.status("Rendering...")
+        await relay.keepalive()
+        await relay.text("Render ready.")
+        await relay.finish()
+    activities = [call.args[1] for call in send.await_args_list]
+    _check("native turn detaches", relay.detached, True)
+    _check("native handover does not close status stream", activities[1].text, "Viewport ready." + ab._HANDOVER_TEXT)
+    _check("native actions survive detach", activities[2].text, "Rendering...")
+    _check("native keepalive survives detach", "still working" in activities[3].text, True)
+    _check("native final after detach", activities[4].text, "Render ready.")
+    _check("native detached turn never reuses inbound context", context.send_activity.await_count, 0)
+    _check("native detached result keeps thread", {call.args[0] for call in send.await_args_list},
+           {context.activity.conversation.id})
+
+
+async def test_native_teams_status_failures():
+    context = _Context("19:status-failures@thread.tacv2;messageid=100")
+    context.activity.id = "200"
+    send = AsyncMock()
+    client = SimpleNamespace(conversations=SimpleNamespace(send_to_conversation=send), close=AsyncMock())
+    context.turn_state["factory"] = SimpleNamespace(create_connector_client=AsyncMock(return_value=client))
+    for label, responses in [
+        ("initial 404", [RuntimeError("404"), SimpleNamespace(id="plain"), SimpleNamespace(id="answer")]),
+        ("missing stream ID", [None, SimpleNamespace(id="plain"), SimpleNamespace(id="answer")]),
+        ("final 403", [SimpleNamespace(id="stream"), RuntimeError("403"), SimpleNamespace(id="answer")]),
+    ]:
+        send.reset_mock(side_effect=True)
+        send.side_effect = responses
+        emitter = ab._TeamsStatusEmitter(context, ab._Emitter(context))
+        with patch.object(ab, "_TEAMS_STATUS_INTERVAL", 0):
+            await emitter.status("Inspecting...")
+            await emitter.text("The complete answer.")
+            await emitter.finish()
+        final = send.await_args_list[-1].args[1]
+        _check(f"{label} keeps the complete answer", final.text, "The complete answer.")
+        _check(f"{label} falls back without stream metadata", getattr(final, "entities", None), None)
+
+    send.reset_mock(side_effect=True)
+    send.return_value = SimpleNamespace(id="stream")
+    emitter = ab._TeamsStatusEmitter(context, ab._Emitter(context))
+    with patch.object(ab, "_TEAMS_STATUS_INTERVAL", 0):
+        await emitter.status("Inspecting...")
+        emitter._started -= ab._STREAM_MAX_SECONDS + 1
+        await emitter.tick()
+        await emitter.status("Rendering...")
+        await emitter.text("Late answer.")
+        await emitter.finish()
+    activities = [call.args[1] for call in send.await_args_list]
+    _check("native deadline closes status stream", activities[1].entities[0]["streamType"], "final")
+    _check("native deadline keeps later statuses ordinary", getattr(activities[2], "entities", None), None)
+    _check("native deadline preserves late answer", activities[3].text, "Late answer.")
+
+    send.reset_mock(side_effect=True)
+    send.return_value = SimpleNamespace(id="stream")
+    emitter = ab._TeamsStatusEmitter(context, ab._Emitter(context))
+    with patch.object(ab.asyncio, "sleep", AsyncMock()) as sleep:
+        await emitter.status("One")
+        await emitter.status("Two")
+    _check("native updates respect one request per second", 0 < sleep.await_args.args[0] <= 1, True)
+    emitter._current = lambda: False
+    await emitter.status("Superseded")
+    _check("native clear suppresses stale status", send.await_count, 2)
+
+
+async def test_native_teams_turns():
+    class StatusAgent(_Agent):
+        def run(self, messages, stream=True, options=None):
+            updates = super().run(messages, stream=stream, options=options)
+
+            async def generate():
+                yield SimpleNamespace(
+                    message_id="status-get_scene_info",
+                    contents=[SimpleNamespace(type="text", text="Inspecting the scene...")],
+                )
+                async for update in updates:
+                    yield update
+
+            return generate()
+
+    for kind in ("personal", "channel", "groupChat"):
+        conversation = f"19:native-{kind};messageid=100"
+        _reset(conversation)
+        agent = StatusAgent()
+        send = AsyncMock(return_value=SimpleNamespace(id="native-stream"))
+        client = SimpleNamespace(
+            conversations=SimpleNamespace(
+                send_to_conversation=send,
+                reply_to_activity=AsyncMock(side_effect=AssertionError("Wrong streaming endpoint")),
+            ),
+            close=AsyncMock(),
+        )
+        factory = SimpleNamespace(create_connector_client=AsyncMock(return_value=client))
+        with (
+            patch.object(ab, "_supports_streaming", _supports_streaming),
+            patch.object(ab, "_StreamingEmitter", side_effect=AssertionError("Use native action updates")),
+            patch.object(ab, "_TEAMS_STATUS_INTERVAL", 0),
+        ):
+            for index, text in enumerate(("first request", "follow-up request")):
+                context = _Context(conversation, text)
+                context.activity.id = str(100 + index)
+                context.activity.channel_id = ab.Channels.ms_teams
+                context.activity.conversation.conversation_type = kind
+                context.activity.conversation.is_group = kind != "personal"
+                context.activity.is_agentic_request = lambda: False
+                context.turn_state["factory"] = factory
+                await ab._run_turn(agent, context, _State({}))
+        activities = [call.args[1] for call in send.await_args_list]
+        _check(f"{kind} routes two turns through native status delivery",
+               [item.type for item in activities], ["typing", "message", "typing", "message"])
+        _check(f"{kind} follow-up status uses its own user-message anchor",
+               activities[2].reply_to_id, "101")
+        _check(f"{kind} follow-up delivers answer", activities[3].text, "reply-2")
+        _check(f"{kind} preserves history", agent.seen[1],
+               ["first request", "reply-1", "follow-up request"])
+
+
 async def main():
     _patch_framework()
+    test_streaming_capabilities()
+    await test_native_teams_status()
+    await test_native_teams_status_failures()
+    await test_native_teams_turns()
+    await test_teams_thread_turns()
     await test_serialised_turns()
     await test_clear_discards_inflight()
     await test_card_submit_transcript()
@@ -663,6 +918,8 @@ async def test_live_video_card_updates():
     _reset(conversation)
     context = _Context(conversation)
     context.activity.channel_id = ab.Channels.ms_teams
+    context.activity.conversation.conversation_type = "channel"
+    context.activity.conversation.is_group = True
     context.activity.is_agentic_request = lambda: False
     slot = ab._conversation_slot(conversation)
     sends, updates = [], []
@@ -678,6 +935,7 @@ async def test_live_video_card_updates():
     client = SimpleNamespace(conversations=SimpleNamespace(send_to_conversation=send, update_activity=update), close=AsyncMock())
     context.turn_state["factory"] = SimpleNamespace(create_connector_client=AsyncMock(return_value=client))
     notifier = ab._capture_video_notifier(context, ab._FallbackEmitter(context), slot, slot.epoch, SCOPE)
+    _check("channel video cards do not require text streaming", _supports_streaming(context), False)
     _check("Teams opts into worker progress", notifier[1].live_progress, True)
     result = {**_Jobs().describe(_Jobs().document), "state": "rendering", "progress": 10}
     result.pop("preview_url")

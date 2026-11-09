@@ -197,9 +197,9 @@ AZURE_STORAGE_ACCOUNT_NAME=<your-storage-account-name>
 To enable voice, also fill in `SPEECH_REGION` and `SPEECH_RESOURCE_ID` (see
 [Environment Variables](#environment-variables) and
 [Voice (speech-in / speech-out)](#voice-speech-in--speech-out) below). All other
-variables are optional or feature-specific. For reference uploads/video controls,
-configure `MEDIA_CONTROL_SECRET`; for paid finishing, also configure
-`WAVESPEED_API_KEY`. See [Video Configuration](#configuration) and the tables below.
+variables are optional or feature-specific. Reference uploads/video controls
+require no shared secret. For paid finishing, configure `WAVESPEED_API_KEY`.
+See [Video Configuration](#configuration) and the tables below.
 
 ## Build & Run
 
@@ -439,8 +439,8 @@ renders, and download links are never read aloud — instead a short spoken cue
 announces them while the image or download button still renders in the web
 chat.
 
-Voice can request a Blender animation in the same media-enabled Webchat conversation.
-The relay supplies a signed ownership scope, but not payment authority: upload
+Voice can request a Blender animation in the same Webchat conversation.
+The relay supplies the browser ownership scope outside the transcript, but not payment authority: upload
 references and approve paid finishing using the visual controls, not spoken consent.
 
 The voice path is **fully optional**: if `ENABLE_VOICE` is off or Speech is not
@@ -490,15 +490,16 @@ position, look-at target and focal length; linear and Bezier interpolation are s
 ### Configuration
 
 - Rebuild the container: it includes ffmpeg/ffprobe and the video modules.
-- Set the same random `MEDIA_CONTROL_SECRET` (at least 32 characters) on the agent
-  and Webchat server. Webchat media controls remain disabled without it. Keep it
-  server-side and out of source control, logs, prompts, and browser bundles.
-  Teams controls instead use verified channel identity and scene ownership.
+- No shared media secret is required. Responses requests bind video jobs to the
+  platform conversation, or a persistent sandbox scope when no conversation ID
+  is available. Webchat sends its browser scope in request metadata; Teams uses
+  the Activity conversation. Keep the hosted endpoint behind Foundry authentication
+  and protect public Webchat deployments with application authentication.
 - Set `AZURE_STORAGE_ACCOUNT_NAME` on both hosts. Reuse the existing private
   `screenshots` container. Grant their managed/developer identities Storage Blob
   Data Contributor on that container and the agent Storage Blob Delegator on the account.
 - For optional paid finishing, set `WAVESPEED_API_KEY` on the agent only. Inject
-  both secrets through the existing deployment configuration; the committed agent
+  the API key through the existing deployment configuration; the committed agent
   manifest intentionally contains no secret values. No new Azure resources or
   permissions are created automatically.
 - Install ffprobe on a separate Webchat host for pre-upload metadata checks. The
@@ -598,7 +599,6 @@ this is a client-side status timer, not proof of server-side progress.
 | `PROJECT_ENDPOINT` | Yes | - | Azure AI Foundry project endpoint |
 | `MODEL_DEPLOYMENT_NAME` | No | `gpt-4.1-mini` | Deployed model name |
 | `AZURE_STORAGE_ACCOUNT_NAME` | Yes | - | Private artifact storage for images, exports, references and video jobs |
-| `MEDIA_CONTROL_SECRET` | For Webchat media controls | - | Same random secret of at least 32 characters on the agent and Webchat server; Teams uses verified channel identity instead |
 | `WAVESPEED_API_KEY` | For paid finishing | - | Agent-only WaveSpeed credential; omit for Blender-only videos |
 | `VIDEO_RENDER_TIMEOUT_SECONDS` | No | `1800` | Blender animation worker render deadline, separate from the agent turn |
 | `AGENT_TURN_IDLE_TIMEOUT_SECONDS` | No | `180` | Maximum time without an upstream model/tool stream update |
@@ -742,7 +742,7 @@ the ` ```models ` / ` ```textures ` gallery blocks become Adaptive Cards.
 | `scene_manager.py` | Single-scene-per-VM Blender persistence on `$HOME` |
 | `artifact_storage.py` | Private Blob artifacts, ownership namespaces and signed download URLs |
 | `media_analysis.py` | Reference validation/decoding, render budgets and camera-path validation |
-| `media_control.py` | Reference/video tools and signed Webchat controls outside model payment authority |
+| `media_control.py` | Reference/video tools, Responses conversation binding and request-level controls outside model payment authority |
 | `video_jobs.py` | Blob-backed video state machine, render worker, leases, progress and recovery |
 | `blender_video.py` | Isolated Blender animation rendering with clay or original materials |
 | `wavespeed_client.py` | WaveSpeed upload, paid Seedance submission, polling and result download |
@@ -803,10 +803,18 @@ restart. The local scene snapshot must remain on the persistent HOME filesystem 
 render completion. Loss of that filesystem requires creating a new preview.
 
 Webchat polls through the existing Responses protocol, without adding control turns
-to conversation history, and restores saved job IDs after reload. A signed HttpOnly
+to conversation history, and restores saved job IDs after reload. A random HttpOnly
 cookie isolates browser ownership; it is not production user authentication. Protect
 the Webchat host with application authentication before exposing it publicly. Clearing
-cookies or rotating the control secret loses browser access to earlier jobs.
+cookies loses browser access to earlier jobs. Existing signed cookies retain their
+random browser key during migration, so their reference/job namespaces remain unchanged.
+
+Playground and direct Responses callers can render Blender videos without a Webchat
+client. `MediaResponsesHost` captures the SDK's actual conversation context before
+the agent-framework adapter drops it, and retains it through streamed tool execution.
+If no conversation ID is available, a random scope persisted under HOME keeps jobs
+recoverable in that sandbox. An ordinary chat or spoken request cannot approve a
+paid finish; use Webchat/Teams controls for the external processing approval.
 
 Teams supports attachment-only messages, approval/status/cancel cards, proactive
 completion and a signed MP4 download fallback. Native playback varies by client.
@@ -841,8 +849,10 @@ The agent is wired with three custom middleware layers on top of Microsoft Agent
 middleware=[MediaMiddleware(SceneIsolationMiddleware(ToolStatusMiddleware(), scene_manager))],
 ```
 
-`MediaMiddleware` validates signed media envelopes, binds conversation ownership,
-and handles verified video controls without asking the model to authorize them.
+`MediaResponsesHost` binds the Responses conversation and validates the optional
+`metadata.blender_media` JSON value (scope, references or a control action).
+`MediaMiddleware` uses that request context, never control-like text in messages,
+and handles video controls without asking the model to authorize them.
 It wraps `SceneIsolationMiddleware`, which activates/saves the scene around the
 `ToolStatusMiddleware` stream. The wrappers retain media scope during streamed tool execution.
 
@@ -916,7 +926,9 @@ Responses-managed persistence.
 ## Teams / M365 Copilot (Activity protocol)
 
 This section explains the implementation behind [Teams Setup and Usage](#teams-setup-and-usage).
-Model-turn statuses and keep-alives stop once a turn is detached. Video jobs use a
+Teams action statuses and keep-alives continue after HTTP request detachment,
+using fresh connector clients, until the status stream's safety deadline.
+Other channels keep their existing detached-result behavior. Video jobs use a
 separate notification path: non-agentic Teams updates the original card in place,
 while M365 Copilot retains completion notifications. Both depend on the runtime
 remaining active; see [Jobs and Recovery](#jobs-and-recovery).
@@ -943,8 +955,8 @@ scene-isolation and tool-status middleware. It routes each streamed
 
 | `message_id` | Emitted as |
 |---|---|
-| `status-*`, `scene-status-*` | `streaming_response.queue_informative_update()` — a live status line above the reply |
-| `tool-img-*`, `tool-link-*`, model prose, error text | `streaming_response.queue_text_chunk()` — the streamed answer |
+| `status-*`, `scene-status-*` | Native Teams informative updates; SDK informative-update queues on other streaming paths |
+| `tool-img-*`, `tool-link-*`, model prose, error text | A buffered complete Teams answer; SDK text-chunk queues on other streaming paths |
 
 Routing on `message_id` is why the bridge lives in-process: the WebChat client has to regex the `\n\n*status*\n\n` markers back out of the text stream, but here the structured update objects are still available.
 
@@ -955,9 +967,39 @@ The conversation is identified to `SceneIsolationMiddleware._get_conversation_id
 
 Both the raw id and the derived key are logged at turn start so they can be correlated.
 
-### Non-streaming fallback (M365 Copilot)
+### Native Teams action updates and safe fallback
 
-`StreamingResponse` silently drops informative updates on channels that don't support streaming, and the M365 Agents SDK **explicitly disables streaming for agentic requests** — which is the M365 Copilot path. On those channels the bridge sends each status as its own message activity instead. Chattier than a live status line, but it is the only way the custom waiting text reaches the user today. Teams (non-agentic) gets the streaming experience.
+The [current Teams streaming API](https://learn.microsoft.com/microsoftteams/platform/bots/streaming-ux)
+supports informative updates in personal chats, group chats and channel threads.
+`_TeamsStatusEmitter` sends those requests to `POST /conversations/{id}/activities`
+with the current user message's `replyToId` in the body. It does **not** use the
+SDK adapter's nested `/activities/{replyToId}` endpoint, which caused HTTP 404
+errors on thread follow-ups.
+
+Only statuses are sent while the model works. Images, download links, cards and
+prose are buffered for one complete final message, so a later informative update
+is not hidden by an earlier content chunk. The initial response establishes the
+stream ID; subsequent updates retain it, increment the sequence and respect
+Teams' one-request-per-second limit. The final message has no stream sequence.
+
+The emitter uses fresh connector clients even after the inbound request is
+detached, preserving native action updates during slow renders. If Teams refuses
+an update, returns no initial stream ID, or rejects stream finalization, the
+bridge logs the failure and uses ordinary messages, including a complete final
+answer. The conservative `ACTIVITY_STREAM_MAX_SECONDS` safety deadline still
+closes a live stream before switching to ordinary status/result messages.
+History, scene affinity and in-place video card updates are unchanged.
+
+`supportsTargetedMessages` in the preview manifest opts in to receiving private
+targeted messages; it is **not** a streaming capability flag. This change does
+not add private scene/history isolation for targeted requests. Use a personal
+chat for a private Blender session.
+
+`StreamingResponse` also silently drops informative updates on channels that
+don't support streaming, and the SDK **explicitly disables streaming for
+agentic requests** (M365 Copilot). Those requests retain the plain-message fallback. WebChat and DirectLine
+streaming are unchanged. The legacy SDK text-stream fallback is still restricted
+to personal Teams chats; groups never use its nested streaming-reply route.
 
 ### Surviving long turns
 
@@ -965,10 +1007,15 @@ Two independent limits bite on turns that take a while, and both are handled in 
 
 **Silence.** Teams and M365 Copilot abandon a turn that produces no traffic for roughly 45 s, and a single tool call (a final render, a model import) routinely takes longer. Status updates only fire when a tool *starts*, so a keep-alive pump (`_keepalive_pump`, `ACTIVITY_KEEPALIVE_SECONDS`, default 20 s) re-states the **current** status whenever nothing has gone out for that long — `Rendering the final image — still working (63s)`. It runs as a task alongside the agent stream and is cancelled before the final message so a keep-alive can never interleave with it.
 
-- Streaming channels get an informative update. Teams stops *rendering* those once real text has been streamed, but they still count as stream traffic, and by then the partial answer plus the typing indicator already show progress. Keep-alives are deliberately never queued as text chunks: streamed content is cumulative, so the noise could not be taken back out of the final message.
-- Non-streaming channels (M365 Copilot) get a short message activity — the same mechanism that already carries the per-tool statuses there.
+- Native Teams turns get informative updates, including after request detachment, without streaming intermediate answer text. Legacy streaming paths also keep keep-alive noise out of answer text.
+- Non-streaming channels (M365 Copilot, or Teams after a native-status failure/deadline) get short ordinary status messages.
 
-**The two-minute stream cap.** Teams kills a streamed message after a hard two minutes and rejects everything further with `403 ContentStreamNotAllowed` (*"Content stream finished due to exceeded streaming time"*) — **including the final message**, so the whole reply is lost. `_StreamingEmitter` closes the stream itself at `ACTIVITY_STREAM_MAX_SECONDS` (default 90, clamped to 110 because anything at or above 120 disables the guard) and hands over to the plain-message emitter. The deadline is re-checked on every pump poll, not only when a keep-alive is due — otherwise a silent render would notice it up to a keep-alive interval late, which is exactly long enough to miss it.
+**Stream lifetime.** Older Teams experiences rejected streams after two minutes;
+the current REST documentation describes a ten-minute limit. The bridge keeps its
+conservative `ACTIVITY_STREAM_MAX_SECONDS` guard (default 90, capped at 110) for
+compatibility. Every pump poll checks the deadline. Native Teams status streams
+are closed before the guard and later output uses ordinary messages; a failed
+stream finalization is retried as a complete ordinary answer.
 
 ### Adaptive Card galleries
 
@@ -1008,6 +1055,10 @@ The bridge runs the turn as a task and waits on it for `ACTIVITY_PROACTIVE_AFTER
 - **Under the mark** — asset searches, small scenes — nothing changes: the turn finishes in-request with live streaming.
 - **Over it**, the turn is *detached*. `_Relay.detach()` writes *"⏳ This task requires time — I'll keep working on it in the background and message you here as soon as it's ready"* onto the live response, closes it, and swaps the emitter for a `_ProactiveEmitter`. The handler returns, so the request completes well inside the platform's window. The task keeps running.
 
+For native Teams action updates, the emitter already uses fresh clients, so only
+the HTTP request detaches: the handover note is an ordinary message and the
+informative-update stream remains open until completion or its safety deadline.
+
 ```mermaid
 sequenceDiagram
     participant U as User (Teams)
@@ -1015,7 +1066,7 @@ sequenceDiagram
     participant T as Turn task
     U->>H: "create a cabin and render it"
     H->>T: start (detached after 35s)
-    H-->>U: 1. ⏳ This task requires time… (in-request, stream closed)
+    H-->>U: 1. ⏳ This task requires time… (native status stream stays open)
     Note over H: HTTP request completes — no client timeout
     T-->>U: 2. 🖼️ viewport screenshot (proactive)
     Note over T: render_final runs (~40s)

@@ -991,12 +991,6 @@ class VoiceSession:
     def _build_agent_request(self, transcript: str) -> dict[str, Any]:
         """Build the shared-conversation Responses payload for one voice turn."""
         input_text = transcript
-        if self._media_context:
-            from media_control import encode_voice_input
-
-            input_text = encode_voice_input(transcript, self._media_context)
-        elif transcript.startswith("BLENDER_MEDIA_V1:"):
-            raise ValueError("Media control envelopes cannot be submitted through voice.")
         input_value: Any = input_text
         if _is_hosted() and not self._foundry_conversation_id and self._fallback_history:
             input_value = [
@@ -1024,6 +1018,11 @@ class VoiceSession:
         if self._conversation_id:
             body["user"] = self._conversation_id
             body["metadata"] = {"conversation_id": self._conversation_id}
+        if self._media_context:
+            from media_control import voice_media_context
+
+            media = voice_media_context(self._media_context)
+            body.setdefault("metadata", {})["blender_media"] = json.dumps(media)
         return body
 
     def _build_loopback_headers(self) -> dict[str, str]:

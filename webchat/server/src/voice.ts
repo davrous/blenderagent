@@ -414,7 +414,7 @@ async function handleVoiceConnection(browser: WebSocket, req: IncomingMessage): 
   }
 
   const mediaContext = req.headers.origin === new URL(config.clientOrigin).origin
-    ? voiceMediaContext(req.headers.cookie, conversationId, config.mediaControlSecret)
+    ? voiceMediaContext(req.headers.cookie, conversationId)
     : undefined;
   relay(browser, upstream, foundryAgentSessionId, foundryConversationId, mediaContext);
 }
@@ -437,6 +437,12 @@ export function attachVoiceRelay(server: Server): void {
     if (pathname !== VOICE_PATH) {
       // Not ours — leave other upgrade handlers a chance, but if none exist the
       // socket must be closed to avoid a hanging connection.
+      return;
+    }
+    if (req.headers.origin !== new URL(config.clientOrigin).origin) {
+      console.warn("[voice] rejected WebSocket upgrade from an unexpected Origin");
+      socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+      socket.destroy();
       return;
     }
     if (!config.voiceEnabled) {

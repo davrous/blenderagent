@@ -45,8 +45,8 @@ environment_variables:
     value: "{{AZURE_STORAGE_ACCOUNT_NAME}}"
   - name: VIDEO_RENDER_TIMEOUT_SECONDS
     value: "1800"
-  # Supply MEDIA_CONTROL_SECRET and optional WAVESPEED_API_KEY through your
-  # deployment's secret configuration, never as literal committed values.
+  # Supply optional WAVESPEED_API_KEY through your deployment's secret
+  # configuration, never as a literal committed value.
   # ── Teams / M365 Copilot (Activity protocol) ──
   # Kill switch: set to "false" to drop back to a responses-only host without
   # rebuilding the image.
@@ -84,5 +84,5 @@ environment_variables:
     value: "8089"
 dockerfile_path: Dockerfile
 resources:
-  cpu: '2.0'
-  memory: 4.0Gi
+  cpu: '4.0'
+  memory: 8.0Gi

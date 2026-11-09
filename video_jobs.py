@@ -20,7 +20,7 @@ from media_analysis import render_settings, run_media
 from wavespeed_client import RATES, TERMINAL_FAILURES, WaveSpeedClient
 
 logger = logging.getLogger("blender_agent.video")
-video_scope = contextvars.ContextVar("video_scope", default=None)
+video_scope: contextvars.ContextVar[str | None] = contextvars.ContextVar("video_scope", default=None)
 video_notifier = contextvars.ContextVar("video_notifier", default=None)
 FINAL_STATES = {"completed", "failed", "cancelled", "submission_unknown", "awaiting_seedance_approval"}
 TRANSITIONS = {
