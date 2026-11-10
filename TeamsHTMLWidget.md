@@ -139,8 +139,8 @@ telechargement, statuts et controles d'autorisation des jobs video.
   HTTPS accessibles, avec des versions stables.
 - Garder un bootstrap HTML leger et deterministe, produit par le serveur,
   sans HTML executable genere par le modele.
-- Prevoir chargement explicite, erreurs recuperables, reinitialisation de la
-  camera et lien de telechargement ou de repli.
+- Prevoir chargement explicite, erreurs recuperables et reinitialisation de la
+  camera. Le lien GLB de repli reste dans la conversation, sans bouton redondant.
 
 ## Ressources, CSP et CORS
 
@@ -257,9 +257,10 @@ Le depot widgetsmith reste non consulte, faute d'acces authentifie.
 
 ## Implementation du MVP
 
-Le MVP est maintenant implemente, mais **la validation de la preview dans Teams
-via Foundry reste a effectuer**. Les tests de navigateur ne valident pas cette
-passerelle ni les politiques du tenant.
+Le MVP est implemente et le chargement du widget et des scenes a ete confirme
+dans Teams via Foundry. Les nouveaux controles de presentation restent dependants
+des capacites de la preview du client Teams ; la fixture navigateur simule le host,
+elle ne valide pas a elle seule les politiques du tenant.
 
 ### Composants
 
@@ -268,11 +269,53 @@ passerelle ni les politiques du tenant.
 - [activity_bridge.py](activity_bridge.py) : registre conversationnel durable,
   route exacte `invoke` + `htmlwidget/calltool`, publication apres la reponse
   native finale et invalidation par `/clear`.
-- [Viewer autonome](webchat/client/widget/) : JavaScript et CSS sans React ni
-  interface de chat, camera orbitale, cadrage, environnement HDR existant,
+- [Viewer autonome](webchat/client/widget/) : JavaScript et CSS sans interface
+  de chat, camera orbitale, cadrage, environnement HDR existant,
   controles clavier, themes, hauteur exacte, erreurs et liberation des ressources.
 - [Route statique](webchat/server/src/teamsWidgetAssets.ts) :
   `/teams-widget/v1/`, sans acces aux scenes et sans nouveau proxy GLB.
+
+### Presentation du 3D viewer
+
+- Titre **3D viewer**, habillage clair/sombre et icones accessibles.
+- Pas de **Download GLB** dans le widget : utiliser le lien deja publie dans
+  la conversation.
+- Barre en bas a droite du canvas : recadrage, inspecteur Babylon et plein ecran.
+  Le plein ecran utilise `ui/request-display-mode`, avec les modes `inline` et
+  `fullscreen` declares a l'initialisation. Les changements du host sont suivis ;
+  aucune notification de hauteur intrinsique n'est envoyee en plein ecran.
+  Le bouton est desactive si le host annonce que ce mode est indisponible.
+- L'icone prise, en bas a droite du pied de page, conserve **Check connection**
+  comme nom accessible. C'est uniquement un diagnostic aller-retour
+  widget/Teams/agent (`scene_widget_ping`) : aucun chargement GLB, aucune action
+  Blender et aucune verification WebGL ou CORS. Elle n'est pas necessaire au
+  parcours normal de l'utilisateur.
+- L'inspecteur Babylon 7.54.3 est embarque avec les assets, sans chargement du
+  script de debug ou de polices sur un CDN. Il utilise React en interne, sans
+  importer l'interface du Web Chat. Ses changements sont locaux au snapshot du
+  navigateur et ne modifient pas la scene Blender. Il est detruit au rechargement
+  de la scene et a la fermeture du viewer.
+- Le cadrage utilise les bornes mondiales de la geometrie visible et les coins de
+  chaque boite locale transformes dans le monde, le champ de vision et le ratio
+  du canvas, avec une occupation cible
+  de 85 %. Les positions decalees et echelles tres petites ou grandes sont prises
+  en compte, ainsi que les plans de clipping. Un support horizontal quasiment
+  plat (epaisseur <= 0,2 % de son etendue) est ignore pour le cadrage seulement
+  s'il depasse quatre fois l'etendue du sujet non plat ; une scene uniquement
+  plate reste cadree en entier.
+- Rotation douce d'environ deux degres par seconde au chargement, avec ajustement
+  du cadrage. Le premier clic/toucher sur le canvas, mouvement de molette, controle
+  clavier, recadrage ou ouverture de l'inspecteur l'arrete definitivement pour
+  ce chargement. Elle ne repart pas apres inactivite ou recadrage. Elle est
+  desactivee avec `prefers-reduced-motion` et suspendue hors ecran ou onglet cache.
+  Avant prise de controle, un redimensionnement recadre le modele ; apres, il
+  conserve le point de vue choisi par l'utilisateur.
+
+Le JavaScript remet a niveau le contenu du viewer depuis le template embarque :
+les messages Teams deja envoyes et le bootstrap de l'agent version 18 beneficient
+du nouveau design apres rechargement de leurs assets, sans republication de
+l'agent ni changement du manifest. La configuration et l'identifiant du widget
+restent ceux du message initial.
 
 Le registre est dans la ConversationState existante, persistee sur `$HOME` comme
 l'historique Activity. Il conserve les **32 derniers widgets** de la conversation.
@@ -381,6 +424,26 @@ du renderer, avec un type explicite pour `.hdr`. Il n'y a pas de serveur Node
 ou d'API dont il faudrait configurer `AGENT_FOUNDRY_URL`, un secret ou une
 identite managee. Le bootstrap HTML reste embarque dans le conteneur de l'agent
 et envoye directement dans son message Teams.
+
+La refonte **3D viewer** a ete publiee le 10 novembre 2026 dans l'environnement
+`production` de ce meme site. Aucune ressource, permission Blob, configuration
+Foundry, version d'agent ou modification du manifest n'a ete necessaire.
+Les trois fichiers servis correspondent exactement au build valide :
+
+| Asset | SHA-256 |
+|---|---|
+| `widget.js` | `39cf1175494e938b1b0290cea035c30eaede3da8878e6cc7f63fb17fd6873de8` |
+| `widget.css` | `0c30b066ca34bf3cb674ea7097e6be78d66ff0c1671394758566ff93356bd6f5` |
+| `studio_small_09_1k.hdr` | `e7cfda5f4e98e623db12b8bfd0184e048488e4855d9c83e2751fb44a32e80c45` |
+
+La sante, les types MIME, le CORS exact et le cache ont ete controles sur les URL
+publiees, y compris `no-store` sur la reponse HDR partielle `206`. Le smoke test
+navigateur utilise les JS/CSS de production avec un GLB de test et le HDR local
+identique : rendu, rotation puis arret sur interaction, ouverture/fermeture de
+l'inspecteur et protocole plein ecran passent sans erreur. Il ne remplace pas
+un essai du plein ecran dans le client Teams et son host de preview.
+Pour charger le nouveau JavaScript dans un message deja ouvert, rouvrir ou
+recharger le widget lui-meme ; **Reload scene** ne recharge que le snapshot.
 
 La regle CORS Blob a ete ajoutee en conservant les proprietes du service et les
 regles existantes. Les prevols des assets et du Blob passent, les types MIME et

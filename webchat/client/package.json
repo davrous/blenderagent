@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@babylonjs/core": "^7.34.0",
+    "@babylonjs/inspector": "7.54.3",
     "@babylonjs/loaders": "^7.34.0",
     "clsx": "^2.1.1",
     "lucide-react": "^1.43.0",

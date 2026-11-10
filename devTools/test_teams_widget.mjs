@@ -12,7 +12,13 @@ const require = createRequire(new URL("../webchat/package.json", import.meta.url
 const { register } = await import(pathToFileURL(require.resolve("tsx/esm/api")).href);
 register();
 const { WidgetBridge, reportHeight } = await import("../webchat/client/widget/bridge.ts");
-const { validateGlb, fetchGlb, freshEnvironmentUrl, SceneViewer } = await import("../webchat/client/widget/viewer.ts");
+const { validateGlb, fetchGlb, freshEnvironmentUrl, modelBounds, cameraFrame, SceneViewer } = await import("../webchat/client/widget/viewer.ts");
+const { NullEngine } = await import(pathToFileURL(require.resolve("@babylonjs/core/Engines/nullEngine.js")).href);
+const { Scene } = await import(pathToFileURL(require.resolve("@babylonjs/core/scene.js")).href);
+const { MeshBuilder } = await import(pathToFileURL(require.resolve("@babylonjs/core/Meshes/meshBuilder.js")).href);
+const { TransformNode } = await import(pathToFileURL(require.resolve("@babylonjs/core/Meshes/transformNode.js")).href);
+const { Vector3 } = await import(pathToFileURL(require.resolve("@babylonjs/core/Maths/math.vector.js")).href);
+const { ArcRotateCamera } = await import(pathToFileURL(require.resolve("@babylonjs/core/Cameras/arcRotateCamera.js")).href);
 const { registerWidgetAssets } = await import("../webchat/server/src/teamsWidgetAssets.ts");
 const express = require("express");
 const id = "a".repeat(32);
@@ -80,6 +86,7 @@ const connection = bridge.connect();
 const initial = host.sent.at(-1).message;
 assert.equal(initial.method, "ui/initialize");
 assert.equal(initial.params.protocolVersion, "2026-01-26");
+assert.deepEqual(initial.params.appCapabilities.availableDisplayModes, ["inline", "fullscreen"]);
 let connected = false;
 connection.then(() => connected = true);
 host.reply({ jsonrpc: "2.0", id: initial.id, result: {} }, { source: {} });
@@ -115,6 +122,22 @@ host.reply({ jsonrpc: "2.0", id: host.sent.at(-1).message.id, result: {
 } });
 await assert.rejects(failed, /scene was cleared/);
 
+for (const mode of ["fullscreen", "inline"]) {
+  const changing = bridge.displayMode(mode);
+  await Promise.resolve();
+  await Promise.resolve();
+  const request = host.sent.at(-1).message;
+  assert.equal(request.method, "ui/request-display-mode");
+  assert.deepEqual(request.params, { mode });
+  host.reply({ jsonrpc: "2.0", id: request.id, result: { mode } });
+  assert.equal(await changing, mode);
+}
+const refused = bridge.displayMode("fullscreen");
+await Promise.resolve();
+await Promise.resolve();
+host.reply({ jsonrpc: "2.0", id: host.sent.at(-1).message.id, result: { mode: "inline" } });
+await assert.rejects(refused, /display mode/);
+
 let observer;
 globalThis.ResizeObserver = class {
   constructor(callback) { this.callback = callback; observer = this; }
@@ -123,16 +146,76 @@ globalThis.ResizeObserver = class {
 };
 globalThis.window = { innerHeight: 1000 };
 let height = 318.625;
-const stopHeight = reportHeight({ getBoundingClientRect: () => ({ height }) }, bridge);
+const root = { dataset: {}, getBoundingClientRect: () => ({ height }) };
+const stopHeight = reportHeight(root, bridge);
 assert.equal(host.sent.at(-1).message.params.height, height);
 height = 215.375;
 observer.callback();
 assert.equal(host.sent.at(-1).message.params.height, height, "Height can shrink without rounding.");
+root.dataset.displayMode = "fullscreen";
+const messagesBeforeFullscreen = host.sent.length;
+height = 900;
+observer.callback();
+assert.equal(host.sent.length, messagesBeforeFullscreen, "Full-screen layouts must not resize their host.");
+root.dataset.displayMode = "inline";
+observer.callback();
+assert.equal(host.sent.at(-1).message.params.height, height);
 stopHeight();
 assert.equal(observer.disconnected, true);
 delete globalThis.window;
 delete globalThis.ResizeObserver;
 bridge.dispose();
+
+for (const aspect of [0.5, 1, 2.5]) {
+  const engine = new NullEngine({ renderWidth: 600 * aspect, renderHeight: 600 });
+  try {
+    for (const scale of [0.0001, 1, 10000]) for (const elongated of [false, true]) {
+      const scene = new Scene(engine);
+      const parent = new TransformNode("imported-root", scene);
+      parent.position.set(1000 * scale, 200 * scale, -400 * scale);
+      parent.scaling.set(2, 0.5, -1);
+      parent.rotation.y = 0.3;
+      const mesh = MeshBuilder.CreateBox("subject", { size: 2 }, scene);
+      mesh.parent = parent;
+      mesh.scaling.set((elongated ? 20 : 1) * scale, scale, scale);
+      mesh.position.set(201 * scale, -73 * scale, 500 * scale);
+      mesh.rotation.y = 0.6;
+      const bounds = modelBounds(scene.meshes);
+      for (const alpha of [0, Math.PI / 4, 3.8]) {
+        const frame = cameraFrame(bounds, alpha, Math.PI / 3, 0.8, aspect);
+        const camera = new ArcRotateCamera("fit", alpha, Math.PI / 3, frame.radius, frame.target, scene);
+        camera.fov = 0.8;
+        camera.minZ = frame.minZ;
+        camera.maxZ = frame.maxZ;
+        const matrix = camera.getViewMatrix(true).multiply(camera.getProjectionMatrix(true));
+        let occupancy = 0;
+        const vertices = mesh.getVerticesData("position");
+        for (let index = 0; index < vertices.length; index += 3) {
+          const world = Vector3.TransformCoordinates(Vector3.FromArray(vertices, index), mesh.getWorldMatrix());
+          const point = Vector3.TransformCoordinates(world, matrix);
+          occupancy = Math.max(occupancy, Math.abs(point.x), Math.abs(point.y));
+          assert.ok(Math.abs(point.x) <= 0.856 && Math.abs(point.y) <= 0.856, "Every model vertex fits with a margin.");
+          assert.ok(point.z > 0 && point.z < 1, "The model fits between the clipping planes.");
+        }
+        assert.ok(occupancy > 0.83, "The fitted model fills the viewport instead of remaining distant.");
+        camera.dispose();
+      }
+      scene.dispose();
+    }
+    const scene = new Scene(engine);
+    const subject = MeshBuilder.CreateBox("subject", { size: 2 }, scene);
+    const ground = MeshBuilder.CreateGround("support", { width: 2000, height: 2000 }, scene);
+    ground.position.y = -1;
+    assert.deepEqual(modelBounds(scene.meshes), modelBounds([subject]), "Oversized flat ground must not dwarf the subject.");
+    assert.equal(modelBounds([ground]).max.x, 1000, "A standalone flat model is still framed in full.");
+    ground.scaling.setAll(0.003);
+    assert.ok(Math.abs(modelBounds(scene.meshes).max.x - 3) < 1e-5, "Ordinary scenery remains part of the framing.");
+    subject.isVisible = ground.isVisible = false;
+    assert.throws(() => modelBounds(scene.meshes), /no visible geometry/);
+    scene.dispose();
+  } finally { engine.dispose(); }
+}
+console.log("Camera framing fits translated, scaled and elongated models in narrow and wide viewports.");
 
 const retryHost = new Host();
 const retryBridge = new WidgetBridge(retryHost, 10);
@@ -237,8 +320,17 @@ try {
   await rm(packageDirectory, { recursive: true });
 }
 
+const template = await readFile(new URL("../webchat/client/widget/widget.html", import.meta.url), "utf8");
+assert.match(template, /<h2>3D viewer<\/h2>/);
+assert.doesNotMatch(template, /id="download"|Download GLB/);
+for (const label of ["Check connection", "Reset view", "Show Babylon inspector", "Enter full screen"]) {
+  assert.ok(template.includes(`aria-label="${label}"`), `The ${label} icon needs an accessible name.`);
+}
+assert.match(template, /aria-controls="viewer-inspector"/);
+assert.doesNotMatch(template, /id="inspector-host"/, "The viewer must not reuse Babylon's reserved inspector host ID.");
+console.log("3D viewer title, icon labels and inspector host are valid; no redundant download button.");
+
 if (process.argv.includes("--serve")) {
-  const template = await readFile(new URL("../webchat/client/widget/widget.html", import.meta.url), "utf8");
   const environmentBytes = await readFile(new URL("../webchat/server/assets/studio_small_09_1k.hdr", import.meta.url));
   let poisonEnvironment = true;
   let environmentRequests = 0;
@@ -265,15 +357,18 @@ if (process.argv.includes("--serve")) {
     window.addEventListener("unhandledrejection", event => window.widgetErrors.push(String(event.reason)));
   `));
   app.get("/widget-test/frame", (_req, res) => {
-    res.setHeader("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' https://widgettest.blob.core.windows.net; img-src 'self' blob: data:; worker-src blob:; base-uri 'none'; frame-ancestors 'self'");
-    res.type("html").send(html);
+    res.setHeader("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://widgettest.blob.core.windows.net; img-src 'self' blob: data:; font-src data:; worker-src blob:; base-uri 'none'; frame-ancestors 'self'");
+    const content = _req.query.legacy === "1" ? html.replace(/<main\b[\s\S]*?<\/main>/,
+      '<main id="root" aria-label="Blender scene"><h2>Blender scene</h2><button id="load">Load scene</button><a id="download">Download GLB</a></main>') : html;
+    res.type("html").send(content);
   });
   app.get("/widget-test/cube.glb", (_req, res) => res.type("model/gltf-binary").send(cube));
-  app.get("/widget-test", (_req, res) => res.type("html").send(`<!doctype html>
+  app.get("/widget-test", (req, res) => res.type("html").send(`<!doctype html>
     <html><title>Teams widget browser fixture</title><body style="margin:0;max-width:760px">
-    <iframe title="Scene widget" src="/widget-test/frame" style="border:0;width:100%;height:500px"></iframe>
+    <iframe title="Scene widget" src="/widget-test/frame${req.query.legacy === "1" ? "?legacy=1" : ""}" style="border:0;width:100%;height:500px"></iframe>
     <script>
-    window.widgetCalls = []; window.widgetHeights = []; window.failSnapshot = false;
+    window.widgetCalls = []; window.widgetHeights = []; window.widgetDisplayModes = [];
+    window.failSnapshot = false; window.failFullscreen = false;
     window.addEventListener("message", (event) => {
       const frame = document.querySelector("iframe");
       if (event.source !== frame.contentWindow) return;
@@ -284,7 +379,18 @@ if (process.argv.includes("--serve")) {
       }
       if (!message.id) return;
       let result = {};
-      if (message.method === "ui/initialize") result = { protocolVersion: "2026-01-26", hostContext: { theme: "dark" } };
+      if (message.method === "ui/initialize") result = { protocolVersion: "2026-01-26",
+        hostContext: { theme: "dark", displayMode: "inline", availableDisplayModes: ["inline", "fullscreen"] } };
+      if (message.method === "ui/request-display-mode") {
+        window.widgetDisplayModes.push(message.params.mode);
+        if (window.failFullscreen) {
+          event.source.postMessage({ jsonrpc:"2.0", id:message.id, error:{code:-32601,message:"Full screen is unavailable."} }, event.origin);
+          return;
+        }
+        result = { mode: message.params.mode };
+        frame.style.height = result.mode === "fullscreen" ? "90vh" : "500px";
+        event.source.postMessage({ jsonrpc:"2.0", method:"ui/notifications/host-context-changed", params:{displayMode:result.mode} }, event.origin);
+      }
       if (message.method === "tools/call") {
         window.widgetCalls.push(message.params);
         result = window.failSnapshot

@@ -69,7 +69,8 @@ export class WidgetBridge {
   connect(): Promise<JsonObject> {
     this.connected ??= this.request("ui/initialize", {
       protocolVersion: "2026-01-26",
-      appInfo: { name: "Blender scene", version: "1.0.0" }, appCapabilities: {},
+      appInfo: { name: "3D viewer", version: "1.1.0" },
+      appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] },
     }).then((result) => {
       this.notify("ui/notifications/initialized", {});
       return result;
@@ -95,6 +96,13 @@ export class WidgetBridge {
     return data;
   }
 
+  async displayMode(mode: "inline" | "fullscreen"): Promise<"inline" | "fullscreen"> {
+    await this.connect();
+    const result = await this.request("ui/request-display-mode", { mode });
+    if (result.mode !== mode) throw new Error("Teams could not switch this widget to the requested display mode.");
+    return mode;
+  }
+
   dispose() {
     this.host.removeEventListener("message", this.receive);
     for (const request of this.pending.values()) {
@@ -108,6 +116,7 @@ export class WidgetBridge {
 export function reportHeight(root: HTMLElement, bridge: WidgetBridge): () => void {
   let previous: number | undefined;
   const report = () => {
+    if (root.dataset.displayMode === "fullscreen") return;
     const height = root.getBoundingClientRect().height;
     if (previous === height && window.innerHeight >= height) return;
     previous = height;

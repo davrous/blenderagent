@@ -1,7 +1,7 @@
 import { ArcRotateCamera } from "@babylonjs/core/Cameras/arcRotateCamera";
 import { Color4 } from "@babylonjs/core/Maths/math.color";
 import { Engine } from "@babylonjs/core/Engines/engine";
-import { FramingBehavior } from "@babylonjs/core/Behaviors/Cameras/framingBehavior";
+import type { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
 import { HDRCubeTexture } from "@babylonjs/core/Materials/Textures/hdrCubeTexture";
 import { Scene } from "@babylonjs/core/scene";
 import { SceneLoader } from "@babylonjs/core/Loading/sceneLoader";
@@ -10,6 +10,53 @@ import "@babylonjs/loaders/glTF";
 import "@babylonjs/core/Helpers/sceneHelpers";
 
 export const MAX_GLB_BYTES = 200 * 1024 * 1024;
+type Bounds = { min: Vector3; max: Vector3; corners: readonly Vector3[] };
+
+export function modelBounds(meshes: readonly AbstractMesh[]): Bounds {
+  const boxes = meshes.filter((mesh) =>
+    mesh.isVisible && mesh.visibility > 0 && mesh.isEnabled() && !mesh.infiniteDistance && mesh.getTotalVertices() > 0,
+  ).map((mesh) => {
+    mesh.computeWorldMatrix(true);
+    const box = mesh.getBoundingInfo().boundingBox;
+    const min = box.minimumWorld.clone(), max = box.maximumWorld.clone();
+    if (![...min.asArray(), ...max.asArray()].every(Number.isFinite)) throw new Error("The snapshot has invalid model bounds.");
+    return { min, max, size: max.subtract(min), corners: box.vectorsWorld.map((point) => point.clone()) };
+  });
+  if (!boxes.length) throw new Error("This snapshot contains no visible geometry.");
+  const combine = (items: readonly Bounds[]): Bounds => ({
+    min: items.reduce((min, box) => Vector3.Minimize(min, box.min), items[0].min.clone()),
+    max: items.reduce((max, box) => Vector3.Maximize(max, box.max), items[0].max.clone()),
+    corners: items.flatMap((box) => box.corners),
+  });
+  const subjects = boxes.filter(({ size }) => size.y > Math.max(size.x, size.z) * 0.002);
+  if (!subjects.length) return combine(boxes);
+  const subjectBounds = combine(subjects);
+  const size = subjectBounds.max.subtract(subjectBounds.min);
+  const extent = Math.max(size.x, size.y, size.z);
+  // A disproportionately large, flat ground/water surface should not dwarf the actual subject.
+  return combine(boxes.filter((box) => !(box.size.y <= Math.max(box.size.x, box.size.z) * 0.002
+    && Math.max(box.size.x, box.size.z) > extent * 4)));
+}
+
+export function cameraFrame(bounds: Bounds, alpha: number, beta: number, fov: number, aspect: number) {
+  if (!(aspect > 0) || !Number.isFinite(aspect) || !(fov > 0 && fov < Math.PI)) {
+    throw new Error("The viewer dimensions are invalid.");
+  }
+  const target = bounds.min.add(bounds.max).scale(0.5);
+  const direction = new Vector3(Math.cos(alpha) * Math.sin(beta), Math.cos(beta), Math.sin(alpha) * Math.sin(beta));
+  const right = Vector3.Cross(Vector3.Up(), direction).normalize();
+  const up = Vector3.Cross(direction, right).normalize();
+  const vertical = Math.tan(fov / 2) * 0.85, horizontal = vertical * aspect;
+  const diagonal = Vector3.Distance(bounds.min, bounds.max);
+  let radius = Math.max(diagonal * 0.001, 1e-10);
+  for (const corner of bounds.corners) {
+    const point = corner.subtract(target);
+    radius = Math.max(radius, Vector3.Dot(point, direction) + Math.max(
+      Math.abs(Vector3.Dot(point, right)) / horizontal, Math.abs(Vector3.Dot(point, up)) / vertical,
+    ));
+  }
+  return { target, radius, minZ: Math.max(diagonal / 10000, 1e-10), maxZ: radius + Math.max(diagonal, 1e-8) * 20 };
+}
 
 export function freshEnvironmentUrl(source: string): string {
   const url = new URL(source);
@@ -92,7 +139,12 @@ export class SceneViewer {
   private activeUntil = 0;
   private disposed = false;
   private reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  private initial?: { alpha: number; beta: number; radius: number; target: Vector3 };
+  private initial?: { alpha: number; beta: number };
+  private bounds?: Bounds;
+  private autoRotate = !this.reducedMotion;
+  private userControlled = false;
+  private inspector?: typeof import("@babylonjs/inspector").Inspector;
+  private inspectorVisible = false;
 
   constructor(private canvas: HTMLCanvasElement, onLost: () => void) {
     this.engine = new Engine(canvas, true, {
@@ -101,7 +153,11 @@ export class SceneViewer {
     this.engine.hideLoadingUI();
     this.scene = new Scene(this.engine);
     this.scene.clearColor = new Color4(0.055, 0.063, 0.078, 1);
-    this.resize = new ResizeObserver(() => { this.engine.resize(); this.wake(); });
+    this.resize = new ResizeObserver(() => {
+      this.engine.resize();
+      if (!this.userControlled) this.fit();
+      this.wake();
+    });
     this.resize.observe(canvas);
     this.intersection = new IntersectionObserver(([entry]) => {
       this.visible = entry.isIntersecting;
@@ -110,9 +166,9 @@ export class SceneViewer {
     this.intersection.observe(canvas);
     this.engine.onContextLostObservable.add(() => { this.engine.stopRenderLoop(); onLost(); });
     document.addEventListener("visibilitychange", this.visibility);
-    canvas.addEventListener("pointerdown", this.wake);
+    canvas.addEventListener("pointerdown", this.interact);
     canvas.addEventListener("pointermove", this.wake);
-    canvas.addEventListener("wheel", this.wake);
+    canvas.addEventListener("wheel", this.interact, { passive: true });
     canvas.addEventListener("keydown", this.key);
   }
 
@@ -129,7 +185,7 @@ export class SceneViewer {
     SceneLoader.ShowLoadingScreen = false;
     await SceneLoader.AppendAsync("", new File([bytes], "scene.glb", { type: "model/gltf-binary" }), this.scene);
     if (this.disposed) return;
-    if (!this.scene.meshes.some((mesh) => mesh.getTotalVertices() > 0)) throw new Error("This snapshot contains no visible geometry.");
+    this.bounds = modelBounds(this.scene.meshes);
     const environment = await new Promise<HDRCubeTexture>((resolve, reject) => {
       const texture = new HDRCubeTexture(
         freshEnvironmentUrl(environmentUrl), this.scene, 256, false, true, false, true,
@@ -139,24 +195,13 @@ export class SceneViewer {
     });
     if (this.disposed) return;
     this.scene.environmentTexture = environment;
-    this.scene.createDefaultCamera(true, true, true);
-    const camera = this.scene.activeCamera;
-    if (!(camera instanceof ArcRotateCamera)) throw new Error("The orbit camera could not be created.");
+    const camera = new ArcRotateCamera("viewer-camera", Math.PI * 0.75, Math.PI / 3, 1, Vector3.Zero(), this.scene);
+    this.scene.activeCamera = camera;
     this.camera = camera;
-    camera.alpha += Math.PI;
-    camera.useFramingBehavior = true;
-    const framing = camera.getBehaviorByName("Framing");
-    if (framing instanceof FramingBehavior) {
-      framing.framingTime = 0;
-      framing.elevationReturnTime = -1;
-      const bounds = this.scene.getWorldExtends((mesh) => mesh.isVisible && mesh.isEnabled());
-      camera.lowerRadiusLimit = null;
-      framing.zoomOnBoundingInfo(bounds.min, bounds.max);
-    }
-    camera.radius = Math.max(camera.radius, 0.01);
-    camera.lowerRadiusLimit = camera.radius / 100;
-    camera.upperRadiusLimit = camera.radius * 5;
-    camera.pinchPrecision = 200 / camera.radius;
+    this.fit();
+    const diagonal = Math.max(Vector3.Distance(this.bounds.min, this.bounds.max), 1e-8);
+    camera.lowerRadiusLimit = diagonal / 1000;
+    camera.upperRadiusLimit = diagonal * 20;
     camera.wheelDeltaPercentage = camera.pinchDeltaPercentage = 0.01;
     if (this.reducedMotion) camera.inertia = camera.panningInertia = 0;
     camera.attachControl(this.canvas, true);
@@ -164,18 +209,47 @@ export class SceneViewer {
     camera.inputs.removeByType("ArcRotateCameraKeyboardMoveInput");
     this.scene.animationGroups.forEach((group) => group.stop());
     this.scene.createDefaultSkybox(environment, true, (camera.maxZ - camera.minZ) / 2, 0.3, false);
-    this.initial = { alpha: camera.alpha, beta: camera.beta, radius: camera.radius, target: camera.target.clone() };
+    this.initial = { alpha: camera.alpha, beta: camera.beta };
     this.wake();
+  }
+
+  private fit() {
+    if (!this.camera || !this.bounds) return;
+    const frame = cameraFrame(this.bounds, this.camera.alpha, this.camera.beta, this.camera.fov, this.engine.getAspectRatio(this.camera));
+    const { alpha, beta } = this.camera;
+    this.camera.setTarget(frame.target);
+    this.camera.alpha = alpha;
+    this.camera.beta = beta;
+    this.camera.radius = frame.radius;
+    this.camera.minZ = frame.minZ;
+    this.camera.maxZ = frame.maxZ;
+    this.camera.pinchPrecision = 200 / frame.radius;
+  }
+
+  async toggleInspector(host: HTMLElement): Promise<boolean> {
+    this.interact();
+    const { Inspector } = await import("@babylonjs/inspector");
+    if (this.disposed) return false;
+    this.inspector = Inspector;
+    if (this.inspectorVisible) Inspector.Hide();
+    else Inspector.Show(this.scene, {
+      globalRoot: host, embedMode: true, overlay: true, enableClose: false, enablePopup: false,
+      skipDefaultFontLoading: true,
+    });
+    this.inspectorVisible = !this.inspectorVisible;
+    this.wake();
+    return this.inspectorVisible;
   }
 
   reset() {
     if (!this.camera || !this.initial) return;
+    this.interact();
     Object.assign(this.camera, {
-      alpha: this.initial.alpha, beta: this.initial.beta, radius: this.initial.radius,
+      alpha: this.initial.alpha, beta: this.initial.beta,
       inertialAlphaOffset: 0, inertialBetaOffset: 0, inertialRadiusOffset: 0,
       inertialPanningX: 0, inertialPanningY: 0,
     });
-    this.camera.setTarget(this.initial.target.clone());
+    this.fit();
     this.wake();
   }
 
@@ -195,6 +269,7 @@ export class SceneViewer {
       } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") camera.alpha += direction * 0.1;
       else camera.beta = Math.max(0.02, Math.min(Math.PI - 0.02, camera.beta + direction * 0.1));
     } else return;
+    this.interact();
     event.preventDefault();
     this.wake();
   };
@@ -204,15 +279,26 @@ export class SceneViewer {
   };
 
   private render = () => {
-    if (this.disposed || document.hidden || !this.visible || performance.now() > this.activeUntil) {
+    if (this.disposed || document.hidden || !this.visible
+      || (!this.autoRotate && !this.inspectorVisible && performance.now() > this.activeUntil)) {
       this.engine.stopRenderLoop();
       return;
     }
     if (this.camera) {
+      if (this.autoRotate) {
+        this.camera.alpha += Math.PI / 90 * Math.min(this.engine.getDeltaTime() / 1000, 0.05);
+        this.fit();
+      }
       this.camera.panningSensibility = 5000 / this.camera.radius;
       this.camera.speed = this.camera.radius * 0.2;
       this.scene.render();
     }
+  };
+
+  private interact = () => {
+    this.autoRotate = false;
+    this.userControlled = true;
+    this.wake();
   };
 
   private wake = () => {
@@ -226,11 +312,12 @@ export class SceneViewer {
     this.resize.disconnect();
     this.intersection.disconnect();
     document.removeEventListener("visibilitychange", this.visibility);
-    this.canvas.removeEventListener("pointerdown", this.wake);
+    this.canvas.removeEventListener("pointerdown", this.interact);
     this.canvas.removeEventListener("pointermove", this.wake);
-    this.canvas.removeEventListener("wheel", this.wake);
+    this.canvas.removeEventListener("wheel", this.interact);
     this.canvas.removeEventListener("keydown", this.key);
     this.engine.stopRenderLoop();
+    if (this.inspectorVisible) this.inspector?.Hide();
     this.scene.dispose();
     this.engine.dispose();
   }
