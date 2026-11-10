@@ -22,7 +22,7 @@ ONE multi-protocol server, so a single container serves:
 The Activity handler runs the *same* ``agent_framework`` ``Agent`` — same
 tools, same ``SceneIsolationMiddleware(ToolStatusMiddleware(), …)`` stack — and
 maps the streamed ``AgentResponseUpdate``s onto native Activity constructs.
-Teams uses explicit informative-update requests plus one complete final answer.
+Teams finalizes an informative stream for each completed answer segment.
 Other streaming clients use the SDK queue:
 
     message_id "status-*" / "scene-status-*" → queue_informative_update()
@@ -39,7 +39,7 @@ The current Teams API supports informative updates in channel threads and group
 chats too, but requires POST /activities with replyToId in the body. The SDK's
 nested reply endpoint caused 404s on follow-ups, so Teams status requests bypass
 that routing and use fresh connector clients, including after request detach.
-If Teams rejects a stream, statuses and the complete final answer fall back to
+If Teams rejects a stream, statuses stop and remaining answer content uses
 ordinary messages. M365 Copilot's agentic requests keep the plain-message path.
 
 Everything here is optional: ``main.py`` falls back to a responses-only host if
@@ -65,6 +65,7 @@ logger = logging.getLogger("blender_agent.activity")
 # Message ids stamped by ToolStatusMiddleware / SceneIsolationMiddleware in
 # main.py. Keep these in sync with the `message_id=` arguments there.
 _STATUS_PREFIXES = ("status-", "scene-status-")
+_ERROR_MESSAGE_IDS = ("agent-stream-error", "agent-turn-timeout")
 
 # How many prior messages (user + assistant) to replay on each turn. The
 # Activity path has NO Foundry-managed history — unlike /responses, which gets
@@ -491,6 +492,8 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
 
     async def _consume() -> None:
         nonlocal history_text
+        error_reported = False
+        pending_model_parts: list[str] = []
         # Tool calls can run for minutes; without this the channel sees nothing
         # between two status updates and gives up on the turn. The pump starts
         # BEFORE the lock so a turn queued behind a long render keeps its own
@@ -566,11 +569,21 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                     async for update in agent.run(messages, stream=True, options=options):
                         if not current():
                             break
+                        message_id = update.message_id or ""
+                        is_tool_media = message_id.startswith(("tool-img-", "tool-link-"))
+                        is_status = message_id.startswith(_STATUS_PREFIXES)
+                        is_error = message_id in _ERROR_MESSAGE_IDS
+                        has_tool_call = any(content.type == "function_call" for content in update.contents or [])
+                        if native_status and (has_tool_call or is_status or is_tool_media or is_error):
+                            # Only terminal model prose belongs in the final reply.
+                            # Keep pre-tool commentary in history, not in Teams.
+                            pending_model_parts.clear()
                         for content in update.contents or []:
                             if content.type != "text" or not content.text:
                                 continue
-                            message_id = update.message_id or ""
-                            if message_id.startswith(_STATUS_PREFIXES):
+                            if is_error:
+                                error_reported = True
+                            if is_status:
                                 await relay.status(_clean_status(content.text))
                                 if message_id.startswith(_PROGRESS_STATUS_PREFIXES):
                                     await relay.progress()
@@ -582,7 +595,15 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                                 # which gallery it offered; the user sees the filtered
                                 # version with the fenced JSON replaced by a card.
                                 reply_parts.append(content.text)
-                                await _emit_filtered(relay, gallery.feed(content.text), dedupe, notifier=notifier)
+                                if native_status and not is_tool_media and not is_error:
+                                    if not has_tool_call:
+                                        pending_model_parts.append(content.text)
+                                else:
+                                    await _emit_filtered(relay, gallery.feed(content.text), dedupe, notifier=notifier)
+                    if native_status and current() and pending_model_parts:
+                        await _emit_filtered(
+                            relay, gallery.feed("".join(pending_model_parts)), dedupe, notifier=notifier,
+                        )
                 finally:
                     video_notifier.reset(notifier_token)
                     video_scope.reset(scope_token)
@@ -592,10 +613,10 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
         except MediaError as error:
             await relay.text(str(error))
         except Exception:
-            # ToolStatusMiddleware already emitted user-facing error text before
-            # re-raising, so only add our own when nothing reached the user.
+            # Raw history may contain a suppressed plan, not an error.
+            # Preserve the middleware's friendly notice when it supplied one.
             logger.error("Activity turn failed; exception details omitted to protect media credentials")
-            if not reply_parts:
+            if not reply_parts or (native_status and not error_reported):
                 # Guarded: the original failure may BE the delivery channel
                 # dying, in which case this send raises too — turning a handled
                 # error into an unhandled one that escapes the turn and skips
@@ -1678,7 +1699,7 @@ class _ProactiveEmitter(_Emitter):
 
 
 class _TeamsStatusEmitter(_ProactiveEmitter):
-    """Native action updates, followed by one complete answer, even after detach."""
+    """One native informative stream, finalized with the complete reply."""
 
     def __init__(self, context: Any, previous: _Emitter) -> None:
         super().__init__(context, previous)
@@ -1720,7 +1741,7 @@ class _TeamsStatusEmitter(_ProactiveEmitter):
                     self._native = False
                     logger.warning(
                         "Teams returned no status stream ID; suppressing chat statuses "
-                        "and keeping the complete answer for ordinary delivery"
+                        "and keeping remaining answer content for ordinary delivery"
                     )
                     return False
                 self._stream_id = stream_id
@@ -1735,7 +1756,7 @@ class _TeamsStatusEmitter(_ProactiveEmitter):
             self._native = False
             logger.warning(
                 "Native Teams %s delivery failed (%s); suppressing chat statuses "
-                "and retaining the complete answer for final delivery",
+                "and retaining remaining answer content for final delivery",
                 kind, type(error).__name__,
             )
             return False
@@ -1780,7 +1801,8 @@ class _TeamsStatusEmitter(_ProactiveEmitter):
                 return
             self._finished = True
             body = "".join(self._parts).strip()
-            body = body or (_GALLERY_ONLY_TEXT if self._attachments else _EMPTY_REPLY_TEXT)
+            if not body:
+                body = _GALLERY_ONLY_TEXT if self._attachments else _EMPTY_REPLY_TEXT
             if self._stream_id and not self._stream_closed:
                 if await self._try_stream("final", body, self._attachments):
                     return

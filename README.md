@@ -975,7 +975,9 @@ scene-isolation and tool-status middleware. It routes each streamed
 | `message_id` | Emitted as |
 |---|---|
 | `status-*`, `scene-status-*` | Native Teams informative updates; SDK informative-update queues on other streaming paths |
-| `tool-img-*`, `tool-link-*`, model prose, error text | A buffered complete Teams answer; SDK text-chunk queues on other streaming paths |
+| Model prose before a tool call | Omitted from native Teams output, retained in raw history; SDK text-chunk queues on other streaming paths |
+| `tool-img-*`, `tool-link-*` | Buffered in chronological order for the native Teams final answer; SDK text-chunk queues on other streaming paths |
+| Remaining model prose, cards, error text | The native Teams stream's final answer; SDK text-chunk queues on other streaming paths |
 
 Routing on `message_id` is why the bridge lives in-process: the WebChat client has to regex the `\n\n*status*\n\n` markers back out of the text stream, but here the structured update objects are still available.
 
@@ -995,19 +997,33 @@ with the current user message's `replyToId` in the body. It does **not** use the
 SDK adapter's nested `/activities/{replyToId}` endpoint, which caused HTTP 404
 errors on thread follow-ups.
 
-Only statuses are sent while the model works. Images, download links, cards and
-prose are buffered for one complete final message, so a later informative update
-is not hidden by an earlier content chunk. The initial response establishes the
-stream ID; subsequent updates retain it, increment the sequence and respect
-Teams' one-request-per-second limit. The final message has no stream sequence.
+Native Teams uses **one informative stream until the turn completes**. Pre-tool
+model commentary, such as an announcement repeating the request, is omitted
+from Teams output but retained in raw history. This also handles text and
+function calls arriving in the same update, in either order. Tool images,
+download links and cards stay buffered. The single final answer preserves the
+media's chronological order and appends the terminal model summary. Per-turn
+deduplication prevents the summary from repeating the same image or link.
+
+Do **not** post ordinary messages alongside an open informative stream, or close
+and reopen the stream to publish intermediate content. Production traces showed
+404s and reordered replies with ordinary messages; reopening after a final was
+accepted by the service but did not restore visible status dots in Teams.
+The documented client behavior stops displaying informative updates once content
+begins. The bridge therefore sends neither intermediate content chunks nor an
+early final. The final message has no stream sequence and closes the original
+informative stream only after the work completes, subject to the safety limit below.
 
 The emitter uses fresh connector clients even after the inbound request is
 detached, preserving native action updates during slow renders. HTTP detachment
-does not publish a handover notice or flush the buffered answer. If Teams refuses
+does not publish a handover notice or flush incomplete content. If Teams refuses
 an update or returns no initial stream ID, the bridge logs the failure and
 suppresses further statuses rather than posting chat countdowns. A known stream
-is still finalized with the complete answer when possible; a rejected final is
-retried as an ordinary complete answer. The separate nine-minute native-stream
+is still finalized with its complete buffered content when possible. A rejected
+final is retried as an ordinary message with its text and cards intact.
+An error after suppressed commentary still produces an explicit failure notice;
+the presence of a plan in raw history is not treated as an error acknowledgement.
+The separate nine-minute native-stream
 guard closes a genuinely long-running stream with one continuation notice, then
 waits for the final result without posting ordinary statuses.
 History, scene affinity and in-place video card updates are unchanged.
@@ -1029,10 +1045,10 @@ Two independent limits bite on turns that take a while, and both are handled in 
 
 **Silence.** Teams and M365 Copilot abandon a turn that produces no traffic for roughly 45 s, and a single tool call (a final render, a model import) routinely takes longer. Status updates only fire when a tool *starts*, so a keep-alive pump (`_keepalive_pump`, `ACTIVITY_KEEPALIVE_SECONDS`, default 20 s) re-states the **current** status whenever nothing has gone out for that long — `Rendering the final image — still working (63s)`. It runs as a task alongside the agent stream and is cancelled before the final message so a keep-alive can never interleave with it.
 
-- Native Teams turns get informative updates, including after request detachment, without streaming intermediate answer text. Legacy streaming paths also keep keep-alive noise out of answer text.
+- Native Teams turns keep one informative stream, including after request detachment, until the complete final answer is ready. They never interleave ordinary messages or intermediate content chunks with an open informative stream. Legacy streaming paths also keep keep-alive noise out of answer text.
 - Non-streaming paths such as M365 Copilot retain short ordinary status messages.
   A native Teams turn never falls back to chat status/countdown messages after a
-  status failure or deadline; only the final answer uses ordinary delivery.
+  status failure or deadline; only actual answer content uses ordinary delivery.
 
 **Stream lifetime.** Older Teams experiences rejected streams after two minutes;
 the current REST documentation describes a ten-minute limit. Native Teams
@@ -1040,7 +1056,7 @@ informative updates therefore use a separate nine-minute safety guard, measured
 from their first update rather than from turn creation. They remain native
 through the 35-second HTTP detach and beyond the old 90-second guard. Every pump
 poll checks the deadline. At nine minutes, the stream closes with one continuation
-notice and the eventual complete answer is sent ordinarily, without chat
+notice and the remaining answer is sent ordinarily, without chat
 countdowns. The legacy SDK path retains `ACTIVITY_STREAM_MAX_SECONDS` (default 90,
 capped at 110); a failed native finalization is still retried as an ordinary answer.
 
@@ -1088,8 +1104,9 @@ The bridge runs the turn as a task and waits on it for `ACTIVITY_PROACTIVE_AFTER
   The task keeps running.
 
 For native Teams action updates, the emitter already uses fresh clients, so only
-the HTTP request detaches, silently. The informative-update stream stays open,
-and text, images and cards remain buffered for the complete final answer.
+the HTTP request detaches, silently. Native informative updates continue on the
+original stream; tool media and the terminal model summary stay buffered until
+the single final answer. Intermediate model announcements are not displayed.
 Neither detachment nor render progress generates a chat handover/countdown.
 
 The following diagram illustrates the legacy/non-native handover:
@@ -1114,8 +1131,9 @@ sequenceDiagram
 
 On legacy/non-native paths, a detached turn would otherwise be silent from the
 handover until the render lands. A render therefore produces **two** proactive
-messages there. Native Teams turns instead keep their informative status control
-and send one complete answer:
+messages there. Native Teams turns instead keep their status dots active while
+buffering both images for one final answer, followed by the model's summary.
+The following two-message behavior applies only to legacy/non-native paths:
 
 | # | When | What it carries | Why |
 |---|---|---|---|

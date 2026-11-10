@@ -461,6 +461,216 @@ async def test_native_teams_status():
            {context.activity.conversation.id})
 
 
+async def test_native_teams_buffered_reply():
+    intro = "I'll make six colorful cottages around a looping footpath."
+    viewport = "Here's the current viewport:\n\n![viewport](https://files.example/viewport.png)"
+    render = "Here's the rendered image:\n\n![render](https://files.example/render.png)"
+
+    for kind in ("personal", "channel", "groupChat"):
+        for delivery in ("chunked", "text-first", "call-first"):
+            label = f"{kind} {delivery}"
+            conversation = f"19:buffered-{kind}-{delivery};messageid=100"
+            _reset(conversation)
+            tool_started, release_tool = asyncio.Event(), asyncio.Event()
+            media_ready, release_render = asyncio.Event(), asyncio.Event()
+            completed = asyncio.Event()
+            slots = []
+            active = None
+            informative = []
+            interleaved = []
+            client_finished = False
+
+            class StagedAgent:
+                def run(self, messages, stream=True, options=None):
+                    async def generate():
+                        def text(message_id, value):
+                            return SimpleNamespace(
+                                message_id=message_id,
+                                contents=[SimpleNamespace(type="text", text=value)],
+                            )
+
+                        yield text("scene-status-0", "Preparing the scene...")
+                        call = SimpleNamespace(type="function_call", name="execute_blender_code")
+                        if delivery != "chunked":
+                            yield text("status-execute_blender_code", "Executing Blender code...")
+                            prose = SimpleNamespace(type="text", text=intro)
+                            yield SimpleNamespace(
+                                message_id="plan",
+                                contents=[prose, call] if delivery == "text-first" else [call, prose],
+                            )
+                        else:
+                            yield text("plan", intro[:18])
+                            _check(f"{label} never publishes a partial sentence",
+                                   [call.args[1].text for call in send.await_args_list
+                                    if call.args[1].type == "message"], [])
+                            yield text("plan", intro[18:])
+                            yield text("status-execute_blender_code", "Executing Blender code...")
+                            yield SimpleNamespace(message_id="plan", contents=[call])
+                        tool_started.set()
+                        await release_tool.wait()
+                        yield text("status-get_viewport_screenshot", "Capturing viewport screenshot...")
+                        yield text("tool-img-viewport", f"\n\n{viewport}\n\n")
+                        yield text("render-plan", "I'll render the village next.")
+                        yield text("status-render_final", "Rendering the final image...")
+                        media_ready.set()
+                        await release_render.wait()
+                        yield text("tool-img-render", f"\n\n{render}\n\n")
+                        yield text("answer", "Created the village.\n\n![viewport](")
+                        yield text("answer", "https://files.example/viewport.png)\n\n![render](https://files.example/render.png)")
+
+                    return generate()
+
+            async def post(_conversation_id, activity):
+                nonlocal active, client_finished
+                if getattr(activity, "entities", None):
+                    entity = activity.entities[0]
+                    stream_id = entity.get("streamId")
+                    if entity["streamType"] == "informative":
+                        if stream_id is None:
+                            if active is not None:
+                                raise RuntimeError("Only one open stream per conversation")
+                            active = SimpleNamespace(id=f"status-{len(slots) + 1}", text=None, invalidated=False)
+                            slots.append(active)
+                        elif active is None or active.id != stream_id or active.invalidated:
+                            raise RuntimeError("404: ordinary reply invalidated informative updates")
+                        # The service accepts later streams, but Teams no longer
+                        # renders their informative updates after the first final.
+                        if not client_finished:
+                            informative.append((active.id, entity["streamSequence"], activity.text))
+                        response_id = active.id
+                    else:
+                        if active is None or active.id != stream_id:
+                            raise RuntimeError("Final references a closed or unknown stream")
+                        active.text = activity.text
+                        response_id = active.id
+                        active = None
+                        client_finished = True
+                else:
+                    if active is not None:
+                        active.invalidated = True
+                        interleaved.append(activity.text)
+                    response_id = f"ordinary-{len(slots) + 1}"
+                    slots.append(SimpleNamespace(id=response_id, text=activity.text))
+                if "Created the village." in activity.text:
+                    completed.set()
+                return SimpleNamespace(id=response_id)
+
+            send = AsyncMock(side_effect=post)
+            client = SimpleNamespace(
+                conversations=SimpleNamespace(
+                    send_to_conversation=send,
+                    reply_to_activity=AsyncMock(side_effect=AssertionError("Wrong thread endpoint")),
+                ),
+                close=AsyncMock(),
+            )
+            context = _Context(conversation, "Create a village and render it.")
+            context.activity.id = "user-100"
+            context.activity.channel_id = ab.Channels.ms_teams
+            context.activity.conversation.conversation_type = kind
+            context.activity.conversation.is_group = kind != "personal"
+            context.activity.is_agentic_request = lambda: False
+            context.turn_state["factory"] = SimpleNamespace(
+                create_connector_client=AsyncMock(return_value=client),
+            )
+
+            def visible():
+                # Finalization fills the slot reserved by the initial update,
+                # rather than appending a new message at finalization time.
+                return [slot.text for slot in slots if slot.text is not None]
+
+            with (
+                patch.object(ab, "_TEAMS_STATUS_INTERVAL", 0),
+                patch.object(ab, "_PROACTIVE_AFTER_SECONDS", 0.01),
+            ):
+                await ab._run_turn(StagedAgent(), context, _State({}))
+                await asyncio.wait_for(tool_started.wait(), timeout=2)
+                _check(f"{label} never publishes the redundant plan", visible(), [])
+                _check(f"{label} native status remains visible during the slow tool",
+                       active is not None and not client_finished, True)
+                context.send_activity = AsyncMock(side_effect=RuntimeError("Inbound context closed"))
+                release_tool.set()
+                await asyncio.wait_for(media_ready.wait(), timeout=2)
+                _check(f"{label} buffers the viewport until completion", visible(), [])
+                _check(f"{label} rendering status remains visible after the viewport is ready",
+                       informative[-1][2], "Rendering the final image...")
+                release_render.set()
+                await asyncio.wait_for(completed.wait(), timeout=2)
+            activities = [call.args[1] for call in send.await_args_list]
+            body = activities[-1].text
+            _check(f"{label} publishes exactly one complete answer", len(visible()), 1)
+            _check(f"{label} final keeps viewport, render, summary in order",
+                   body.startswith(viewport) and body.find(viewport) < body.find(render) < body.find("Created the village."),
+                   True)
+            _check(f"{label} final omits the redundant plan", intro in body, False)
+            _check(f"{label} final omits intermediate render commentary", "I'll render the village next." in body, False)
+            _check(f"{label} viewport and render each appear once",
+                   [body.count("https://files.example/viewport.png"), body.count("https://files.example/render.png")], [1, 1])
+            _check(f"{label} never injects ordinary replies into an open stream", interleaved, [])
+            _check(f"{label} preserves the final summary", body.endswith("Created the village."), True)
+            finals = [a for a in activities if a.type == "message" and getattr(a, "entities", None)]
+            _check(f"{label} sends final only after all work completes", len(finals), 1)
+            _check(f"{label} never reopens a stream", len(slots), 1)
+            _check(f"{label} final closes the original informative stream", finals[-1].entities,
+                   [{"type": "streaminfo", "streamType": "final", "streamId": "status-1"}])
+            _check(f"{label} no native stream remains open", active, None)
+            sequences = {}
+            for stream_id, sequence, _text in informative:
+                sequences.setdefault(stream_id, []).append(sequence)
+            _check(f"{label} informative updates stay on one continuous sequence",
+                   list(sequences.values()), [[1, 2, 3, 4]])
+            typing = [a for a in activities if a.type == "typing"]
+            _check(f"{label} never converts statuses to streamed content",
+                   [a.entities[0]["streamType"] for a in typing], ["informative"] * len(typing))
+            statuses = [text for _, _, text in informative]
+            _check(f"{label} each tool status is accepted after earlier stages",
+                   [text for index, text in enumerate(statuses) if index == 0 or text != statuses[index - 1]],
+                   ["Preparing the scene...", "Executing Blender code...", "Capturing viewport screenshot...", "Rendering the final image..."])
+            _check(f"{label} every stage keeps its user-message anchor", {a.reply_to_id for a in activities}, {"user-100"})
+            _check(f"{label} keeps the complete plan in history", ab._conversations[conversation].history[-1]["text"].count(intro), 1)
+            _check(f"{label} never reuses a detached inbound context", context.send_activity.await_count, 0)
+
+
+async def test_native_teams_error_after_commentary():
+    for error_id in (None, "agent-stream-error", "agent-turn-timeout"):
+        conversation = f"19:staged-error-{error_id};messageid=100"
+        _reset(conversation)
+
+        class ErrorAgent:
+            def run(self, messages, stream=True, options=None):
+                async def generate():
+                    yield SimpleNamespace(
+                        message_id="status-get_scene_info",
+                        contents=[SimpleNamespace(type="text", text="Inspecting...")],
+                    )
+                    yield SimpleNamespace(
+                        message_id="plan",
+                        contents=[
+                            SimpleNamespace(type="text", text="The plan."),
+                            SimpleNamespace(type="function_call", name="execute_blender_code"),
+                        ],
+                    )
+                    if error_id:
+                        yield SimpleNamespace(
+                            message_id=error_id,
+                            contents=[SimpleNamespace(type="text", text="The tool failed. Please retry.")],
+                        )
+                    raise RuntimeError("Tool failed")
+
+                return generate()
+
+        send = AsyncMock(return_value=SimpleNamespace(id="native-status"))
+        client = SimpleNamespace(conversations=SimpleNamespace(send_to_conversation=send), close=AsyncMock())
+        context = _Context(conversation, "Create a village.")
+        context.activity.id = "user-100"
+        context.activity.channel_id = ab.Channels.ms_teams
+        context.activity.is_agentic_request = lambda: False
+        context.turn_state["factory"] = SimpleNamespace(create_connector_client=AsyncMock(return_value=client))
+        with patch.object(ab, "_TEAMS_STATUS_INTERVAL", 0):
+            await ab._run_turn(ErrorAgent(), context, _State({}))
+        _check(f"{error_id or 'unannounced error'} after commentary never claims success",
+               send.await_args.args[1].text, "The tool failed. Please retry." if error_id else ab._ERROR_TEXT)
+
+
 async def test_native_teams_status_failures():
     context = _Context("19:status-failures@thread.tacv2;messageid=100")
     context.activity.id = "200"
@@ -634,6 +844,8 @@ async def main():
     _patch_framework()
     test_streaming_capabilities()
     await test_native_teams_status()
+    await test_native_teams_buffered_reply()
+    await test_native_teams_error_after_commentary()
     await test_native_teams_status_failures()
     await test_native_teams_turns()
     await test_teams_thread_turns()
