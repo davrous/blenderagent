@@ -22,7 +22,7 @@ ONE multi-protocol server, so a single container serves:
 The Activity handler runs the *same* ``agent_framework`` ``Agent`` — same
 tools, same ``SceneIsolationMiddleware(ToolStatusMiddleware(), …)`` stack — and
 maps the streamed ``AgentResponseUpdate``s onto native Activity constructs.
-Teams finalizes an informative stream for each completed answer segment.
+Teams keeps one informative stream until the complete final answer.
 Other streaming clients use the SDK queue:
 
     message_id "status-*" / "scene-status-*" → queue_informative_update()
@@ -58,6 +58,7 @@ import os
 import re
 import time
 from typing import Any
+import teams_widgets as widgets
 
 logger = logging.getLogger("blender_agent.activity")
 
@@ -333,6 +334,28 @@ def register_activity_handlers(host: Any, agent: Any) -> None:
     """Wire the Activity handlers on the host's M365 ``AgentApplication``."""
     app = host.agent_app
 
+    async def on_widget(context: Any, state: Any) -> None:
+        conversation_id = _conversation_id(context)
+        slot = _conversation_slot(conversation_id)
+        slot.generation = max(slot.generation, _scene_generation(state))
+        generation, epoch = slot.generation, slot.epoch
+        from artifact_storage import conversation_scope
+
+        scope = conversation_scope(_scene_key(conversation_id, generation)) if conversation_id else None
+        result = await widgets.call_tool(
+            context, _load_scene_widgets(state, slot), scope, generation,
+            lambda: slot.epoch == epoch and slot.generation == generation,
+        )
+        await _safe_send(context, Activity(type="invokeResponse", value={"status": 200, "body": result}))
+
+    app.add_route(
+        lambda context: (
+            getattr(context.activity, "type", None) == "invoke"
+            and getattr(context.activity, "name", None) == widgets.INVOKE_NAME
+        ),
+        on_widget, is_invoke=True,
+    )
+
     @app.activity("message")
     async def on_message(context: Any, state: Any) -> None:  # pyright: ignore[reportUnusedFunction]
         await _run_turn(agent, context, state)
@@ -446,6 +469,18 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
     gallery = _GalleryFilter(scope)
     dedupe = _MediaDedupeFilter()
     reply_parts: list[str] = []
+    widget_config = None
+    widget_binding = ""
+    widget_messages: list[str] = []
+    captured_exports: list[widgets.SceneExport] = []
+    if native_status:
+        try:
+            widget_config = widgets.configuration()
+            if widget_config:
+                widget_binding = widgets.context_binding(context)
+        except ValueError as error:
+            widget_config = None
+            logger.warning("Scene widgets unavailable (%s); keeping ordinary downloads", type(error).__name__)
 
     # `user` carries the scene key into
     # SceneIsolationMiddleware._get_conversation_id (it reads
@@ -565,6 +600,7 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                 ]
                 scope_token = video_scope.set(scope)
                 notifier_token = video_notifier.set(notifier)
+                export_token = widgets.exports.set(captured_exports if widget_config else None)
                 try:
                     async for update in agent.run(messages, stream=True, options=options):
                         if not current():
@@ -604,7 +640,15 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                         await _emit_filtered(
                             relay, gallery.feed("".join(pending_model_parts)), dedupe, notifier=notifier,
                         )
+                    if widget_config and scope and captured_exports and current():
+                        export = captured_exports[-1]
+                        slot.scene_widgets = widgets.remember(
+                            export, scope, widget_binding, generation, _load_scene_widgets(state, slot),
+                        )
+                        state.conversation.set_value(widgets.STATE_KEY, slot.scene_widgets)
+                        widget_messages.append(widgets.markdown(export.id, widget_config))
                 finally:
+                    widgets.exports.reset(export_token)
                     video_notifier.reset(notifier_token)
                     video_scope.reset(scope_token)
                     # Still inside the lock: the next turn must not read the
@@ -643,6 +687,9 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
             # 500 on the inbound webhook, or the connector retries the whole turn.
             try:
                 await relay.finish()
+                if slot.epoch == inbound_epoch:
+                    for message in widget_messages:
+                        await relay.widget(message)
             except Exception as exc:
                 logger.warning("Could not finish the activity response (%s)", type(exc).__name__)
 
@@ -835,6 +882,8 @@ def _clear_conversation(state: Any, slot: _Conversation) -> int:
     state.conversation.set_value(_SCENE_GENERATION_KEY, generation)
     slot.epoch += 1
     slot.video_cards.clear()
+    slot.scene_widgets = []
+    state.conversation.set_value(widgets.STATE_KEY, [])
     _save_history(state, slot, [])
     return generation
 
@@ -1220,6 +1269,9 @@ class _Emitter:
     def _touch(self) -> None:
         self._last_sent = time.monotonic()
 
+    async def widget(self, markdown: str) -> None:
+        await _safe_send(self._context, Activity(type="message", text=markdown, text_format="extendedmarkdown"))
+
     def _keepalive_text(self) -> str:
         """Restate the live status rather than a canned 'please wait'."""
         detail = self._last_status.rstrip("…. ") or _KEEPALIVE_FALLBACK_TEXT
@@ -1441,6 +1493,9 @@ class _ProactiveEmitter(_Emitter):
 
     async def card(self, attachment: Any) -> None:
         self._attachments.append(attachment)
+
+    async def widget(self, markdown: str) -> None:
+        await self._send(Activity(type="message", text=markdown, text_format="extendedmarkdown"))
 
     async def keepalive(self) -> None:
         return None
@@ -1843,6 +1898,9 @@ class _Relay:
     async def card(self, attachment: Any) -> None:
         await self._inner.card(attachment)
 
+    async def widget(self, markdown: str) -> None:
+        await self._inner.widget(markdown)
+
     async def keepalive(self) -> None:
         await self._inner.keepalive()
 
@@ -2028,7 +2086,7 @@ class _Conversation:
     the life of the container, and ``TurnState`` is the durable write-through.
     """
 
-    __slots__ = ("lock", "history", "loaded", "epoch", "generation", "media_receipts", "video_cards")
+    __slots__ = ("lock", "history", "loaded", "epoch", "generation", "media_receipts", "video_cards", "scene_widgets")
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
@@ -2040,6 +2098,7 @@ class _Conversation:
         self.generation = 0
         self.media_receipts = []
         self.video_cards = {}
+        self.scene_widgets: list[dict] | None = None
 
 
 _conversations: dict[str, _Conversation] = {}
@@ -2090,6 +2149,18 @@ def _trim_history(history: list[dict[str, str]]) -> list[dict[str, str]]:
         kept.append(entry)
     kept.reverse()
     return kept
+
+
+def _load_scene_widgets(state: Any, slot: _Conversation) -> list[dict]:
+    if slot.scene_widgets is None:
+        stored = state.conversation.get_value(widgets.STATE_KEY)
+        if stored is not None and (
+            not isinstance(stored, list) or not all(isinstance(item, dict) for item in stored)
+        ):
+            logger.warning("Persisted widget registry is invalid; refusing existing snapshots")
+            stored = []
+        slot.scene_widgets = [dict(item) for item in (stored or [])[-widgets.MAX_WIDGETS:]]
+    return slot.scene_widgets
 
 
 def _load_history(state: Any, slot: _Conversation) -> list[dict[str, str]]:

@@ -52,6 +52,10 @@ environment_variables:
   # rebuilding the image.
   - name: ENABLE_ACTIVITY
     value: "true"
+  # Optional public HTTPS asset directory, ending in /teams-widget/v1.
+  # Set empty to disable the HTML Widget preview; existing downloads are unchanged.
+  - name: TEAMS_WIDGET_ASSET_BASE_URL
+    value: "https://gentle-smoke-0841c8c0f.3.azurestaticapps.net/teams-widget/v1"
   # Teams / M365 Copilot drop a turn that goes quiet for ~45s. Re-state the
   # current status when nothing has been sent for this long.
   - name: ACTIVITY_KEEPALIVE_SECONDS

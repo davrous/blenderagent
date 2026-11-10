@@ -77,6 +77,29 @@ All settings live in `webchat/.env`. See [`.env.example`](.env.example) for the 
 
 ## Project layout
 
+### Teams widget assets
+
+`npm run build` also builds a **standalone**, non-React Babylon.js viewer under
+`client/dist/teams-widget/v1`. The Express server serves its public JavaScript,
+CSS and HDR map at `/teams-widget/v1/`; no chat UI or private scene is served there.
+Set `TEAMS_WIDGET_RENDERER_ORIGIN` to the exact Teams widget renderer HTTPS origin
+to allow cross-origin asset reads. Normal Web Chat API CORS is unchanged.
+
+Configure the agent's separate `TEAMS_WIDGET_ASSET_BASE_URL` and private Blob CORS
+as described in [the widget deployment checklist](../TeamsHTMLWidget.md#activation-et-deploiement).
+The widget obtains authorized GLB links through Activity invokes, not `/api/blob`
+or `/api/assets`. Merely deploying the agent does not publish these frontend files.
+
+Production can host only the three built files on Azure Static Web Apps without
+deploying this proxy or its chat APIs. From the repository root, set the exact
+`TEAMS_WIDGET_RENDERER_ORIGIN` and run
+`node .\devTools\package_teams_widget.mjs <empty-output-directory>`. This creates
+the public static package and its CORS/MIME configuration; no Node runtime,
+Foundry identity, credentials or scenes are included. Follow the
+[deployed installation and publishing commands](../TeamsHTMLWidget.md#installation-azure-de-ce-depot).
+
+### Chat application
+
 ```
 webchat/
 ├── server/                 # Express proxy: SSE pass-through + Entra auth

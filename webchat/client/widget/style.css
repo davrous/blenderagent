@@ -1,0 +1,23 @@
+:root { color-scheme: light dark; font-family: "Segoe UI", system-ui, sans-serif; font-size: 14px; }
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+#root { display: flow-root; padding: 16px; background: light-dark(#fff, #202124); color: light-dark(#242424, #f5f5f5); border: 1px solid light-dark(#d1d1d1, #696969); border-radius: 12px; }
+#root[data-theme="light"] { color-scheme: light; }
+#root[data-theme="dark"] { color-scheme: dark; }
+#root[data-theme="high-contrast"] { background: Canvas; color: CanvasText; border-color: CanvasText; }
+header, .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+h2 { font-size: 18px; margin: 0; }
+.badge { font-size: 12px; border: 1px solid currentColor; padding: 3px 8px; border-radius: 12px; }
+p { margin: 12px 0; }
+.toolbar { margin-bottom: 12px; }
+button, a { font: inherit; color: inherit; min-height: 36px; padding: 7px 12px; border: 1px solid currentColor; border-radius: 5px; background: transparent; }
+button { cursor: pointer; }
+button:disabled { opacity: 0.55; cursor: default; }
+:focus-visible { outline: 3px solid light-dark(#464eb8, #b8baff); outline-offset: 3px; }
+.viewport { position: relative; border-radius: 8px; overflow: hidden; background: #0e1014; color: #fff; }
+canvas { width: 100%; height: clamp(240px, 55vw, 420px); display: block; touch-action: none; }
+#placeholder { position: absolute; inset: 20px; pointer-events: none; }
+.help { font-size: 12px; line-height: 1.5; }
+#error { padding: 12px; border: 2px solid currentColor; border-radius: 5px; }
+[hidden] { display: none !important; }
+@media (forced-colors: active) { #root, button, a { border-color: CanvasText; } :focus-visible { outline-color: Highlight; } }

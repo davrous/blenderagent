@@ -149,6 +149,11 @@ Chat ni sur celle declaree dans `domain`.
 
 Pour les widgets propres au bot, la documentation decrit une origine de la forme
 `https://<hash>.widget-renderer.usercontent.microsoft`.
+Le texte a hacher est le **MRI Teams complet en minuscules**,
+`28:<bot-id>`, et non le GUID seul. Le hash est constitue des 32 premiers
+caracteres hexadecimaux du SHA-256 de ce MRI. Entrer ce MRI dans le
+[widget domain tool](https://widgettool.z19.web.core.windows.net/), puis
+verifier l'origine effective dans le client Teams.
 
 - `resourceDomains` autorise les origines des scripts, styles, images et polices.
 - `connectDomains` autorise les origines contactees par `fetch`, XHR ou WebSocket.
@@ -249,4 +254,210 @@ doit traverser Teams, Foundry et notre Activity Protocol.
   d'accessibilite et de format des messages.
 
 Le depot widgetsmith reste non consulte, faute d'acces authentifie.
-Ce document est un plan : aucune implementation Widget n'a encore ete ajoutee.
+
+## Implementation du MVP
+
+Le MVP est maintenant implemente, mais **la validation de la preview dans Teams
+via Foundry reste a effectuer**. Les tests de navigateur ne valident pas cette
+passerelle ni les politiques du tenant.
+
+### Composants
+
+- [teams_widgets.py](teams_widgets.py) : capture des exports fiables, contrat
+  Widget, verification du contexte et renouvellement des liens de lecture.
+- [activity_bridge.py](activity_bridge.py) : registre conversationnel durable,
+  route exacte `invoke` + `htmlwidget/calltool`, publication apres la reponse
+  native finale et invalidation par `/clear`.
+- [Viewer autonome](webchat/client/widget/) : JavaScript et CSS sans React ni
+  interface de chat, camera orbitale, cadrage, environnement HDR existant,
+  controles clavier, themes, hauteur exacte, erreurs et liberation des ressources.
+- [Route statique](webchat/server/src/teamsWidgetAssets.ts) :
+  `/teams-widget/v1/`, sans acces aux scenes et sans nouveau proxy GLB.
+
+Le registre est dans la ConversationState existante, persistee sur `$HOME` comme
+l'historique Activity. Il conserve les **32 derniers widgets** de la conversation.
+Le cache de conversation evite qu'un tour deja en attente ecrase un registre plus
+recent avec son ancien snapshot d'etat. Le JSON ne contient aucun SAS : seulement
+le Blob, son compte, sa taille, son ETag, sa version et les associations de contexte.
+La durabilite exige le volume `$HOME` du host ; le repli MemoryStorage local ne
+garantit pas la reouverture d'anciens widgets apres redemarrage.
+
+Seul `upload_glb_to_blob` peut enregistrer un export dans le contexte du tour.
+Une URL ecrite par le modele n'enregistre aucun widget. Le dernier export du tour
+donne un widget ; il n'y a pas d'export supplementaire ou automatique.
+
+La reponse habituelle, ses images et son lien GLB restent inchanges. Le widget
+arrive ensuite dans une **activite distincte**, `extendedmarkdown`, jamais dans
+un flux natif ouvert. Les pastilles conservent donc leur cycle actuel.
+
+### Activation et deploiement
+
+1. Construire depuis [webchat/](webchat/) avec `npm run build`. Le build genere
+   `client/dist/teams-widget/v1/widget.js`, `widget.css` et
+   `studio_small_09_1k.hdr`. Les ressources n'importent pas le Web Chat.
+2. Publier ces trois fichiers derriere une origine HTTPS publique accessible aux
+   clients Teams. La route `/teams-widget/v1/` doit les servir sans connexion
+   utilisateur. Le serveur Web Chat existant peut les servir, ou utiliser
+   l'hebergement statique dedie decrit ci-dessous. Ces assets sont publics ; pas les GLB.
+3. Sur **le serveur Web Chat**, definir `TEAMS_WIDGET_RENDERER_ORIGIN` avec l'origine
+   exacte fournie par le widget domain tool pour le **MRI** du bot. Pour le bot
+   actuel, utiliser `28:27d67f5b-b7cc-4935-b979-0fdb47ccf365`, ce qui donne
+   `https://ecf78bca578133f43cc5a936854c832d.widget-renderer.usercontent.microsoft`.
+   Ne pas hacher le GUID sans `28:`. La route n'autorise pas de wildcard
+   CORS ni d'autres origines applicatives. Pour Static Web Apps, cette variable
+   est lue lors du packaging et devient l'en-tete CORS du site, pas une variable
+   d'une API ou d'un serveur Node.
+4. Sur le service **Blob** du compte des artefacts, ajouter une regle CORS
+   conservant les regles existantes : cette meme origine exacte, methodes `GET`,
+   `HEAD`, `OPTIONS`, en-tetes `Range`, exposes `Content-Length`, `Content-Type`,
+   `ETag`. Ne pas rendre le conteneur `screenshots` public.
+5. Sur **l'agent**, definir `TEAMS_WIDGET_ASSET_BASE_URL` avec l'URL HTTPS
+   publique complete de `/teams-widget/v1`. Le champ existe dans
+   [agent.yaml](agent.yaml) pointe sur l'installation de ce depot. Une valeur vide
+   desactive la fonctionnalite. Pour une execution locale, utiliser la variable
+   correspondante dans `.env`.
+6. Reconstruire/redeployer le conteneur de l'agent : le Dockerfile embarque le
+   module et le bootstrap HTML. Deployer aussi le build des assets et le serveur
+   qui les sert, ou le package Static Web Apps. Deployer uniquement l'agent ne
+   publie pas les assets.
+7. Conserver le manifest `devPreview` existant. Aucun flag Widget invente ni
+   changement global vers Bot API Canary n'est ajoute. Si la politique Teams
+   exige une entree `validDomains`, ajouter le hostname HTTPS choisi au package ;
+   cela ne remplace ni CSP ni CORS.
+8. Demander explicitement un export GLB dans Teams, puis tester d'abord
+   **Check connection**, ensuite **Load scene**, en personnel, groupe et thread.
+   Deux exports successifs doivent produire deux instantanes independants.
+
+Sans URL d'assets, la fonctionnalite est desactivee : les parcours actuels
+restent identiques. Une mauvaise configuration est journalisee, sans interrompre
+la reponse habituelle. Les assets sont versionnes par contrat : conserver `v1`
+pour les messages existants et utiliser un nouveau repertoire en cas de changement
+incompatible du protocole ou du bootstrap.
+
+### Installation Azure de ce depot
+
+Les assets ont ete publies le 10 novembre 2026 dans une **Azure Static Web App
+Standard** dediee, sans interface de chat, API, identite Foundry, secrets ni GLB :
+
+| Parametre | Valeur |
+|---|---|
+| Subscription | `480af19d-6138-460b-962c-e2a0b5aca925` (`Private Test Sub DAVROUS`) |
+| Resource group | `davrousai-rg` |
+| Foundry existant | `davrousfoundry` / `proj-dav`, `northcentralus` |
+| Static Web App | `blender-teams-widget`, `eastus2`, SKU `Standard` |
+| Agent publie | `blender-agent`, version `18`, statut `active` |
+| URL d'assets de l'agent | `https://gentle-smoke-0841c8c0f.3.azurestaticapps.net/teams-widget/v1` |
+| Sante de l'hebergement | `https://gentle-smoke-0841c8c0f.3.azurestaticapps.net/health` |
+| Stockage prive des GLB | `msdavrous`, conteneur `screenshots`, acces anonyme desactive |
+
+Ce choix remplace uniquement l'hebergement HTTP des fichiers. Les tentatives
+App Service B1 (`northcentralus`, `eastus2`), P0v3 et F1 ont ete refusees avec un
+quota effectif de zero VM. Aucun plan App Service n'a ete cree. Static Web Apps
+n'utilise pas ces VM ; le SKU Standard est facturable.
+
+Pour republier les assets depuis la racine du depot :
+
+```powershell
+npm --prefix .\webchat run build
+$env:TEAMS_WIDGET_RENDERER_ORIGIN = "https://ecf78bca578133f43cc5a936854c832d.widget-renderer.usercontent.microsoft"
+$output = Join-Path $env:TEMP ("blender-teams-widget-" + [Guid]::NewGuid().ToString("N"))
+node .\devTools\package_teams_widget.mjs $output
+$env:SWA_CLI_DEPLOYMENT_TOKEN = az staticwebapp secrets list `
+  --name blender-teams-widget --resource-group davrousai-rg `
+  --subscription 480af19d-6138-460b-962c-e2a0b5aca925 `
+  --query properties.apiKey -o tsv
+swa deploy $output --env production --no-use-keychain
+Remove-Item Env:\SWA_CLI_DEPLOYMENT_TOKEN
+```
+
+Le dossier de sortie doit etre vide. **Ne pas executer `swa deploy` depuis ce
+dossier ou un de ses sous-dossiers** : le client natif le refuse. La version
+2.0.6 du wrapper peut alors retourner zero malgre l'echec ; verifier
+systematiquement `/health` et les trois fichiers apres deploiement.
+
+Le packager genere seulement les assets `v1`, une page d'information, la sante
+et `staticwebapp.config.json`. Les en-tetes autorisent exclusivement l'origine
+du renderer, avec un type explicite pour `.hdr`. Il n'y a pas de serveur Node
+ou d'API dont il faudrait configurer `AGENT_FOUNDRY_URL`, un secret ou une
+identite managee. Le bootstrap HTML reste embarque dans le conteneur de l'agent
+et envoye directement dans son message Teams.
+
+La regle CORS Blob a ete ajoutee en conservant les proprietes du service et les
+regles existantes. Les prevols des assets et du Blob passent, les types MIME et
+les SHA-256 des trois fichiers publies correspondent au build local, et les
+routes `/api/chat`, `/api/blob` et `/.env` ne sont pas exposees.
+
+Si **Check connection** fonctionne mais **Load scene** affiche `Failed to fetch`,
+cela ne prouve pas une panne de l'invoke : les telechargements HTTP du GLB et
+du HDR sont des etapes distinctes. La configuration initiale hachait le GUID
+seul et autorisait donc une autre origine. Les deux services doivent autoriser
+l'origine du MRI ci-dessus : le Blob pour le GLB, Static Web Apps pour le HDR.
+Les scripts classiques et la feuille de style peuvent se charger malgre cette
+erreur CORS, ce qui explique pourquoi l'interface et le ping fonctionnaient.
+Ce correctif ne change ni l'HTML deja envoye, ni l'agent version 18, ni le
+manifest Teams ; reessayer **Load scene** dans le widget existant suffit.
+Apres correction, le navigateur telecharge le GLB original et le HDR avec HTTP
+200 depuis l'origine du MRI ; le player publie atteint `Scene ready` sous une
+CSP restrictive. Le parent Teams est simule dans ce controle navigateur :
+la confirmation finale du bouton dans le vrai client Teams reste a faire.
+
+Le registre ACR existant utilise `AbacRepositoryPermissions`. Un build ACR
+doit donc fournir `--source-acr-auth-id '[caller]'`. Utiliser un contexte de
+build minimal contenant seulement les entrees `COPY` du Dockerfile, ses
+requirements et le bootstrap HTML ; ne pas envoyer les dependances Node,
+environnements locaux ou secrets avec les sources.
+
+L'image de la version 18 est epinglee sur
+`480af19projdav343cacr.azurecr.io/blenderagent@sha256:843200340a3598f1de4e785591a26089857ccbe75f9ebaf7a51d225c2c5640b6`
+(build ACR `cp37`). Les 17 variables de la version 17 ont ete conservees,
+notamment le modele `gpt-6-astra`, le stockage, Speech et les reglages Activity.
+Seule `TEAMS_WIDGET_ASSET_BASE_URL` a ete ajoutee. CPU, memoire, protocoles
+Responses/Activity/`invocations_ws`, selecteur d'endpoint `@latest`,
+`BotServiceRbac` et identite du bot sont inchanges.
+
+Un smoke test Responses sur la version 18 active a repondu `OK` dans une session
+isolee, supprimee ensuite. Aucun export, rendu, appel payant video ou conversation
+Teams existante n'a ete utilise pour ce test. Il ne valide pas les invokes du
+widget dans le client Teams : installer la mise a jour du package `1.1.1`,
+demander un nouvel export GLB et utiliser **Check connection**, puis **Load scene**.
+
+### Acces, limites et repli
+
+Les deux seuls outils Widget sont `scene_widget_ping` et `load_scene_snapshot`.
+Ils ne sont pas exposes comme outils LLM. Le serveur exige une activite Teams
+authentifiee et verifie tenant, bot, conversation/thread, generation et identifiant.
+Il n'utilise pas `activity.from` comme preuve d'identite individuelle.
+
+Le chargement verifie l'existence, la taille et l'ETag du Blob avant d'emettre un
+SAS de lecture d'une heure. Il reverifie `/clear` apres l'appel Storage. Aucune
+operation Blender, export ou action payante n'est executee par ces invokes.
+Un lien deja obtenu ou un GLB deja telecharge ne peut pas etre retire
+retroactivement par `/clear` ; les nouvelles demandes et renouvellements sont refuses.
+
+Le viewer accepte les GLB 2.0 autonomes jusqu'a 200 MiB ; il refuse les ressources
+externes et les extensions Draco, Meshopt et BasisU pour eviter des chargements
+implicites de decodeurs/CDN. Le temps de chargement est borne a 90 secondes.
+Un echec du transport, de CORS, du WebGL ou de l'environnement laisse un message
+explicite et une possibilite de reessai. Le lien GLB initial reste le repli.
+Le rendu est suspendu quand le widget est masque, hors ecran ou immobile.
+
+### Verifications locales
+
+```powershell
+.\.venv\Scripts\python.exe .\devTools\test_teams_widgets.py
+.\.venv\Scripts\python.exe .\devTools\test_activity_history.py
+node .\devTools\test_teams_widget.mjs
+npm --prefix .\webchat run build
+```
+
+Le script Node verifie handshake, source/origine du parent, erreurs, retries,
+hauteur fractionnaire, limites GLB et CORS des assets. Avec `--serve`, il ouvre
+un serveur de fixture local et affiche l'URL `/widget-test` : hote Teams simule,
+cube GLB synthetique et environnement HDR reel. La fixture remplace le
+telechargement Blob par `/widget-test/cube.glb` ; cela ne teste pas Azure.
+Le rendu WebGL reel du cube est verifie localement, pas seulement la presence
+d'un canvas. Les controles orbit/pan et leur reinitialisation, les themes, la
+hauteur fractionnaire responsive, le rechargement apres HTTP 403 et la
+recuperation apres perte du contexte WebGL ont aussi ete verifies sur la fixture.
+Les tests Python verifient la restauration du registre depuis le stockage durable
+recree. La validation finale de Teams/Foundry reste celle des criteres du POC.

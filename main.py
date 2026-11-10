@@ -186,8 +186,12 @@ def upload_glb_to_blob(local_path: str, blob_name: str) -> str:
     logger.info("Uploading .glb to blob: %s (%d bytes)", blob_name, file_size)
     storage = ArtifactStorage(AZURE_STORAGE_ACCOUNT_NAME)
     with open(local_path, "rb") as source:
-        storage.upload(blob_name, source, "model/gltf-binary", download_name="blender_scene.glb")
-    return storage.signed_url(blob_name, hours=1)
+        uploaded = storage.upload(blob_name, source, "model/gltf-binary", download_name="blender_scene.glb")
+    from teams_widgets import record_export
+
+    url = storage.signed_url(blob_name, hours=1)
+    record_export(blob_name, storage.account, file_size, uploaded["etag"])
+    return url
 
 
 MODEL_DEPLOYMENT_NAME = os.getenv("MODEL_DEPLOYMENT_NAME", "gpt-4.1")
@@ -1518,6 +1522,8 @@ def export_scene_as_glb_for_download() -> str:
     Returns a download link the user can use to open the scene in any glTF viewer
     (Babylon.js Sandbox, three.js editor, Windows 3D Viewer, etc.).
     The link expires after 1 hour.
+    In Teams, a configured scene widget is published automatically for this
+    snapshot. Do not generate widget HTML or request another export to load it.
     """
     logger.info("Tool called: export_scene_as_glb_for_download")
     try:

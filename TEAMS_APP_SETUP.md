@@ -97,3 +97,20 @@ atk install --file-path blender-agent-teams-app.zip --scope Personal
 
 atk prints a TitleId and a Teams deep link you can open to launch the agent.
 atk CLI reference: https://learn.microsoft.com/microsoftteams/platform/toolkit/microsoft-365-agents-toolkit-cli
+
+## D. Optional preview — interactive 3D scene widget
+
+The existing [sideload manifest](m365sideloadmanifest/manifest.json) uses
+`devPreview`. The agent can send a standalone Babylon.js viewer after an explicit
+GLB export. It does not embed the Web Chat or interrupt native status dots.
+
+Enable it only after publishing the widget assets over public HTTPS, configuring
+the exact Teams renderer origin in asset/Blob CORS, and setting
+`TEAMS_WIDGET_ASSET_BASE_URL` on the deployed agent. An empty value disables the
+preview. [agent.yaml](agent.yaml) now points at this installation's dedicated
+Azure Static Web App, which serves only public viewer assets, not the Web Chat.
+
+See [TeamsHTMLWidget.md](TeamsHTMLWidget.md#activation-et-deploiement) for the
+complete deployment checklist, access controls, limitations and local tests.
+There is no new manifest capability flag or automatic Canary endpoint override.
+Real Teams-to-Foundry widget invokes and WebGL must still be verified in the tenant.

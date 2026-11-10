@@ -10,7 +10,7 @@
     "dev": "concurrently --kill-others-on-fail -n server,client -c blue,green \"cd server && npm run dev\" \"cd client && npm run dev\"",
     "dev:server": "cd server && npm run dev",
     "dev:client": "cd client && npm run dev",
-    "build": "npm --workspace server run build && npm --workspace client run build",
+    "build": "npm --workspace server run build && npm --workspace client run build && npm --workspace client run build:widget",
     "start": "npm --workspace server run start"
   },
   "devDependencies": {

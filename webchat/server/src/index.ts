@@ -14,10 +14,12 @@ import {
 import { attachVoiceRelay } from "./voice.js";
 import { browserKey, isUuid, mediaMetadata, ownedReferences, requireOrigin, type MediaContext } from "./mediaSecurity.js";
 import { registerMediaRoutes, requestScope } from "./videoJobs.js";
+import { registerWidgetAssets } from "./teamsWidgetAssets.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
+registerWidgetAssets(app, process.env.TEAMS_WIDGET_RENDERER_ORIGIN?.trim());
 app.use(express.json({ limit: "1mb" }));
 app.use(
   cors({

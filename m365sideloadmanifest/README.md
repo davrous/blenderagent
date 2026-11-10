@@ -18,7 +18,7 @@ Read from Azure on November 9, 2026:
 | App type | `SingleTenant` |
 | Microsoft Teams channel | `MsTeamsChannel`, enabled |
 | Teams app ID | `22ce0d24-dea1-4bb2-b4c5-8a32bdae3902` |
-| App version | `1.1.0` |
+| App version | `1.1.1` |
 
 The configured messaging endpoint is:
 
@@ -37,6 +37,11 @@ manifest. No secrets, SSO configuration, placeholder Application ID URI,
 delegated Graph permissions or resource-specific consent permissions are added.
 The bot remains single-tenant: this ZIP does not make it available in other
 tenants.
+
+Version `1.1.1` also allowlists the dedicated widget asset hostname
+`gentle-smoke-0841c8c0f.3.azurestaticapps.net` without changing the app or bot
+identities. It does not enable the Teams preview by itself; see the
+[widget deployment guide](../TeamsHTMLWidget.md#installation-azure-de-ce-depot).
 
 ## Branding and description
 

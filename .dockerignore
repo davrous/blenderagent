@@ -3,6 +3,7 @@
 venv/
 env/
 .python-version
+**/node_modules/
 
 # Environment files with secrets
 .env
