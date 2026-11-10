@@ -20,7 +20,8 @@ for (const name of ["widget.js", "widget.css", "studio_small_09_1k.hdr"]) {
 await writeFile(path.join(output, "staticwebapp.config.json"), JSON.stringify({
   routes: [
     { route: "/health", rewrite: "/health.json" },
-    { route: "/teams-widget/*", headers: { "Cache-Control": "public, max-age=3600" } },
+    { route: "/teams-widget/v1/studio_small_09_1k.hdr", headers: { "Cache-Control": "no-store" } },
+    { route: "/teams-widget/*", headers: { "Cache-Control": "no-cache, must-revalidate" } },
   ],
   globalHeaders: {
     "Access-Control-Allow-Origin": renderer,

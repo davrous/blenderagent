@@ -112,7 +112,7 @@ load.addEventListener("click", async () => {
     viewer = undefined;
     if (!disposed) {
       const message = reason instanceof Error ? reason.message.slice(0, 300) : "The snapshot could not be loaded.";
-      showError(`${message} Check network/CORS access or retry loading. You can also use the conversation's download link.`);
+      showError(`${message} You can retry loading or use the conversation's download link.`);
     }
   } finally {
     clearTimeout(timeout);

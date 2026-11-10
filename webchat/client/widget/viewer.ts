@@ -11,6 +11,13 @@ import "@babylonjs/core/Helpers/sceneHelpers";
 
 export const MAX_GLB_BYTES = 200 * 1024 * 1024;
 
+export function freshEnvironmentUrl(source: string): string {
+  const url = new URL(source);
+  // Existing widget frames can retain a truncated HDR response in their HTTP cache.
+  url.searchParams.set("widget-load", crypto.randomUUID());
+  return url.href;
+}
+
 export function validateGlb(bytes: ArrayBuffer): void {
   const header = new DataView(bytes);
   if (bytes.byteLength < 20 || header.getUint32(0, true) !== 0x46546c67
@@ -125,9 +132,9 @@ export class SceneViewer {
     if (!this.scene.meshes.some((mesh) => mesh.getTotalVertices() > 0)) throw new Error("This snapshot contains no visible geometry.");
     const environment = await new Promise<HDRCubeTexture>((resolve, reject) => {
       const texture = new HDRCubeTexture(
-        environmentUrl, this.scene, 256, false, true, false, true,
+        freshEnvironmentUrl(environmentUrl), this.scene, 256, false, true, false, true,
         () => resolve(texture),
-        () => reject(new Error("The lighting environment could not be loaded. Check widget asset hosting and CORS.")),
+        () => reject(new Error("The HDR lighting data could not be downloaded or decoded. Load scene again to retry.")),
       );
     });
     if (this.disposed) return;

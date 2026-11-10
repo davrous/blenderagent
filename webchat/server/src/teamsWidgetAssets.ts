@@ -11,7 +11,10 @@ export function registerWidgetAssets(app: Express, rendererOrigin: string | unde
     "/teams-widget",
     cors({ origin: rendererOrigin || false, methods: ["GET", "HEAD"] }),
     express.static(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../client/dist/teams-widget"), {
-      maxAge: "1h",
+      cacheControl: false,
+      setHeaders(response, file) {
+        response.setHeader("Cache-Control", path.extname(file) === ".hdr" ? "no-store" : "no-cache, must-revalidate");
+      },
       fallthrough: false,
       index: false,
       dotfiles: "deny",

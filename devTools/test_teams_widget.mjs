@@ -12,7 +12,7 @@ const require = createRequire(new URL("../webchat/package.json", import.meta.url
 const { register } = await import(pathToFileURL(require.resolve("tsx/esm/api")).href);
 register();
 const { WidgetBridge, reportHeight } = await import("../webchat/client/widget/bridge.ts");
-const { validateGlb, fetchGlb, SceneViewer } = await import("../webchat/client/widget/viewer.ts");
+const { validateGlb, fetchGlb, freshEnvironmentUrl, SceneViewer } = await import("../webchat/client/widget/viewer.ts");
 const { registerWidgetAssets } = await import("../webchat/server/src/teamsWidgetAssets.ts");
 const express = require("express");
 const id = "a".repeat(32);
@@ -147,6 +147,14 @@ retryBridge.dispose();
 await assert.rejects(closing, /closed/);
 
 validateGlb(arrayBuffer(cube));
+const environmentSource = "https://assets.example/studio.hdr?revision=1";
+const firstEnvironment = new URL(freshEnvironmentUrl(environmentSource));
+const nextEnvironment = new URL(freshEnvironmentUrl(environmentSource));
+assert.equal(firstEnvironment.origin, "https://assets.example");
+assert.equal(firstEnvironment.pathname, "/studio.hdr");
+assert.equal(firstEnvironment.searchParams.get("revision"), "1");
+assert.match(firstEnvironment.searchParams.get("widget-load"), /^[a-f0-9-]{36}$/);
+assert.notEqual(firstEnvironment.href, nextEnvironment.href, "Every HDR attempt bypasses a previously truncated cache entry.");
 const abortedLoad = new AbortController();
 const stalled = SceneViewer.prototype.load.call(
   { loadScene: () => new Promise(() => {}) }, new ArrayBuffer(0), "https://assets.example/env.hdr", abortedLoad.signal,
@@ -190,7 +198,13 @@ try {
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("access-control-allow-origin"), renderer);
     assert.ok(Number(response.headers.get("content-length")) > 0);
+    assert.equal(response.headers.get("cache-control"), file.endsWith(".hdr") ? "no-store" : "no-cache, must-revalidate");
   }
+  const hdr = await fetch(`${base}/teams-widget/v1/studio_small_09_1k.hdr`);
+  const hdrBytes = Buffer.from(await hdr.arrayBuffer());
+  const sourceHdr = await readFile(new URL("../webchat/server/assets/studio_small_09_1k.hdr", import.meta.url));
+  assert.deepEqual(hdrBytes, sourceHdr, "The complete HDR must be served, not a cached one-byte prefix.");
+  assert.equal(hdrBytes.subarray(0, 10).toString(), "#?RADIANCE");
   for (const origin of ["https://untrusted.example", bareIdOrigin]) {
     const response = await fetch(`${base}/teams-widget/v1/widget.js`, { method: "HEAD", headers: { Origin: origin } });
     assert.notEqual(response.headers.get("access-control-allow-origin"), origin);
@@ -212,6 +226,8 @@ try {
   assert.equal(config.globalHeaders["Access-Control-Allow-Origin"], renderer);
   assert.notEqual(config.globalHeaders["Access-Control-Allow-Origin"], bareIdOrigin);
   assert.equal(config.mimeTypes[".hdr"], "application/octet-stream");
+  assert.equal(config.routes.find((route) => route.route === "/teams-widget/v1/studio_small_09_1k.hdr").headers["Cache-Control"], "no-store");
+  assert.equal(config.routes.find((route) => route.route === "/teams-widget/*").headers["Cache-Control"], "no-cache, must-revalidate");
   assert.deepEqual((await readdir(packageDirectory)).sort(),
     ["health.json", "index.html", "staticwebapp.config.json", "teams-widget"]);
   assert.deepEqual((await readdir(path.join(packageDirectory, "teams-widget", "v1"))).sort(),
@@ -223,9 +239,20 @@ try {
 
 if (process.argv.includes("--serve")) {
   const template = await readFile(new URL("../webchat/client/widget/widget.html", import.meta.url), "utf8");
+  const environmentBytes = await readFile(new URL("../webchat/server/assets/studio_small_09_1k.hdr", import.meta.url));
+  let poisonEnvironment = true;
+  let environmentRequests = 0;
+  app.get("/widget-test/environment.hdr", (req, res) => {
+    environmentRequests++;
+    const poison = poisonEnvironment && req.query["widget-load"] === undefined;
+    if (poison) poisonEnvironment = false;
+    res.setHeader("Cache-Control", poison ? "public, max-age=3600" : "no-store");
+    res.type("application/octet-stream").send(poison ? Buffer.from("#") : environmentBytes);
+  });
+  app.get("/widget-test/environment-status", (_req, res) => res.json({ requests: environmentRequests }));
   const html = template.replace("__CONFIG__", JSON.stringify({
     id, storageOrigin: "https://widgettest.blob.core.windows.net",
-    environmentUrl: `${base}/teams-widget/v1/studio_small_09_1k.hdr`,
+    environmentUrl: `${base}/widget-test/environment.hdr`,
   })).replaceAll("__ASSET_BASE__", `${base}/teams-widget/v1`)
     .replace("<script defer src=", '<script src="/widget-test/mock.js"></script>\n  <script defer src=');
   app.get("/widget-test/mock.js", (_req, res) => res.type("js").send(`

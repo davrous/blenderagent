@@ -396,10 +396,35 @@ Les scripts classiques et la feuille de style peuvent se charger malgre cette
 erreur CORS, ce qui explique pourquoi l'interface et le ping fonctionnaient.
 Ce correctif ne change ni l'HTML deja envoye, ni l'agent version 18, ni le
 manifest Teams ; reessayer **Load scene** dans le widget existant suffit.
+Si le navigateur conserve encore les anciens assets en cache, suivre le
+diagnostic HDR ci-dessous avant de reessayer.
 Apres correction, le navigateur telecharge le GLB original et le HDR avec HTTP
 200 depuis l'origine du MRI ; le player publie atteint `Scene ready` sous une
 CSP restrictive. Le parent Teams est simule dans ce controle navigateur :
-la confirmation finale du bouton dans le vrai client Teams reste a faire.
+le client Teams a ensuite confirme le fonctionnement avec son cache desactive.
+
+Le HAR Teams a ensuite confirme un GLB HTTP 200 et le bon CORS du HDR, mais
+une reponse HDR **tronquee a un seul octet `#`, servie depuis le cache disque**.
+Le fichier sain fait 1 615 248 octets. Un statut 200 et de bons en-tetes CORS ne
+suffisent donc pas a valider ce chargement. L'origine de cette entree tronquee
+n'est pas etablie par le HAR.
+
+Chaque tentative HDR utilise desormais une URL unique, sur la meme origine et
+le meme chemin, pour contourner cette ancienne entree. Le serveur renvoie
+`Cache-Control: no-store` pour le HDR et `no-cache, must-revalidate` pour les
+scripts et styles aux noms stables. Aucun fallback silencieux d'eclairage n'est
+ajoute. Apres cette mise a jour, **recharger Teams avec Ctrl+Maj+R** pour
+remplacer l'ancien JavaScript deja en cache, puis cliquer **Load scene**.
+Ni nouveau manifest ni nouveau deploiement de l'agent ne sont necessaires.
+
+La fixture `node devTools/test_teams_widget.mjs --serve` permet de reproduire le
+cache : lire `/widget-test/environment.hdr` avant le chargement pour memoriser
+un octet pendant une heure, puis charger la scene. La requete HDR versionnee
+doit obtenir le fichier complet. Ne pas intercepter les requetes Playwright
+pendant ce controle : `page.route` desactive le cache HTTP et masque ce cas.
+Le controle a effectivement conserve un octet en cache, sans seconde requete
+serveur, puis charge le HDR complet et atteint `Scene ready` avec le nouveau
+player, sans erreur navigateur et sans desactiver le cache.
 
 Le registre ACR existant utilise `AbacRepositoryPermissions`. Un build ACR
 doit donc fournir `--source-acr-auth-id '[caller]'`. Utiliser un contexte de
