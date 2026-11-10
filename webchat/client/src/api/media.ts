@@ -1,9 +1,10 @@
 export const JOB_ID_RE = /^[0-9a-f]{32}$/;
 export const TERMINAL_JOB_STATES = new Set(["completed", "failed", "cancelled", "submission_unknown"]);
-export const VIDEO_JOB_STATES = new Set(["queued", "rendering", "encoding", "awaiting_seedance_approval", "wavespeed_uploading", "wavespeed_submitting", "wavespeed_processing", ...TERMINAL_JOB_STATES]);
+export const VIDEO_JOB_STATES = new Set(["queued", "rendering", "encoding", "publishing", "awaiting_seedance_approval", "wavespeed_uploading", "wavespeed_submitting", "wavespeed_processing", ...TERMINAL_JOB_STATES]);
 export const RESOLUTION_RATES = { "480p": 0.11, "720p": 0.22, "1080p": 0.55, "4k": 1.10 };
 export type VideoResolution = keyof typeof RESOLUTION_RATES;
 export interface VideoJob {
+  kind?: "video";
   id: string;
   state: string;
   progress: number;
@@ -17,6 +18,36 @@ export interface VideoJob {
   output_url?: string;
   error?: string;
   estimate_usd?: number;
+}
+export interface ImageJob {
+  kind: "image";
+  id: string;
+  state: string;
+  progress: number;
+  width: number;
+  height: number;
+  samples: number;
+  engine: "CYCLES" | "BLENDER_EEVEE_NEXT";
+  resolution: string;
+  output_url?: string;
+  error?: string;
+}
+export type RenderJob = VideoJob | ImageJob;
+
+export function isImageJob(value: unknown): value is ImageJob {
+  if (!value || typeof value !== "object") return false;
+  return "kind" in value && value.kind === "image"
+    && "id" in value && typeof value.id === "string" && JOB_ID_RE.test(value.id)
+    && "state" in value && typeof value.state === "string" && ["queued", "rendering", "publishing", "completed", "failed", "cancelled"].includes(value.state)
+    && "progress" in value && typeof value.progress === "number" && Number.isFinite(value.progress) && value.progress >= 0 && value.progress <= 100
+    && "width" in value && typeof value.width === "number" && Number.isInteger(value.width) && value.width >= 1 && value.width <= 8192
+    && "height" in value && typeof value.height === "number" && Number.isInteger(value.height) && value.height >= 1 && value.height <= 8192 && value.width * value.height <= 16_000_000
+    && "samples" in value && typeof value.samples === "number" && Number.isInteger(value.samples) && value.samples >= 1 && value.samples <= 512
+    && "engine" in value && (value.engine === "CYCLES" || value.engine === "BLENDER_EEVEE_NEXT")
+    && "resolution" in value && value.resolution === `${value.width}x${value.height}`
+    && (!("error" in value) || value.error === undefined || typeof value.error === "string")
+    && (!("output_url" in value) || value.output_url === undefined || typeof value.output_url === "string")
+    && (value.state !== "completed" || ("output_url" in value && typeof value.output_url === "string" && value.output_url.length > 0));
 }
 export interface ReferenceUpload {
   blob_name: string;
@@ -38,9 +69,9 @@ export function blobProxyUrl(url: string): string {
   return `/api/blob?url=${encodeURIComponent(url)}`;
 }
 
-const requests = new Map<string, { action: string; promise: Promise<VideoJob> }>();
+const requests = new Map<string, { action: string; promise: Promise<RenderJob> }>();
 
-export function requestVideoJob(conversationId: string, id: string, action: "status" | "approve" | "cancel" = "status", options?: ApprovalOptions): Promise<VideoJob> {
+export function requestVideoJob(conversationId: string, id: string, action: "status" | "approve" | "cancel" = "status", options?: ApprovalOptions): Promise<RenderJob> {
   if (!JOB_ID_RE.test(id)) return Promise.reject(new Error("Invalid video job ID"));
   const key = `${conversationId}:${id}`;
   const pending = requests.get(key);
@@ -56,6 +87,11 @@ export function requestVideoJob(conversationId: string, id: string, action: "sta
       });
       const body = await response.json();
       if (!response.ok) throw new Error(body.error || `Job request failed (${response.status})`);
+      if (body?.kind === "image") {
+        if (body.id !== id || !isImageJob(body)) throw new Error("Invalid image job response");
+        return body;
+      }
+      if (body?.kind !== undefined && body.kind !== "video") throw new Error("Invalid render job kind");
       if (body.id !== id || !VIDEO_JOB_STATES.has(body.state) || typeof body.seedance_enabled !== "boolean" || !Number.isFinite(body.duration_seconds) || body.duration_seconds < 0) throw new Error("Invalid video job response");
       return body as VideoJob;
     } catch (error) {

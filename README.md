@@ -611,6 +611,42 @@ to 1800. Agent turns stop after 180 seconds without model/tool stream progress
 (`AGENT_TURN_TIMEOUT_SECONDS`). Webchat reports elapsed progress every 30 seconds;
 this is a client-side status timer, not proof of server-side progress.
 
+### Asynchronous high-resolution still images
+
+`render_final` and `render_preview` automatically queue an image job when the
+requested width exceeds **1920** or the height exceeds **1080**. Exactly
+1920×1080 and smaller images keep their synchronous behavior. Custom sizes such
+as 2560×1440, 3820×2160 and 3840×2160 are preserved, not replaced by a video
+resolution preset. Still-image limits are 16 megapixels, 8192 pixels per side,
+1–512 samples, and Cycles CPU or Eevee.
+
+The tool packs a snapshot of the current scene and camera/frame, uploads it to
+private Blob storage, and returns an `imagejob` fenced descriptor immediately.
+A separate Blender process renders the PNG without blocking the interactive
+Blender socket or the agent's 180-second idle timeout. Later scene edits do not
+affect the frozen render. Images and videos share the existing job repository,
+Blob lease and single-session render budget; an active job prevents starting
+another heavy render job.
+
+Webchat displays an image render card with progress, status refresh, cancellation,
+a lightbox and PNG download. Teams uses the existing authenticated job controls
+and proactive delivery to update the card and send the completed image. The
+existing `get_video_job_status` tool also accepts image job IDs. Image jobs cannot
+authorize Seedance or any paid processing.
+
+`IMAGE_RENDER_TIMEOUT_SECONDS` defaults to 3600, independent of turn/socket and
+video deadlines. Progress reflects Blender sample statistics when available;
+it is not a time estimate and may stay unchanged during setup/denoising.
+Cancellation stops only the isolated render process. Errors are explicit and
+the worker keeps `render.log`; no timeout automatically queues duplicate work.
+As with videos, a background thread cannot keep a hosted sandbox alive: use
+**Status** to resume after idle. The packed image snapshot is Blob-backed so
+local-file loss does not require reconstructing the scene. The image job is a
+still render, not an animation or a guarantee of available CPU/memory.
+
+Focused checks: `python -m unittest devTools.test_image_jobs devTools.test_video_pipeline`
+and `node devTools/test_video_webchat.mjs`.
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |
@@ -620,6 +656,7 @@ this is a client-side status timer, not proof of server-side progress.
 | `AZURE_STORAGE_ACCOUNT_NAME` | Yes | - | Private artifact storage for images, exports, references and video jobs |
 | `WAVESPEED_API_KEY` | For paid finishing | - | Agent-only WaveSpeed credential; omit for Blender-only videos |
 | `VIDEO_RENDER_TIMEOUT_SECONDS` | No | `1800` | Blender animation worker render deadline, separate from the agent turn |
+| `IMAGE_RENDER_TIMEOUT_SECONDS` | No | `3600` | Isolated still-image worker render deadline, separate from turn/socket and video limits |
 | `AGENT_TURN_IDLE_TIMEOUT_SECONDS` | No | `180` | Maximum time without an upstream model/tool stream update |
 | `AGENT_TURN_TIMEOUT_SECONDS` | No | `900` | Absolute maximum agent turn duration, even when updates continue |
 | `BLENDER_PATH` / `FFMPEG_PATH` / `FFPROBE_PATH` | No | `blender` / `ffmpeg` / `ffprobe` | Executable overrides for local media processing |

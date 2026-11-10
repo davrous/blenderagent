@@ -810,7 +810,7 @@ def _capture_video_notifier(context, previous, slot, epoch, scope):
                 states = ["queued", "rendering", "encoding", "awaiting_seedance_approval",
                           "wavespeed_uploading", "wavespeed_submitting", "wavespeed_processing",
                           "completed", "failed", "cancelled", "submission_unknown"]
-                fingerprint = (states.index(value["state"]), value["progress"])
+                fingerprint = (states.index("encoding" if value["state"] == "publishing" else value["state"]), value["progress"])
                 if binding.fingerprint is not None:
                     if fingerprint < binding.fingerprint or (fingerprint == binding.fingerprint and not refresh):
                         return
@@ -839,7 +839,7 @@ def _capture_video_notifier(context, previous, slot, epoch, scope):
             try:
                 attachments = video_attachments(value, scope, Attachment)
                 async with asyncio.timeout(30):
-                    delivered = await sender._send(Activity(type="message", text="Video job update", attachments=attachments))
+                    delivered = await sender._send(Activity(type="message", text="Image render update" if value.get("kind") == "image" else "Video job update", attachments=attachments))
                 if delivered:
                     seen.add(fingerprint)
             except Exception:
@@ -969,7 +969,7 @@ class _GalleryFilter:
             end = self._buffer.find("```", newline + 1) if newline != -1 else -1
             if newline == -1 or end == -1:
                 if final:
-                    if self._buffer[start + 3:].lstrip().lower().startswith("videojob"):
+                    if self._buffer[start + 3:].lstrip().lower().startswith(("videojob", "imagejob")):
                         out.append(self._buffer[:start] + "The video card was incomplete. Request the job status again.")
                         self._buffer = ""
                     break  # unterminated fence — fall through and emit raw
@@ -981,7 +981,7 @@ class _GalleryFilter:
             tag = self._buffer[start + 3:newline].strip().lower()
             body = self._buffer[newline + 1:end]
             out.append(self._buffer[:start])
-            if tag == "videojob":
+            if tag in ("videojob", "imagejob"):
                 try:
                     value = json.loads(body)
                     job_id = value.get("id") if isinstance(value, dict) else None

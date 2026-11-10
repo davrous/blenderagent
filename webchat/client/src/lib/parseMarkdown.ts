@@ -7,7 +7,7 @@ export function isVideoLink(href: string): boolean {
 
 export function extractVideoJobIds(text: string): string[] {
   const ids = new Set<string>();
-  for (const block of text.matchAll(/```videojob\s*\n([\s\S]*?)```/gi)) {
+  for (const block of text.matchAll(/```(?:videojob|imagejob)\s*\n([\s\S]*?)```/gi)) {
     try {
       const value = JSON.parse(block[1]);
       if (typeof value?.id === "string" && JOB_ID_RE.test(value.id)) ids.add(value.id);
@@ -42,7 +42,7 @@ export function buildChatTimeline(messages: readonly Message[], recoveredIds: re
 }
 
 export function stripVideoJobBlocks(text: string): string {
-  return text.replace(/```videojob\s*\n[\s\S]*?```/gi, "").replace(/```videojob\b[^]*$/i, "").trim();
+  return text.replace(/```(?:videojob|imagejob)\s*\n[\s\S]*?```/gi, "").replace(/```(?:videojob|imagejob)\b[^]*$/i, "").trim();
 }
 
 /** Heuristic: does this URL look like a downloadable Blender scene file? */

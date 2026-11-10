@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, Download, RefreshCw, X } from "lucide-react";
 import { useChatStore } from "../state/chatStore";
-import { blobProxyUrl, paidEstimate, requestVideoJob, RESOLUTION_RATES, TERMINAL_JOB_STATES, type VideoJob, type VideoResolution } from "../api/media";
+import { blobProxyUrl, paidEstimate, requestVideoJob, RESOLUTION_RATES, TERMINAL_JOB_STATES, type RenderJob, type VideoResolution } from "../api/media";
+import { ImageLightbox } from "./ImageLightbox";
 
 export function VideoJobCard({ id, conversationId, enabled }: { id: string; conversationId: string; enabled: boolean }) {
   const busy = useChatStore((state) => state.isStreaming || state.voiceActive);
-  const [job, setJob] = useState<VideoJob | null>(null);
+  const [job, setJob] = useState<RenderJob | null>(null);
+  const [imageOpen, setImageOpen] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [acting, setActing] = useState(false);
@@ -42,7 +44,7 @@ export function VideoJobCard({ id, conversationId, enabled }: { id: string; conv
   const act = async (action: "approve" | "cancel") => {
     const current = useChatStore.getState();
     if (!enabled || loading || acting || current.isStreaming || current.voiceActive || error || !job) return;
-    if (action === "approve" && (!consent || !job.seedance_enabled || job.state !== "awaiting_seedance_approval")) return;
+    if (action === "approve" && (job.kind === "image" || !consent || !job.seedance_enabled || job.state !== "awaiting_seedance_approval")) return;
     setActing(true);
     setConsent(false);
     try {
@@ -57,25 +59,36 @@ export function VideoJobCard({ id, conversationId, enabled }: { id: string; conv
 
   const locked = busy || loading || acting || !enabled || !!error;
   const state = job?.state ?? "loading";
-  const estimate = job ? paidEstimate(job.duration_seconds, job.duration_seconds, resolution) : 0;
-  const videoUrl = job?.output_url ?? job?.preview_url;
+  const estimate = job && job.kind !== "image" ? paidEstimate(job.duration_seconds, job.duration_seconds, resolution) : 0;
+  const videoUrl = job && job.kind !== "image" ? job.output_url ?? job.preview_url : undefined;
+  const image = job?.kind === "image" ? job : null;
   return (
-    <article className="video-job" aria-label={`Video job ${id}`} aria-busy={loading || acting}>
+    <article className="video-job" aria-label={`${image ? "Image" : "Video"} job ${id}`} aria-busy={loading || acting}>
       <header className="video-job-header">
-        <strong>Video job</strong>
+        <strong>{image ? "Image render" : "Video job"}</strong>
         <span role="status">{acting ? "Submitting action..." : state.replaceAll("_", " ")}</span>
         <button className="media-icon" type="button" title="Refresh job status" aria-label="Refresh job status" disabled={!enabled || busy || loading || acting} onClick={retry}><RefreshCw size={17} /></button>
       </header>
       <code className="video-job-id">{id}</code>
       {job && <>
-        <div className="video-job-meta">{job.mode} · {job.duration_seconds}s · {job.fps} fps · {job.resolution}</div>
-        {!TERMINAL_JOB_STATES.has(state) && <progress aria-label="Video job progress" max={100} value={job.progress} />}
-        {videoUrl && <video className="inline-video" controls playsInline preload="metadata" src={blobProxyUrl(videoUrl)} poster={job.poster_url ? blobProxyUrl(job.poster_url) : undefined} />}
-        {!videoUrl && job.poster_url && <img className="video-poster" src={blobProxyUrl(job.poster_url)} alt="Video preview" />}
+        <div className="video-job-meta">{job.kind === "image"
+          ? `${job.width} × ${job.height} · ${job.samples} samples · ${job.engine}`
+          : `${job.mode} · ${job.duration_seconds}s · ${job.fps} fps · ${job.resolution}`}</div>
+        {!TERMINAL_JOB_STATES.has(state) && <progress aria-label={`${image ? "Image" : "Video"} job progress`} max={100} value={job.progress} />}
+        {image && !TERMINAL_JOB_STATES.has(state) && <p role="status">{state === "publishing" ? "Saving the PNG image…" : "Rendering from the saved scene. You can continue chatting; do not launch the same render again."}</p>}
+        {image?.output_url && <>
+          <button type="button" className="msg-image-btn" aria-label="Open rendered image" onClick={() => setImageOpen(true)}>
+            <img className="video-poster" src={blobProxyUrl(image.output_url)} alt={`Rendered image ${image.width} × ${image.height}`} />
+          </button>
+          <a className="video-download" href={blobProxyUrl(image.output_url)} download={`${id}.png`}><Download size={16} /> Download PNG</a>
+          {imageOpen && <ImageLightbox src={blobProxyUrl(image.output_url)} alt="Rendered image" onClose={() => setImageOpen(false)} />}
+        </>}
+        {videoUrl && job.kind !== "image" && <video className="inline-video" controls playsInline preload="metadata" src={blobProxyUrl(videoUrl)} poster={job.poster_url ? blobProxyUrl(job.poster_url) : undefined} />}
+        {!videoUrl && job.kind !== "image" && job.poster_url && <img className="video-poster" src={blobProxyUrl(job.poster_url)} alt="Video preview" />}
         {videoUrl && <a className="video-download" href={blobProxyUrl(videoUrl)} download={`${id}.mp4`}><Download size={16} /> Download MP4</a>}
         {job.error && <p className="media-error" role="alert">{job.error}</p>}
         {state === "submission_unknown" && <p className="media-warning">Submission outcome is unknown. Automatic polling has stopped. Do not submit again; verify the existing external job before taking further action.</p>}
-        {state === "awaiting_seedance_approval" && <fieldset className="video-approval" disabled={locked || !job.seedance_enabled}>
+        {job.kind !== "image" && state === "awaiting_seedance_approval" && <fieldset className="video-approval" disabled={locked || !job.seedance_enabled}>
           <legend>Paid external processing</legend>
           {!job.seedance_enabled && <p className="media-warning">Seedance is disabled on the agent.</p>}
           <label>Prompt<textarea value={prompt} maxLength={8000} onChange={(event) => { setPrompt(event.target.value); setConsent(false); }} rows={2} /></label>

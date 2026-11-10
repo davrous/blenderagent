@@ -143,7 +143,7 @@ const jobId = "e".repeat(32);
 let liveState = "awaiting_seedance_approval";
 const descriptor = () => ({ id: jobId, state: liveState, progress: 0.5, mode: "seedance", duration_seconds: 10, fps: 24, resolution: "720p", seedance_enabled: true });
 const sse = (job) => {
-  const text = "```videojob\n" + JSON.stringify(job) + "\n```";
+  const text = "```" + (job.kind === "image" ? "imagejob" : "videojob") + "\n" + JSON.stringify(job) + "\n```";
   return [...text].map((delta) => `event: response.output_text.delta\r\ndata: ${JSON.stringify({ delta })}\r\n\r\n`).join("");
 };
 const encoded = new TextEncoder().encode(sse(descriptor()));
@@ -152,6 +152,21 @@ const splitStream = new ReadableStream({ start(controller) {
   controller.close();
 } });
 assert.equal((await readJobStream(new Response(splitStream), jobId)).id, jobId);
+const imageJob = { id: jobId, kind: "image", state: "rendering", progress: 42, width: 2560, height: 1440,
+  samples: 256, engine: "CYCLES", resolution: "2560x1440" };
+const imageParsed = await readJobStream(new Response(sse(imageJob)), jobId);
+assert.equal(imageParsed.kind, "image");
+assert.equal(imageParsed.width, 2560);
+assert.equal(imageParsed.seedance_enabled, undefined);
+for (const invalid of [{ ...imageJob, width: 0 }, { ...imageJob, height: 8193 }, { ...imageJob, samples: 513 },
+  { ...imageJob, progress: -1 }, { ...imageJob, state: "awaiting_seedance_approval" },
+  { ...imageJob, engine: "injected" }, { ...imageJob, state: "completed", output_url: "https://evil.example/fake.png" },
+  { ...imageJob, state: "completed", output_url: "https://test.blob.core.windows.net/fake.mp4" }]) {
+  assert.throws(() => validateJob(invalid, jobId));
+}
+assert.equal(validateJob({ ...imageJob, state: "publishing", progress: 95 }, jobId).state, "publishing");
+assert.equal(validateJob({ ...imageJob, state: "completed", output_url: "https://test.blob.core.windows.net/image.png" }, jobId).output_url,
+  "https://test.blob.core.windows.net/image.png");
 await assert.rejects(readJobStream(new Response(sse({ ...descriptor(), id: "f".repeat(32) })), jobId));
 assert.throws(() => validateJob({ ...descriptor(), state: "invented" }, jobId));
 assert.equal(validateJob({ ...descriptor(), preview_url: "https://evil.example/a.mp4" }, jobId).preview_url, undefined);
@@ -338,6 +353,16 @@ assert.equal(voiceSecurity.voiceMediaContext(voiceCookie, "invalid"), undefined)
 console.log("PASS voice media context: same typed scope without secrets, no actions, invalid inputs rejected");
 const fence = "```videojob\n" + JSON.stringify({ ...descriptor(), action: "approve" }) + "\n```";
 assert.deepEqual(markdown.extractVideoJobIds(fence + fence), [jobId]);
+const imageFence = "```imagejob\n" + JSON.stringify(imageJob) + "\n```";
+assert.deepEqual(markdown.extractVideoJobIds(imageFence + imageFence), [jobId]);
+assert.equal(markdown.stripVideoJobBlocks("Image queued\n" + imageFence), "Image queued");
+assert.equal(markdown.stripVideoJobBlocks('Image queued\n```imagejob\n{"id":'), "Image queued");
+assert.deepEqual(markdown.buildChatTimeline([{
+  id: "image-message", role: "assistant", text: imageFence, status: "done", rawBuffer: imageFence, currentStatus: null,
+}]).jobIds, [jobId]);
+assert.equal(media.isImageJob(imageJob), true);
+assert.equal(media.isImageJob({ ...imageJob, state: "completed" }), false);
+assert.equal(media.isImageJob({ ...imageJob, progress: 101 }), false);
 assert.deepEqual(markdown.extractVideoJobIds('```videojob\n{"id":"../../evil"}\n```'), []);
 assert.equal(markdown.stripVideoJobBlocks("Hello\n```videojob\n{\"id\":"), "Hello");
 assert.equal(markdown.isVideoLink("https://test.blob.core.windows.net/screenshots/a.mp4?sig=test"), true);
@@ -387,4 +412,11 @@ try {
   resolveFetch(new Response(JSON.stringify(descriptor())));
   await first;
 } finally { globalThis.fetch = originalFetch; }
+try {
+  globalThis.fetch = async () => Response.json(imageJob);
+  assert.equal((await media.requestVideoJob(conversation, jobId)).kind, "image");
+  globalThis.fetch = async () => Response.json({ ...imageJob, width: 9000 });
+  await assert.rejects(media.requestVideoJob(conversation, jobId), /Invalid image job/);
+} finally { globalThis.fetch = originalFetch; }
 console.log("PASS client ID-only parsing, partial fence hiding, MP4 recognition, durable scoped IDs, paid estimates and single-flight requests");
+console.log("PASS asynchronous image descriptors, custom dimensions, imagejob streaming/timeline recovery and malformed image rejection");

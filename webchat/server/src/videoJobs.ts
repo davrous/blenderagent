@@ -4,9 +4,10 @@ import { config } from "./config.js";
 import { browserKey, isUuid, JOB_ID_RE, requireOrigin, scopeFor, type MediaAction, type MediaContext } from "./mediaSecurity.js";
 import { storeReference, withReferenceUpload } from "./referenceUploads.js";
 
-export const JOB_STATES = ["queued", "rendering", "encoding", "awaiting_seedance_approval", "wavespeed_uploading", "wavespeed_submitting", "wavespeed_processing", "submission_unknown", "completed", "failed", "cancelled"] as const;
+export const JOB_STATES = ["queued", "rendering", "encoding", "publishing", "awaiting_seedance_approval", "wavespeed_uploading", "wavespeed_submitting", "wavespeed_processing", "submission_unknown", "completed", "failed", "cancelled"] as const;
 const TERMINAL = new Set(["completed", "failed", "cancelled", "submission_unknown"]);
 export interface VideoJob {
+  kind?: "video";
   id: string;
   state: typeof JOB_STATES[number];
   progress: number;
@@ -21,6 +22,20 @@ export interface VideoJob {
   error?: string;
   estimate_usd?: number;
 }
+export interface ImageJob {
+  kind: "image";
+  id: string;
+  state: typeof JOB_STATES[number];
+  progress: number;
+  width: number;
+  height: number;
+  samples: number;
+  engine: "CYCLES" | "BLENDER_EEVEE_NEXT";
+  resolution: string;
+  output_url?: string;
+  error?: string;
+}
+export type RenderJob = VideoJob | ImageJob;
 
 export function safeBlobUrl(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -32,9 +47,24 @@ export function safeBlobUrl(value: unknown): string | undefined {
   } catch { return undefined; }
 }
 
-export function validateJob(value: unknown, id: string): VideoJob {
+export function validateJob(value: unknown, id: string): RenderJob {
   if (!value || typeof value !== "object") throw new Error("Invalid video job descriptor");
   const job = value as Record<string, unknown>;
+  if (job.kind === "image") {
+    if (job.id !== id || !JOB_ID_RE.test(id) || !["queued", "rendering", "publishing", "completed", "failed", "cancelled"].includes(String(job.state))
+      || typeof job.progress !== "number" || !Number.isFinite(job.progress) || job.progress < 0 || job.progress > 100
+      || typeof job.width !== "number" || !Number.isInteger(job.width) || job.width < 1 || job.width > 8192
+      || typeof job.height !== "number" || !Number.isInteger(job.height) || job.height < 1 || job.height > 8192
+      || job.width * job.height > 16_000_000 || job.resolution !== `${job.width}x${job.height}`
+      || typeof job.samples !== "number" || !Number.isInteger(job.samples) || job.samples < 1 || job.samples > 512
+      || (job.engine !== "CYCLES" && job.engine !== "BLENDER_EEVEE_NEXT")) throw new Error("Invalid image job descriptor");
+    const output = safeBlobUrl(job.output_url);
+    if (job.state === "completed" && (!output || !new URL(output).pathname.endsWith(".png"))) throw new Error("Completed image job has no PNG output");
+    return { kind: "image", id, state: job.state as ImageJob["state"], progress: job.progress,
+      width: job.width, height: job.height, samples: job.samples, engine: job.engine, resolution: job.resolution,
+      output_url: output, error: typeof job.error === "string" ? job.error.slice(0, 2000) : undefined };
+  }
+  if (job.kind !== undefined && job.kind !== "video") throw new Error("Invalid render job kind");
   if (job.id !== id || !JOB_ID_RE.test(id) || !JOB_STATES.includes(job.state as VideoJob["state"]) || typeof job.seedance_enabled !== "boolean" || typeof job.mode !== "string" || typeof job.resolution !== "string") throw new Error("Invalid video job descriptor");
   for (const field of ["progress", "duration_seconds", "fps"] as const) {
     if (typeof job[field] !== "number" || !Number.isFinite(job[field]) || job[field] < 0) throw new Error("Invalid video job metadata");
@@ -48,7 +78,7 @@ export function validateJob(value: unknown, id: string): VideoJob {
   };
 }
 
-export async function readJobStream(response: globalThis.Response, id: string): Promise<VideoJob> {
+export async function readJobStream(response: globalThis.Response, id: string): Promise<RenderJob> {
   if (!response.ok || !response.body) throw new Error(`Agent control returned HTTP ${response.status}`);
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -78,7 +108,7 @@ export async function readJobStream(response: globalThis.Response, id: string): 
     }
     buffer += decoder.decode();
     if (buffer.trim()) consume(buffer);
-    const blocks = [...text.matchAll(/```videojob\s*\n([\s\S]*?)```/gi)];
+    const blocks = [...text.matchAll(/```(?:videojob|imagejob)\s*\n([\s\S]*?)```/gi)];
     for (const block of blocks.reverse()) {
       const job = JSON.parse(block[1]);
       if (job?.id === id) return validateJob(job, id);
@@ -168,7 +198,7 @@ export function registerMediaRoutes(app: Express, build: UpstreamBuilder, upload
     try {
       if (type !== "status") {
         const live = await call({ type: "status", job_id: id });
-        if ((type === "approve" && (live.state !== "awaiting_seedance_approval" || !live.seedance_enabled)) || (type === "cancel" && TERMINAL.has(live.state))) {
+        if ((type === "approve" && (live.kind === "image" || live.state !== "awaiting_seedance_approval" || !live.seedance_enabled)) || (type === "cancel" && TERMINAL.has(live.state))) {
           res.status(409).json({ error: "Job is no longer eligible for this action. Refresh status.", job: live });
           return;
         }

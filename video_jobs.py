@@ -16,6 +16,7 @@ from pathlib import Path
 from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
 
 from artifact_storage import ArtifactStorage
+from blender_image import image_settings, png_dimensions, sample_progress
 from media_analysis import render_settings, run_media
 from wavespeed_client import RATES, TERMINAL_FAILURES, WaveSpeedClient
 
@@ -25,7 +26,8 @@ video_notifier = contextvars.ContextVar("video_notifier", default=None)
 FINAL_STATES = {"completed", "failed", "cancelled", "submission_unknown", "awaiting_seedance_approval"}
 TRANSITIONS = {
     "queued": {"rendering", "failed", "cancelled"},
-    "rendering": {"encoding", "failed", "cancelled"},
+    "rendering": {"encoding", "publishing", "failed", "cancelled"},
+    "publishing": {"completed", "failed", "cancelled"},
     "encoding": {"completed", "awaiting_seedance_approval", "failed", "cancelled"},
     "awaiting_seedance_approval": {"wavespeed_uploading", "cancelled"},
     "wavespeed_uploading": {"wavespeed_submitting", "failed", "cancelled"},
@@ -63,6 +65,8 @@ class JobRepository:
         if resolution not in RATES or not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 8000 or type(generate_audio) is not bool:
             raise ValueError("Provide a finishing prompt, valid resolution and audio setting.")
         document, etag = self.read(scope, job_id)
+        if document.get("kind") == "image":
+            raise ValueError("Still image jobs cannot authorize paid video finishing.")
         if document["state"] != "awaiting_seedance_approval":
             return document
         if not os.getenv("WAVESPEED_API_KEY"):
@@ -85,6 +89,7 @@ class VideoJobs:
         self._render_lock = threading.Lock()
         self._notifications = {}
         self._notification_sends = {}
+        self._creating = False
 
     def resume_pending(self):
         for identity in self.root.glob("*/identity.json"):
@@ -100,32 +105,49 @@ class VideoJobs:
             "duration_seconds", "fps", "resolution", "mode", "engine", "samples")})
         if seedance and settings["mode"] != "clay":
             raise ValueError("Render a clay preview before Seedance finishing.")
+        return self._create(scope, settings, snapshot, seedance=seedance)
+
+    def create_image(self, scope, width, height, samples, engine, snapshot):
+        settings = image_settings(width, height, samples, engine)
+        return self._create(scope, settings, snapshot, seedance=False)
+
+    def _create(self, scope, settings, snapshot, *, seedance):
         job_id = uuid.uuid4().hex
         job_name(scope, job_id)
         with self._guard:
-            if any(task.is_alive() for task in self._tasks.values()):
-                raise ValueError("A video job is already running in this session.")
-        if shutil.disk_usage(self.root).free < 2 * 1024 ** 3:
-            raise ValueError("Video rendering requires at least 2 GiB of free temporary space.")
+            if self._creating or any(task.is_alive() for task in self._tasks.values()):
+                raise ValueError("A render job is already running in this session.")
+            self._creating = True
         directory = self.root / job_id
-        directory.mkdir()
         try:
+            if shutil.disk_usage(self.root).free < 2 * 1024 ** 3:
+                raise ValueError("Rendering requires at least 2 GiB of free temporary space.")
+            directory.mkdir()
             snapshot(directory / "scene.blend")
             if not (directory / "scene.blend").is_file():
                 raise ValueError("Blender did not create the scene snapshot.")
             (directory / "settings.json").write_text(json.dumps(settings))
             document = {"id": job_id, "scope": scope, "state": "queued", "progress": 0,
                         "created_at": time.time(), "updated_at": time.time(), "seedance": seedance, **settings}
+            if settings.get("kind") == "image":
+                scene = directory / "scene.blend"
+                if scene.stat().st_size > 200 * 1024 * 1024:
+                    raise ValueError("The packed image snapshot exceeds the 200 MiB limit.")
+                document["scene_blob"] = f"images/{scope}/{job_id}/scene.blend"
+                self.storage.upload_file(document["scene_blob"], scene, "application/x-blender")
             self.storage.write_json(job_name(scope, job_id), document)
             (directory / "identity.json").write_text(json.dumps({"scope": scope, "id": job_id}))
+            notifier = video_notifier.get()
+            if notifier:
+                self._notifications[job_id] = notifier
+            self.ensure(scope, job_id)
+            return self.describe(document)
         except BaseException:
             shutil.rmtree(directory, ignore_errors=True)
             raise
-        notifier = video_notifier.get()
-        if notifier:
-            self._notifications[job_id] = notifier
-        self.ensure(scope, job_id)
-        return self.describe(document)
+        finally:
+            with self._guard:
+                self._creating = False
 
     def ensure(self, scope, job_id):
         job_name(scope, job_id)
@@ -149,9 +171,20 @@ class VideoJobs:
         if document["state"] == "rendering" and (directory / "progress").exists():
             try:
                 with (directory / "progress").open() as progress:
-                    document["progress"] = max(0, min(90, int(progress.read(32)) * 90 // document["frames"]))
+                    value = int(progress.read(32))
+                    document["progress"] = max(0, min(95, value)) if document.get("kind") == "image" else max(0, min(90, value * 90 // document["frames"]))
             except (OSError, ValueError):
                 pass
+        if document.get("kind") == "image" and document["state"] == "rendering" and (directory / "render.log").is_file():
+            try:
+                with (directory / "render.log").open("rb") as source:
+                    size = source.seek(0, os.SEEK_END)
+                    source.seek(max(0, size - 8192))
+                    value = sample_progress(source.read(8192).decode("utf-8", errors="replace"))
+                if value is not None:
+                    document["progress"] = max(document["progress"], value)
+            except OSError:
+                logger.warning("Could not read image progress for job %s", document["id"])
 
     def _publish(self, document, *, final=False):
         job_id = document["id"]
@@ -206,6 +239,13 @@ class VideoJobs:
         return self.status(scope, job_id)
 
     def describe(self, document):
+        if document.get("kind") == "image":
+            result = {key: document[key] for key in ("id", "kind", "state", "progress", "width", "height", "samples", "engine", "resolution")}
+            if document.get("output_blob"):
+                result["output_url"] = self.storage.signed_url(document["output_blob"])
+            if document.get("error"):
+                result["error"] = document["error"]
+            return result
         result = {key: document[key] for key in ("id", "state", "progress", "mode", "duration_seconds", "fps", "resolution")}
         result["seedance_enabled"] = bool(os.getenv("WAVESPEED_API_KEY"))
         result["estimate_usd"] = round(document["duration_seconds"] * 2 * RATES["720p"], 2)
@@ -243,7 +283,10 @@ class VideoJobs:
             document, etag = self.repo.read(scope, job_id)
             directory = self.root / job_id
             directory.mkdir(exist_ok=True)
-            if document["state"] in ("queued", "rendering", "encoding"):
+            if document.get("kind") == "image" and document["state"] in ("queued", "rendering", "publishing"):
+                with self._render_lock:
+                    document, etag = self._render_image(document, etag, directory, lost)
+            elif document["state"] in ("queued", "rendering", "encoding"):
                 with self._render_lock:
                     document, etag = self._render(document, etag, directory, lost)
             if document["state"] in ("wavespeed_uploading", "wavespeed_submitting", "wavespeed_processing"):
@@ -252,13 +295,15 @@ class VideoJobs:
         except ResourceModifiedError:
             logger.info("Video job %s changed concurrently; stopping this worker", job_id)
         except Exception as error:
-            logger.warning("Video job %s failed (%s)", job_id, type(error).__name__)
+            logger.warning("Render job %s failed (%s)", job_id, type(error).__name__, exc_info=True)
             if document and lease and not lost.is_set():
                 try:
                     current, current_etag = self.repo.read(scope, job_id)
                     state = "submission_unknown" if current["state"] == "wavespeed_submitting" else "failed"
                     message = ("Submission outcome is unknown. Reconcile this job in WaveSpeed before creating another paid request."
                                if state == "submission_unknown" else "Video processing failed. Check server diagnostics and media/render limits.")
+                    if current.get("kind") == "image":
+                        message = "Image rendering failed. Check the saved render diagnostics; no automatic retry was submitted."
                     if state in TRANSITIONS.get(current["state"], set()):
                         current, _ = self.repo.update(current, current_etag, state, error=message)
                     self._finalize(current)
@@ -281,7 +326,60 @@ class VideoJobs:
         (directory / "scene.blend").unlink(missing_ok=True)
         (directory / "preview.mp4").unlink(missing_ok=True)
         (directory / "final.mp4").unlink(missing_ok=True)
+        (directory / "result.png").unlink(missing_ok=True)
+        (directory / "pending.png").unlink(missing_ok=True)
         self._publish(document, final=True)
+
+    def _render_image(self, document, etag, directory, lost):
+        settings = image_settings(document["width"], document["height"], document["samples"], document["engine"])
+        expected = f"images/{document['scope']}/{document['id']}/scene.blend"
+        if document.get("scene_blob") != expected:
+            raise ValueError("The image render snapshot does not belong to this job.")
+        result = directory / "result.png"
+        if document["state"] != "publishing" or not result.is_file():
+            if not (directory / "scene.blend").is_file():
+                self.storage.download(expected, directory / "scene.blend")
+            (directory / "settings.json").write_text(json.dumps(settings))
+            if document["state"] == "queued":
+                document, etag = self.repo.update(document, etag, "rendering")
+            command = [os.getenv("BLENDER_PATH", "blender"), "--background", "--disable-autoexec",
+                       str(directory / "scene.blend"), "--threads", "2", "--python-exit-code", "1",
+                       "--python", str(Path(__file__).with_name("blender_image.py")), "--", str(directory)]
+            with (directory / "render.log").open("wb") as output:
+                process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
+                deadline = time.monotonic() + int(os.getenv("IMAGE_RENDER_TIMEOUT_SECONDS", "3600"))
+                try:
+                    while process.poll() is None:
+                        if lost.wait(1):
+                            raise ValueError("The image render lease was lost.")
+                        if (directory / "cancel").exists():
+                            raise ValueError("The image render was cancelled.")
+                        if time.monotonic() > deadline:
+                            raise ValueError("The image render exceeded IMAGE_RENDER_TIMEOUT_SECONDS.")
+                        self._read_progress(document, directory)
+                        self._publish(document)
+                    if process.returncode:
+                        raise ValueError(f"Blender image rendering exited with code {process.returncode}; see render.log.")
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+        if lost.is_set() or (directory / "cancel").exists():
+            raise ValueError("The image render was cancelled or its lease was lost.")
+        if not result.is_file() or not 0 < result.stat().st_size <= 200 * 1024 * 1024:
+            raise ValueError("The rendered PNG is missing or exceeds 200 MiB.")
+        if png_dimensions(result) != (settings["width"], settings["height"]):
+            raise ValueError("The rendered PNG dimensions differ from the requested image.")
+        if document["state"] != "publishing":
+            document, etag = self.repo.update(document, etag, "publishing", progress=95)
+        self._publish(document)
+        output_blob = f"images/{document['scope']}/{document['id']}/image.png"
+        self.storage.upload_file(output_blob, result, "image/png")
+        return self.repo.update(document, etag, "completed", output_blob=output_blob, progress=100)
 
     def _render(self, document, etag, directory, lost):
         if not (directory / "scene.blend").is_file():
@@ -403,4 +501,5 @@ def resume_video_jobs():
 
 
 def descriptor(value: dict) -> str:
-    return "```videojob\n" + json.dumps(value) + "\n```"
+    tag = "imagejob" if value.get("kind") == "image" else "videojob"
+    return f"```{tag}\n" + json.dumps(value) + "\n```"

@@ -83,7 +83,7 @@ RUN pip install --no-cache-dir --retries "$PIP_RETRIES" --timeout "$PIP_DEFAULT_
 COPY main.py auth_diagnostics.py conversation_telemetry.py \
     voice_pipeline.py activity_bridge.py blender_startup.py \
     blender_connection.py scene_manager.py artifact_storage.py media_analysis.py \
-    media_control.py video_jobs.py wavespeed_client.py blender_video.py teams_media.py teams_widgets.py \
+    media_control.py video_jobs.py wavespeed_client.py blender_video.py blender_image.py teams_media.py teams_widgets.py \
     entrypoint.sh agent.yaml ./
 
 COPY webchat/client/widget/widget.html ./webchat/client/widget/widget.html

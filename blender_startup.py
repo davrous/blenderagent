@@ -206,6 +206,7 @@ class BlenderMCPServer:
         handlers = {
             "apply_camera_path": self.apply_camera_path,
             "snapshot_animation": self.snapshot_animation,
+            "snapshot_image": self.snapshot_image,
             "get_scene_info": self.get_scene_info,
             "get_object_info": self.get_object_info,
             "get_viewport_screenshot": self.get_viewport_screenshot,
@@ -264,6 +265,19 @@ class BlenderMCPServer:
             raise ValueError("Invalid animation snapshot path")
         if bpy.context.scene.camera is None:
             raise ValueError("Apply a camera path before rendering")
+        bpy.ops.wm.save_as_mainfile(filepath=str(destination), check_existing=False, copy=True)
+        return {"saved": True}
+
+    def snapshot_image(self, path):
+        from pathlib import Path
+
+        destination = Path(path).resolve()
+        root = (Path.home() / "tmp" / "video-jobs").resolve()
+        if not destination.is_relative_to(root) or destination.name != "scene.blend":
+            raise ValueError("Invalid image snapshot path")
+        if bpy.context.scene.camera is None:
+            raise ValueError("Set an active camera before rendering")
+        bpy.ops.file.pack_all()
         bpy.ops.wm.save_as_mainfile(filepath=str(destination), check_existing=False, copy=True)
         return {"saved": True}
     # ──────────────────────────────────────────────

@@ -265,13 +265,14 @@ def video_attachments(value, scope, attachment_type):
     if not isinstance(job_id, str) or not re.fullmatch(ID_PATTERN, job_id):
         raise MediaError("The video job descriptor is invalid.")
     state = value.get("state", "unknown")
-    if state not in {"queued", "rendering", "encoding", "awaiting_seedance_approval", "wavespeed_uploading",
+    if state not in {"queued", "rendering", "encoding", "publishing", "awaiting_seedance_approval", "wavespeed_uploading",
                      "wavespeed_submitting", "wavespeed_processing", "completed", "failed", "cancelled", "submission_unknown"}:
         raise MediaError("The video job state is invalid.")
     base = {"type": "blenderVideoAction", "scope": scope, "job_id": job_id}
     progress = value.get("progress", 0)
     if type(progress) not in (int, float) or not math.isfinite(progress):
         progress = 0
+    image = value.get("kind") == "image"
     body = [{"type": "TextBlock", "text": "Video job", "weight": "Bolder", "wrap": True},
             {"type": "TextBlock", "text": f"{state} | {max(0, min(100, progress)):g}%", "wrap": True},
             {"type": "TextBlock", "text": f"Job ID: {job_id}", "wrap": True},
@@ -287,10 +288,32 @@ def video_attachments(value, scope, attachment_type):
             parsed = urlsplit(address)
             return bool(parsed.scheme == "https" and parsed.hostname and parsed.hostname.endswith(".blob.core.windows.net")
                         and not parsed.username and not parsed.password and parsed.port in (None, 443)
-                        and parsed.path.startswith(f"/screenshots/videos/{scope}/{job_id}/")
+                        and parsed.path.startswith(f"/screenshots/{'images' if image else 'videos'}/{scope}/{job_id}/")
                         and parsed.path.endswith(suffix))
         except ValueError:
             return False
+    if image:
+        width, height = value.get("width"), value.get("height")
+        if (state not in {"queued", "rendering", "publishing", "completed", "failed", "cancelled"}
+                or type(width) is not int or type(height) is not int or min(width, height) < 1
+                or max(width, height) > 8192 or width * height > 16_000_000):
+            raise MediaError("The image render descriptor is invalid.")
+        body[0]["text"] = "Image render"
+        body.insert(1, {"type": "TextBlock", "text": f"{width} × {height} pixels", "wrap": True})
+        if state == "completed":
+            if not safe_artifact(url, ".png"):
+                raise MediaError("The completed image has no valid PNG download.")
+            body.append({"type": "Image", "url": url, "altText": "Rendered image", "size": "Large"})
+            actions.append({"type": "Action.OpenUrl", "title": "Download PNG", "url": url})
+            attachments.append(attachment_type(content_type="image/png", content_url=url, name=f"render-{job_id}.png"))
+        elif state in {"queued", "rendering", "publishing"}:
+            actions.append({"type": "Action.Submit", "title": "Cancel", "associatedInputs": "none", "data": {**base, "action": "cancel"}})
+        if state == "failed":
+            body.append({"type": "TextBlock", "text": value.get("error") or "Image rendering failed. Check diagnostics and refresh Status.", "wrap": True})
+        card = attachment_type(content_type="application/vnd.microsoft.card.adaptive", content={
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "type": "AdaptiveCard", "version": "1.3",
+            "body": body, "actions": actions})
+        return [card, *attachments]
     if safe_artifact(poster, ".png"):
         body.append({"type": "Image", "url": poster, "altText": "Video preview", "size": "Large"})
     if safe_artifact(url, ".mp4"):

@@ -255,7 +255,7 @@ async def start_animation_render(duration_seconds: float = 5, fps: int = 24, res
 
 @tool(approval_mode="never_require")
 async def get_video_job_status(job_id: str) -> str:
-    """Get a conversation-owned video job's progress, preview and final download links; resume paused work."""
+    """Get a conversation-owned video OR high-resolution image job's progress and download links; resume paused work."""
     return descriptor(await asyncio.to_thread(get_video_jobs().status, require_scope(), job_id))
 
 

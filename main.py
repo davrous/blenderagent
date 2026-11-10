@@ -40,6 +40,7 @@ from auth_diagnostics import start_auth_diagnostics
 from blender_connection import get_blender_connection, close_blender_connection, is_blender_socket_ready
 from conversation_telemetry import FoundryConversationTelemetryAgent
 from scene_manager import SceneManager
+from blender_image import needs_async_image
 from media_control import (
     MediaMiddleware, analyze_reference_media, apply_camera_path, configure_vision,
     get_video_job_status, start_animation_render, start_seedance_finish,
@@ -1308,6 +1309,23 @@ def _do_render(
     drops (e.g. Blender crashes mid-render), waits for the supervisor to restart
     it, reloads the conversation's scene, and retries once.
     """
+    if needs_async_image(resolution_x, resolution_y):
+        from media_control import require_scope
+        from video_jobs import descriptor, get_video_jobs
+
+        def snapshot(path):
+            get_blender_connection().send_command("snapshot_image", {"path": str(path)})
+
+        value = get_video_jobs().create_image(
+            require_scope(), resolution_x, resolution_y, samples, engine, snapshot,
+        )
+        return (
+            "High-resolution image queued from a frozen scene snapshot. Return the EXACT imagejob block. "
+            "The card provides status, cancellation and PNG download. Do not call render_final again, "
+            "poll in a loop, or claim completion while the job is queued/rendering. "
+            "Status resumes recoverable work after hosted idle; background execution is not guaranteed.\n\n"
+            + descriptor(value)
+        )
     # Generate unique timestamped output path — kept in $HOME/tmp AND uploaded to blob
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     unique_name = f"{label}_{timestamp}_{uuid.uuid4().hex[:8]}.png"
@@ -1462,6 +1480,8 @@ def render_final(
     For higher resolutions requested by the user, first render a quick
     640x480 preview, return it, and ask the user to confirm before
     proceeding with the full resolution at 256 samples.
+    Images wider than 1920 or taller than 1080 are queued asynchronously and
+    return an imagejob card, not a finished image. Lower resolutions remain synchronous.
     """
     return _do_render("render", resolution_x, resolution_y, samples, engine)
 
@@ -2331,7 +2351,7 @@ async def main():
 - **Rendering workflow**:
   0. A render takes a while, so ALWAYS call get_viewport_screenshot() ONCE immediately before the first render_final() call. It gives the user something to look at while the render runs, and it is the one exception to the "no intermediate screenshots" rule above.
   1. When the user asks for a high-fidelity render WITHOUT specifying a resolution (or at 640x480 or smaller): call render_final() ONCE at **640x480 with 32 samples**. Do NOT call render_preview() — a single render_final() call is sufficient. Include the render image from render_final() in your response.
-  2. When the user asks for a high-fidelity render at a resolution HIGHER than 640x480 (e.g. 1920x1080): first call render_final() at **640x480 with 32 samples** as a quick preview, return that image to the user immediately, then ASK the user to confirm whether they want to generate the higher-resolution version. If confirmed, call render_final() again at the **requested resolution with 256 samples** and return that image.
+  2. When the user asks for a high-fidelity render at a resolution HIGHER than 640x480 (e.g. 1920x1080): first call render_final() at **640x480 with 32 samples** as a quick preview, return that image to the user immediately, then ASK the user to confirm whether they want to generate the higher-resolution version. If confirmed, call render_final() again at the **requested resolution with 256 samples**. Above 1920 pixels wide OR 1080 pixels tall, render_final/render_preview automatically return an asynchronous imagejob, not a finished image. Preserve the requested dimensions (including custom 2560x1440 or 3820x2160), and return the EXACT imagejob fence immediately. The job renders a frozen scene with a separate Blender process, so the user can continue chatting without changing that image. Never render high-resolution stills through execute_blender_code, retry an already submitted render, or loop on status. The job card provides progress, Cancel and the final PNG download; get_video_job_status also handles image jobs on explicit status requests. Background threads cannot prevent Foundry idle; Status resumes recoverable work after a pause.
 - NEVER set `collection.name` — it is read-only in this Blender environment. To organize objects, create new collections with `bpy.data.collections.new("Name")` and link them to the scene with `bpy.context.scene.collection.children.link(new_collection)` instead of renaming existing ones.
 - The render engine enum for Eevee in Blender 4.x is `'BLENDER_EEVEE_NEXT'`, NOT `'BLENDER_EEVEE'`. Valid engines are: `'BLENDER_EEVEE_NEXT'`, `'BLENDER_WORKBENCH'`, `'CYCLES'`.
 - When a tool returns an image in markdown format (e.g. `![screenshot](url)` or `![render](url)`), you MUST include that exact markdown image link in your response so the chat client can display the image. Never omit, summarize, or rewrite the image URL.
