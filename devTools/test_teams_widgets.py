@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+from agent_framework import AgentResponse, AgentResponseUpdate, Content, ResponseStream
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import activity_bridge as ab
@@ -82,6 +83,64 @@ class ExportAgent(_Agent):
                 contents=[SimpleNamespace(type="text", text=f"[Download GLB]({SAS})\n\n")],
             )
             yield SimpleNamespace(message_id="final", contents=[SimpleNamespace(type="text", text="Exported scene.")])
+        return generate()
+
+
+class SceneEditingAgent:
+    def __init__(self, *, manual_export=False, late_edit=False, fail=False, calls=None, stream_arguments=False):
+        import main
+        self.main = main
+        self.manual_export = manual_export
+        self.late_edit = late_edit
+        self.fail = fail
+        self.calls = calls
+        self.stream_arguments = stream_arguments
+        self.messages = []
+
+    def run(self, messages, **kwargs):
+        self.messages.append(messages)
+
+        async def original():
+            calls = self.calls if self.calls is not None else [
+                ("execute_blender_code", {"code": "build_scene()"}, "Scene updated."),
+            ]
+            for index, (name, arguments, result) in enumerate(calls):
+                call_id = f"call-{index}"
+                if self.stream_arguments:
+                    yield AgentResponseUpdate(contents=[Content.from_function_call(
+                        call_id, name, arguments=None,
+                    )], role="assistant")
+                yield AgentResponseUpdate(contents=[Content.from_function_call(
+                    call_id, name, arguments=arguments,
+                )], role="assistant")
+                yield AgentResponseUpdate(contents=[Content.from_function_result(call_id, result=result)], role="tool")
+            if self.fail:
+                raise RuntimeError("model stream interrupted")
+            if self.manual_export:
+                yield AgentResponseUpdate(contents=[Content.from_function_call(
+                    "manual-export", "export_scene_as_glb_for_download", arguments={},
+                )], role="assistant")
+                widgets.record_export(EXPORT.blob, EXPORT.account, EXPORT.size, EXPORT.etag)
+                yield AgentResponseUpdate(contents=[Content.from_function_result(
+                    "manual-export", result=f"[Download GLB]({SAS})",
+                )], role="tool")
+            if self.late_edit:
+                yield AgentResponseUpdate(contents=[Content.from_function_call(
+                    "edit-after-export", "modify_object", arguments={"name": "Castle"},
+                )], role="assistant")
+                yield AgentResponseUpdate(contents=[Content.from_function_result(
+                    "edit-after-export", result="Castle updated.",
+                )], role="tool")
+            yield AgentResponseUpdate(contents=[Content.from_text("Created the requested castle.")],
+                                      role="assistant", message_id="final")
+
+        async def generate():
+            context = SimpleNamespace(stream=True, session=None,
+                result=ResponseStream(original(), finalizer=AgentResponse.from_updates))
+            await self.main.ToolStatusMiddleware().process(context, AsyncMock())
+            async for update in context.result:
+                yield update
+
         return generate()
 
 
@@ -249,6 +308,191 @@ class WidgetTests(unittest.IsolatedAsyncioTestCase):
         stale = _State({})
         await ab._run_turn(ExportAgent(), value, stale)
         self.assertEqual(len(stale.conversation.get_value(widgets.STATE_KEY)), 2, "Queued state snapshots use the authoritative registry.")
+
+    async def test_first_creation_and_followup_export_once_without_a_glb_prompt(self):
+        agent = SceneEditingAgent()
+        value = context()
+        value.activity.text = "Create a castle."
+        state = _State({})
+        send = connector(value)
+
+        def export():
+            widgets.record_export(EXPORT.blob, EXPORT.account, EXPORT.size, EXPORT.etag)
+            return f"[Download GLB]({SAS})"
+
+        with patch.dict(os.environ, ENV), patch.object(agent.main, "export_scene_as_glb_for_download", side_effect=export) as tool:
+            await ab._run_turn(agent, value, state)
+            self.assertEqual(tool.call_count, 1)
+            first = [call.args[1] for call in send.await_args_list]
+            self.assertEqual(first[-1].text_format, "extendedmarkdown")
+            self.assertIn("Created the requested castle.", first[-2].text, "Automatic export must preserve final prose.")
+            self.assertFalse(any("![screenshot]" in (item.text or "") for item in first))
+            self.assertIn("NOT a screenshot", agent.messages[0][0].contents[0].text)
+            value.activity.id = "user-101"
+            value.activity.text = "Make the castle blue."
+            await ab._run_turn(agent, value, state)
+            self.assertEqual(tool.call_count, 2)
+        registry = state.conversation.get_value(widgets.STATE_KEY)
+        self.assertEqual(len(registry), 2)
+        self.assertNotEqual(registry[0]["id"], registry[1]["id"])
+        self.assertIsNone(widgets.exports.get())
+        history = state.conversation.get_value(ab._HISTORY_KEY)
+        self.assertNotIn(widgets.SCENE_PREVIEW_INSTRUCTIONS, str(history), "Channel-only guidance must not enter replay history.")
+
+    async def test_explicit_export_is_not_duplicated_and_failed_turn_does_not_publish(self):
+        for manual, fail in ((True, False), (False, True)):
+            agent = SceneEditingAgent(manual_export=manual, fail=fail)
+            value = context(f"scene-{manual}-{fail}")
+            state = _State({})
+            send = connector(value)
+            with patch.dict(os.environ, ENV), patch.object(agent.main, "export_scene_as_glb_for_download") as tool:
+                await ab._run_turn(agent, value, state)
+                tool.assert_not_called()
+            widgets_sent = [call.args[1] for call in send.await_args_list if getattr(call.args[1], "text_format", None) == "extendedmarkdown"]
+            self.assertEqual(len(widgets_sent), 0 if fail else 1)
+
+    async def test_edit_after_an_explicit_export_publishes_the_latest_scene(self):
+        agent = SceneEditingAgent(manual_export=True, late_edit=True)
+        value, state = context("scene-late-edit"), _State({})
+        send = connector(value)
+
+        def latest_export():
+            widgets.record_export("scenes/latest.glb", EXPORT.account, EXPORT.size, "latest-etag")
+            return f"[Download GLB]({SAS})"
+
+        with patch.dict(os.environ, ENV), patch.object(agent.main, "export_scene_as_glb_for_download", side_effect=latest_export) as tool:
+            await ab._run_turn(agent, value, state)
+            tool.assert_called_once()
+        self.assertEqual(state.conversation.get_value(widgets.STATE_KEY)[0]["blob"], "scenes/latest.glb")
+        self.assertEqual(sum(getattr(call.args[1], "text_format", None) == "extendedmarkdown" for call in send.await_args_list), 1)
+
+    async def test_automatic_export_failure_is_visible_without_publishing_a_forged_widget(self):
+        agent = SceneEditingAgent()
+        value, state = context("scene-export-error"), _State({})
+        send = connector(value)
+        with patch.dict(os.environ, ENV), patch.object(agent.main, "export_scene_as_glb_for_download", return_value="Error: export failed"):
+            await ab._run_turn(agent, value, state)
+        messages = [call.args[1] for call in send.await_args_list]
+        self.assertTrue(any("preview could not be exported" in (message.text or "") for message in messages))
+        self.assertFalse(any(getattr(message, "text_format", None) == "extendedmarkdown" for message in messages))
+
+    async def test_scene_edits_without_widget_configuration_keep_ordinary_behavior(self):
+        agent = SceneEditingAgent()
+        value = context("scene-widget-disabled")
+        send = connector(value)
+        with patch.dict(os.environ, {"TEAMS_WIDGET_ASSET_BASE_URL": ""}), patch.object(agent.main, "export_scene_as_glb_for_download") as tool:
+            await ab._run_turn(agent, value, _State({}))
+        tool.assert_not_called()
+        self.assertNotEqual(agent.messages[0][0].role, "system")
+        self.assertFalse(any(getattr(call.args[1], "text_format", None) == "extendedmarkdown" for call in send.await_args_list))
+
+    async def test_questions_and_listings_do_not_publish_widgets(self):
+        cases = [
+            ("What can you do?", []),
+            ("How many objects are in the scene?", [("get_scene_info", {}, "Three objects.")]),
+            ("What material does the cube use?", [("get_object_info", {"object_name": "Cube"}, "Wood.")]),
+            ("Show me a list of models.", [("list_available_models", {}, "Model gallery.")]),
+            ("Show me textures.", [("list_available_textures", {}, "Texture gallery.")]),
+            ("What is the total mesh area?", [
+                ("execute_blender_code", {"code": "print(mesh_area)", "modifies_scene": False}, "42"),
+            ]),
+            ("Make the cube bigger.", [("modify_object", {"object_name": "Cube"}, "Error: no changes supplied.")]),
+        ]
+        for index, (prompt, calls) in enumerate(cases):
+            with self.subTest(prompt=prompt):
+                agent = SceneEditingAgent(calls=calls, stream_arguments=True)
+                value, state = context(f"read-only-{index}"), _State({})
+                value.activity.text = prompt
+                send = connector(value)
+                with patch.object(agent.main, "export_scene_as_glb_for_download") as export:
+                    await ab._run_turn(agent, value, state)
+                export.assert_not_called()
+                self.assertFalse(any(getattr(call.args[1], "text_format", None) == "extendedmarkdown"
+                                     for call in send.await_args_list))
+
+    async def test_requested_media_suppresses_widgets_even_after_edits_or_manual_exports(self):
+        import main
+        for name in ("get_viewport_screenshot", "render_preview", "render_final",
+                     "start_animation_render", "start_seedance_finish", "get_video_job_status"):
+            for manual in (False, True):
+                with self.subTest(tool=name, manual=manual):
+                    agent = SceneEditingAgent(manual_export=manual, calls=[
+                        ("execute_blender_code", {"code": "build_scene()"}, "Scene updated."),
+                        (name, {}, "![requested](https://assets.example/requested.png)"
+                         if name in main.ToolStatusMiddleware._IMAGE_TOOLS else "Requested media."),
+                    ])
+                    value, state = context(f"media-{name}-{manual}"), _State({})
+                    value.activity.text = "Create a castle and return an image or video, not a 3D scene."
+                    send = connector(value)
+                    with patch.object(agent.main, "export_scene_as_glb_for_download") as export:
+                        await ab._run_turn(agent, value, state)
+                    export.assert_not_called()
+                    self.assertFalse(state.conversation.get_value(widgets.STATE_KEY))
+                    self.assertFalse(any(getattr(call.args[1], "text_format", None) == "extendedmarkdown"
+                                         for call in send.await_args_list))
+                    if name in agent.main.ToolStatusMiddleware._IMAGE_TOOLS:
+                        self.assertTrue(any("![requested]" in (call.args[1].text or "")
+                                            for call in send.await_args_list))
+
+    async def test_explicit_show_scene_and_library_import_publish_widgets(self):
+        for name, calls in (
+            ("show", [("show_3d_scene", {}, "Scene preview requested.")]),
+            ("import", [
+                ("list_available_models", {}, "Model gallery."),
+                ("download_model", {"model_id": "castle"}, "Imported castle."),
+            ]),
+        ):
+            with self.subTest(name=name):
+                agent = SceneEditingAgent(calls=calls)
+                value, state = context(f"preview-{name}"), _State({})
+                value.activity.text = "Show me the 3D scene." if name == "show" else "Import a castle model."
+                send = connector(value)
+
+                def capture():
+                    widgets.record_export(EXPORT.blob, EXPORT.account, EXPORT.size, EXPORT.etag)
+                    return f"[Download GLB]({SAS})"
+
+                with patch.object(agent.main, "export_scene_as_glb_for_download", side_effect=capture) as export:
+                    await ab._run_turn(agent, value, state)
+                export.assert_called_once()
+                self.assertEqual(len(state.conversation.get_value(widgets.STATE_KEY)), 1)
+                self.assertEqual(sum(getattr(call.args[1], "text_format", None) == "extendedmarkdown"
+                                     for call in send.await_args_list), 1)
+
+    def test_explicit_screenshot_is_available_with_or_without_widgets(self):
+        import main
+        with tempfile.TemporaryDirectory() as temporary, patch.object(main, "_PERSISTENT_TMP", temporary), \
+             patch.object(main, "get_blender_connection") as connection, \
+             patch.object(main, "upload_image_to_blob", return_value="https://widgettest.blob.core.windows.net/screenshot.png"):
+            def capture(command, parameters):
+                self.assertEqual(command, "get_viewport_screenshot")
+                Path(parameters["filepath"]).write_bytes(b"screenshot")
+                return {"width": 800, "height": 450}
+
+            connection.return_value.send_command.side_effect = capture
+            for captured in (None, []):
+                token = widgets.exports.set(captured)
+                try:
+                    self.assertIn("![screenshot]", main.get_viewport_screenshot())
+                finally:
+                    widgets.exports.reset(token)
+            self.assertEqual(connection.return_value.send_command.call_count, 2)
+
+    def test_show_scene_defers_export_only_when_widgets_are_available(self):
+        import main
+        for captured in (None, []):
+            token = widgets.exports.set(captured)
+            try:
+                with patch.object(main, "export_scene_as_glb_for_download", return_value="Download scene.") as export:
+                    result = main.show_3d_scene()
+                if captured is None:
+                    export.assert_called_once()
+                    self.assertEqual(result, "Download scene.")
+                else:
+                    export.assert_not_called()
+                    self.assertIn("interactive widget", result)
+            finally:
+                widgets.exports.reset(token)
 
     async def test_registry_survives_recreating_durable_storage(self):
         from microsoft_agents.hosting.core.storage import StoreItem

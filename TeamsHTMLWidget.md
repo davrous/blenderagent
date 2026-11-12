@@ -23,11 +23,18 @@ Hors perimetre initial :
 - La voix, les connexions temps reel et l'edition de la scene dans le widget.
 - Un viewport Blender distant ou un rendu identique a Blender/Cycles.
 - L'exposition generique des outils Blender ou des actions payantes.
-- Un export GLB automatique apres chaque message.
 
 Le MVP est un viewer en lecture seule, propose lorsqu'un export GLB est
 disponible. Une future actualisation devra distinguer le renouvellement du lien
 d'un instantane existant de la creation d'un nouvel export Blender.
+
+Sur la branche **IgniteDemo**, ce parcours est etendu : dans une conversation
+Teams ou le widget est configure, le premier tour qui cree une scene publie
+automatiquement son GLB. Les modifications et inspections suivantes republient
+la scene finale du tour, sans demander « exporte le GLB ». Le widget initialise
+Babylon.js et charge le snapshot des que le handshake Teams aboutit, sans clic.
+Ce n'est pas une connexion temps reel a Blender : la navigation 3D est locale
+et chaque tour fournit un nouvel instantane en lecture seule.
 
 ## Etat de faisabilite au 9 novembre 2026
 
@@ -281,6 +288,11 @@ elle ne valide pas a elle seule les politiques du tenant.
 - Pas de **Download GLB** dans le widget : utiliser le lien deja publie dans
   la conversation.
 - Barre en bas a droite du canvas : recadrage, inspecteur Babylon et plein ecran.
+- Reglette de zoom en bas a gauche (boutons **Zoom out** / **Zoom in** et
+  curseur **Zoom level**), utile dans Teams ou la molette fait souvent defiler
+  la conversation. Echelle logarithmique entre la sphere englobante (diagonale/2)
+  et quatre fois la diagonale ; molette, pincement et clavier gardent les limites
+  completes et le curseur reste synchronise avec la camera.
   Le plein ecran utilise `ui/request-display-mode`, avec les modes `inline` et
   `fullscreen` declares a l'initialisation. Les changements du host sont suivis ;
   aucune notification de hauteur intrinsique n'est envoyee en plein ecran.
@@ -298,18 +310,19 @@ elle ne valide pas a elle seule les politiques du tenant.
 - Le cadrage utilise les bornes mondiales de la geometrie visible et les coins de
   chaque boite locale transformes dans le monde, le champ de vision et le ratio
   du canvas, avec une occupation cible
-  de 85 %. Les positions decalees et echelles tres petites ou grandes sont prises
+  de 95 %. Les positions decalees et echelles tres petites ou grandes sont prises
   en compte, ainsi que les plans de clipping. Un support horizontal quasiment
   plat (epaisseur <= 0,2 % de son etendue) est ignore pour le cadrage seulement
   s'il depasse quatre fois l'etendue du sujet non plat ; une scene uniquement
   plate reste cadree en entier.
 - Rotation douce d'environ deux degres par seconde au chargement, avec ajustement
-  du cadrage. Le premier clic/toucher sur le canvas, mouvement de molette, controle
-  clavier, recadrage ou ouverture de l'inspecteur l'arrete definitivement pour
-  ce chargement. Elle ne repart pas apres inactivite ou recadrage. Elle est
-  desactivee avec `prefers-reduced-motion` et suspendue hors ecran ou onglet cache.
-  Avant prise de controle, un redimensionnement recadre le modele ; apres, il
-  conserve le point de vue choisi par l'utilisateur.
+  du cadrage. Un clic/glisser/toucher sur le canvas, mouvement de molette,
+  controle clavier, reglette de zoom, recadrage ou ouverture de l'inspecteur la
+  met en pause. Apres 5 secondes sans interaction (inspecteur ferme), elle
+  reprend et la camera revient en douceur au cadrage plein ecran du modele. Elle
+  est desactivee avec `prefers-reduced-motion` et suspendue hors ecran ou onglet
+  cache. Avant prise de controle (ou apres reprise), un redimensionnement
+  recadre le modele ; pendant le controle, il conserve le point de vue choisi.
 
 Le JavaScript remet a niveau le contenu du viewer depuis le template embarque :
 les messages Teams deja envoyes et le bootstrap de l'agent version 18 beneficient
@@ -327,11 +340,27 @@ garantit pas la reouverture d'anciens widgets apres redemarrage.
 
 Seul `upload_glb_to_blob` peut enregistrer un export dans le contexte du tour.
 Une URL ecrite par le modele n'enregistre aucun widget. Le dernier export du tour
-donne un widget ; il n'y a pas d'export supplementaire ou automatique.
+donne un widget. Sur IgniteDemo, le middleware effectue l'export final apres les
+outils de scene, meme si le modele n'a pas appele l'outil d'export. Un export
+explicite deja effectue apres les derniers changements est reutilise, sans doublon.
+Les questions sans modification, les lectures `get_scene_info` / `get_object_info`
+et les listes de modeles ou textures ne declenchent aucun export automatique.
+Les requetes Python de lecture utilisent `execute_blender_code(modifies_scene=False)`.
+Une demande explicite comme « show me the 3D scene » appelle `show_3d_scene`
+et publie le snapshot courant, meme sans modification.
 
-La reponse habituelle, ses images et son lien GLB restent inchanges. Le widget
+Dans ce mode Teams, les apercus viewport automatiques sont remplaces par la
+scene 3D ; le prompt du canal ne demande plus de screenshot final ni de rendu
+image par defaut. Une demande explicite d'image, de screenshot ou de video utilise
+les outils media habituels et ne publie pas de widget, meme apres des modifications
+de scene ou un export GLB dans le meme tour. Les liens de telechargement restent
+disponibles. Les autres canaux et le mode widget
+desactive conservent leurs apercus habituels. Un echec d'export est signale sans
+publier un widget fictif. Le widget
 arrive ensuite dans une **activite distincte**, `extendedmarkdown`, jamais dans
 un flux natif ouvert. Les pastilles conservent donc leur cycle actuel.
+Le chargement est automatique ; **Reload scene** permet de retenter apres une
+erreur reseau ou de renouveler l'acces au meme snapshot, pas de reexporter Blender.
 
 ### Activation et deploiement
 
@@ -367,8 +396,10 @@ un flux natif ouvert. Les pastilles conservent donc leur cycle actuel.
    changement global vers Bot API Canary n'est ajoute. Si la politique Teams
    exige une entree `validDomains`, ajouter le hostname HTTPS choisi au package ;
    cela ne remplace ni CSP ni CORS.
-8. Demander explicitement un export GLB dans Teams, puis tester d'abord
-   **Check connection**, ensuite **Load scene**, en personnel, groupe et thread.
+8. Demander la creation d'une scene dans Teams : verifier que le widget apparait
+   des le premier tour et ouvre automatiquement la 3D. Modifier ensuite la scene
+   et verifier le nouveau snapshot. Tester aussi **Check connection** et
+   **Reload scene** en personnel, groupe et thread.
    Deux exports successifs doivent produire deux instantanes independants.
 
 Sans URL d'assets, la fonctionnalite est desactivee : les parcours actuels
@@ -413,6 +444,10 @@ swa deploy $output --env production --no-use-keychain
 Remove-Item Env:\SWA_CLI_DEPLOYMENT_TOKEN
 ```
 
+Sous Node 22.12, la CLI SWA 2.0.6 echoue avec `ERR_REQUIRE_CYCLE_MODULE` (une
+dependance transitive est ESM uniquement) ; l'executer avec Node 24, par exemple
+`npx -y node@24 <chemin>/@azure/static-web-apps-cli/dist/cli/bin.js deploy ...`.
+
 Le dossier de sortie doit etre vide. **Ne pas executer `swa deploy` depuis ce
 dossier ou un de ses sous-dossiers** : le client natif le refuse. La version
 2.0.6 du wrapper peut alors retourner zero malgre l'echec ; verifier
@@ -425,16 +460,24 @@ ou d'API dont il faudrait configurer `AGENT_FOUNDRY_URL`, un secret ou une
 identite managee. Le bootstrap HTML reste embarque dans le conteneur de l'agent
 et envoye directement dans son message Teams.
 
-La refonte **3D viewer** a ete publiee le 10 novembre 2026 dans l'environnement
+La refonte **3D viewer**, puis le chargement automatique du snapshot
+**IgniteDemo**, ont ete publies le 10 novembre 2026 dans l'environnement
 `production` de ce meme site. Aucune ressource, permission Blob, configuration
 Foundry, version d'agent ou modification du manifest n'a ete necessaire.
-Les trois fichiers servis correspondent exactement au build valide :
+Le player avec reglette de zoom, cadrage a 95 % et reprise de la rotation apres
+5 secondes a ete republie le 12 novembre 2026 dans ce meme environnement. Les
+trois fichiers servis correspondent exactement au build valide :
 
 | Asset | SHA-256 |
 |---|---|
-| `widget.js` | `39cf1175494e938b1b0290cea035c30eaede3da8878e6cc7f63fb17fd6873de8` |
-| `widget.css` | `0c30b066ca34bf3cb674ea7097e6be78d66ff0c1671394758566ff93356bd6f5` |
+| `widget.js` | `94f4dae7a455eaf036c9f2ca1a84af57d87ef94db30d5979f08367728528226e` |
+| `widget.css` | `7855f5fd66b3237309e71902caa915a2ccee3156cf7cbb0f97b1d616cf258857` |
 | `studio_small_09_1k.hdr` | `e7cfda5f4e98e623db12b8bfd0184e048488e4855d9c83e2751fb44a32e80c45` |
+
+Cette republication des assets active l'ouverture automatique dans les widgets
+existants apres rechargement. Elle ne deploie pas le code Python IgniteDemo :
+l'export GLB automatique apres chaque tour necessite encore le redeploiement de
+l'agent. Le bouton **Reload scene** ne cree pas de nouvel export Blender.
 
 La sante, les types MIME, le CORS exact et le cache ont ete controles sur les URL
 publiees, y compris `no-store` sur la reponse HDR partielle `206`. Le smoke test
@@ -450,7 +493,7 @@ regles existantes. Les prevols des assets et du Blob passent, les types MIME et
 les SHA-256 des trois fichiers publies correspondent au build local, et les
 routes `/api/chat`, `/api/blob` et `/.env` ne sont pas exposees.
 
-Si **Check connection** fonctionne mais **Load scene** affiche `Failed to fetch`,
+Si **Check connection** fonctionne mais le chargement automatique ou **Reload scene** affiche `Failed to fetch`,
 cela ne prouve pas une panne de l'invoke : les telechargements HTTP du GLB et
 du HDR sont des etapes distinctes. La configuration initiale hachait le GUID
 seul et autorisait donc une autre origine. Les deux services doivent autoriser
@@ -458,7 +501,7 @@ l'origine du MRI ci-dessus : le Blob pour le GLB, Static Web Apps pour le HDR.
 Les scripts classiques et la feuille de style peuvent se charger malgre cette
 erreur CORS, ce qui explique pourquoi l'interface et le ping fonctionnaient.
 Ce correctif ne change ni l'HTML deja envoye, ni l'agent version 18, ni le
-manifest Teams ; reessayer **Load scene** dans le widget existant suffit.
+manifest Teams ; reessayer **Reload scene** dans le widget existant suffit.
 Si le navigateur conserve encore les anciens assets en cache, suivre le
 diagnostic HDR ci-dessous avant de reessayer.
 Apres correction, le navigateur telecharge le GLB original et le HDR avec HTTP
@@ -477,7 +520,8 @@ le meme chemin, pour contourner cette ancienne entree. Le serveur renvoie
 `Cache-Control: no-store` pour le HDR et `no-cache, must-revalidate` pour les
 scripts et styles aux noms stables. Aucun fallback silencieux d'eclairage n'est
 ajoute. Apres cette mise a jour, **recharger Teams avec Ctrl+Maj+R** pour
-remplacer l'ancien JavaScript deja en cache, puis cliquer **Load scene**.
+remplacer l'ancien JavaScript deja en cache ; le chargement est automatique,
+avec **Reload scene** disponible pour retenter.
 Ni nouveau manifest ni nouveau deploiement de l'agent ne sont necessaires.
 
 La fixture `node devTools/test_teams_widget.mjs --serve` permet de reproduire le
@@ -507,7 +551,7 @@ Un smoke test Responses sur la version 18 active a repondu `OK` dans une session
 isolee, supprimee ensuite. Aucun export, rendu, appel payant video ou conversation
 Teams existante n'a ete utilise pour ce test. Il ne valide pas les invokes du
 widget dans le client Teams : installer la mise a jour du package `1.1.1`,
-demander un nouvel export GLB et utiliser **Check connection**, puis **Load scene**.
+demander un nouvel export GLB et utiliser **Check connection**, puis **Reload scene**.
 
 ### Acces, limites et repli
 

@@ -12,7 +12,7 @@ const require = createRequire(new URL("../webchat/package.json", import.meta.url
 const { register } = await import(pathToFileURL(require.resolve("tsx/esm/api")).href);
 register();
 const { WidgetBridge, reportHeight } = await import("../webchat/client/widget/bridge.ts");
-const { validateGlb, fetchGlb, freshEnvironmentUrl, modelBounds, cameraFrame, SceneViewer } = await import("../webchat/client/widget/viewer.ts");
+const { validateGlb, fetchGlb, freshEnvironmentUrl, modelBounds, cameraFrame, SceneViewer, zoomLevel, zoomRadius, FRAME_FILL } = await import("../webchat/client/widget/viewer.ts");
 const { NullEngine } = await import(pathToFileURL(require.resolve("@babylonjs/core/Engines/nullEngine.js")).href);
 const { Scene } = await import(pathToFileURL(require.resolve("@babylonjs/core/scene.js")).href);
 const { MeshBuilder } = await import(pathToFileURL(require.resolve("@babylonjs/core/Meshes/meshBuilder.js")).href);
@@ -194,10 +194,10 @@ for (const aspect of [0.5, 1, 2.5]) {
           const world = Vector3.TransformCoordinates(Vector3.FromArray(vertices, index), mesh.getWorldMatrix());
           const point = Vector3.TransformCoordinates(world, matrix);
           occupancy = Math.max(occupancy, Math.abs(point.x), Math.abs(point.y));
-          assert.ok(Math.abs(point.x) <= 0.856 && Math.abs(point.y) <= 0.856, "Every model vertex fits with a margin.");
+          assert.ok(Math.abs(point.x) <= FRAME_FILL + 0.006 && Math.abs(point.y) <= FRAME_FILL + 0.006, "Every model vertex fits with a margin.");
           assert.ok(point.z > 0 && point.z < 1, "The model fits between the clipping planes.");
         }
-        assert.ok(occupancy > 0.83, "The fitted model fills the viewport instead of remaining distant.");
+        assert.ok(occupancy > FRAME_FILL - 0.02, "The fitted model fills the viewport instead of remaining distant.");
         camera.dispose();
       }
       scene.dispose();
@@ -230,6 +230,16 @@ retryBridge.dispose();
 await assert.rejects(closing, /closed/);
 
 validateGlb(arrayBuffer(cube));
+assert.equal(zoomRadius(0, 0.01, 100), 100);
+assert.ok(Math.abs(zoomRadius(1, 0.01, 100) - 0.01) < 1e-9);
+assert.ok(Math.abs(zoomRadius(0.5, 0.01, 100) - 1) < 1e-9, "The zoom slider is logarithmic.");
+assert.equal(zoomRadius(5, 0.01, 100), zoomRadius(1, 0.01, 100));
+assert.equal(zoomRadius(Number.NaN, 0.01, 100), 100);
+for (const level of [0, 0.25, 0.5, 0.9, 1]) {
+  assert.ok(Math.abs(zoomLevel(zoomRadius(level, 0.01, 100), 0.01, 100) - level) < 1e-9);
+}
+assert.equal(zoomLevel(1000, 0.01, 100), 0);
+assert.equal(zoomLevel(0.001, 0.01, 100), 1);
 const environmentSource = "https://assets.example/studio.hdr?revision=1";
 const firstEnvironment = new URL(freshEnvironmentUrl(environmentSource));
 const nextEnvironment = new URL(freshEnvironmentUrl(environmentSource));
@@ -322,8 +332,10 @@ try {
 
 const template = await readFile(new URL("../webchat/client/widget/widget.html", import.meta.url), "utf8");
 assert.match(template, /<h2>3D viewer<\/h2>/);
+assert.match(template, /id="load"[^>]*>Reload scene<\/button>/);
+assert.match(template, /Loading your 3D scene automatically/);
 assert.doesNotMatch(template, /id="download"|Download GLB/);
-for (const label of ["Check connection", "Reset view", "Show Babylon inspector", "Enter full screen"]) {
+for (const label of ["Check connection", "Reset view", "Show Babylon inspector", "Enter full screen", "Zoom out", "Zoom level", "Zoom in"]) {
   assert.ok(template.includes(`aria-label="${label}"`), `The ${label} icon needs an accessible name.`);
 }
 assert.match(template, /aria-controls="viewer-inspector"/);

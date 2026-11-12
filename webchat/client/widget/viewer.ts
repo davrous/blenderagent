@@ -10,6 +10,8 @@ import "@babylonjs/loaders/glTF";
 import "@babylonjs/core/Helpers/sceneHelpers";
 
 export const MAX_GLB_BYTES = 200 * 1024 * 1024;
+export const FRAME_FILL = 0.95;
+export const IDLE_ROTATE_MS = 5000;
 type Bounds = { min: Vector3; max: Vector3; corners: readonly Vector3[] };
 
 export function modelBounds(meshes: readonly AbstractMesh[]): Bounds {
@@ -46,7 +48,7 @@ export function cameraFrame(bounds: Bounds, alpha: number, beta: number, fov: nu
   const direction = new Vector3(Math.cos(alpha) * Math.sin(beta), Math.cos(beta), Math.sin(alpha) * Math.sin(beta));
   const right = Vector3.Cross(Vector3.Up(), direction).normalize();
   const up = Vector3.Cross(direction, right).normalize();
-  const vertical = Math.tan(fov / 2) * 0.85, horizontal = vertical * aspect;
+  const vertical = Math.tan(fov / 2) * FRAME_FILL, horizontal = vertical * aspect;
   const diagonal = Vector3.Distance(bounds.min, bounds.max);
   let radius = Math.max(diagonal * 0.001, 1e-10);
   for (const corner of bounds.corners) {
@@ -63,6 +65,17 @@ export function freshEnvironmentUrl(source: string): string {
   // Existing widget frames can retain a truncated HDR response in their HTTP cache.
   url.searchParams.set("widget-load", crypto.randomUUID());
   return url.href;
+}
+
+// Logarithmic mapping so each slider step changes the distance by the same ratio.
+export function zoomLevel(radius: number, lower: number, upper: number): number {
+  if (!(lower > 0 && upper > lower && radius > 0)) return 0;
+  return Math.min(1, Math.max(0, Math.log(upper / radius) / Math.log(upper / lower)));
+}
+
+export function zoomRadius(level: number, lower: number, upper: number): number {
+  const clamped = Math.min(1, Math.max(0, Number.isFinite(level) ? level : 0));
+  return upper * Math.pow(lower / upper, clamped);
 }
 
 export function validateGlb(bytes: ArrayBuffer): void {
@@ -133,6 +146,7 @@ export class SceneViewer {
   private engine: Engine;
   private scene: Scene;
   private camera?: ArcRotateCamera;
+  private zoomRange?: { near: number; far: number };
   private resize: ResizeObserver;
   private intersection: IntersectionObserver;
   private visible = true;
@@ -143,10 +157,12 @@ export class SceneViewer {
   private bounds?: Bounds;
   private autoRotate = !this.reducedMotion;
   private userControlled = false;
+  private easing = false;
+  private idleTimer?: ReturnType<typeof setTimeout>;
   private inspector?: typeof import("@babylonjs/inspector").Inspector;
   private inspectorVisible = false;
 
-  constructor(private canvas: HTMLCanvasElement, onLost: () => void) {
+  constructor(private canvas: HTMLCanvasElement, onLost: () => void, private onZoom?: (level: number) => void) {
     this.engine = new Engine(canvas, true, {
       stencil: true, premultipliedAlpha: false, useHighPrecisionMatrix: true,
     });
@@ -167,14 +183,14 @@ export class SceneViewer {
     this.engine.onContextLostObservable.add(() => { this.engine.stopRenderLoop(); onLost(); });
     document.addEventListener("visibilitychange", this.visibility);
     canvas.addEventListener("pointerdown", this.interact);
-    canvas.addEventListener("pointermove", this.wake);
+    canvas.addEventListener("pointermove", this.pointerMove);
     canvas.addEventListener("wheel", this.interact, { passive: true });
     canvas.addEventListener("keydown", this.key);
   }
 
   async load(bytes: ArrayBuffer, environmentUrl: string, signal: AbortSignal): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const abort = () => reject(new Error("Loading timed out or the viewer was closed. Load scene again to retry."));
+      const abort = () => reject(new Error("Loading timed out or the viewer was closed. Use Reload scene to retry."));
       if (signal.aborted) { abort(); return; }
       signal.addEventListener("abort", abort, { once: true });
       this.loadScene(bytes, environmentUrl).then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
@@ -202,28 +218,34 @@ export class SceneViewer {
     const diagonal = Math.max(Vector3.Distance(this.bounds.min, this.bounds.max), 1e-8);
     camera.lowerRadiusLimit = diagonal / 1000;
     camera.upperRadiusLimit = diagonal * 20;
+    // The slider stays outside the bounding sphere; wheel, pinch and keys keep the full limits.
+    this.zoomRange = { near: diagonal / 2, far: diagonal * 4 };
     camera.wheelDeltaPercentage = camera.pinchDeltaPercentage = 0.01;
     if (this.reducedMotion) camera.inertia = camera.panningInertia = 0;
     camera.attachControl(this.canvas, true);
     // Widget keyboard controls below avoid duplicate Babylon arrow handling.
     camera.inputs.removeByType("ArcRotateCameraKeyboardMoveInput");
+    camera.onViewMatrixChangedObservable.add(() => this.onZoom?.(this.zoom));
     this.scene.animationGroups.forEach((group) => group.stop());
     this.scene.createDefaultSkybox(environment, true, (camera.maxZ - camera.minZ) / 2, 0.3, false);
     this.initial = { alpha: camera.alpha, beta: camera.beta };
+    this.onZoom?.(this.zoom);
     this.wake();
   }
 
-  private fit() {
+  private fit(blend = 1) {
     if (!this.camera || !this.bounds) return;
     const frame = cameraFrame(this.bounds, this.camera.alpha, this.camera.beta, this.camera.fov, this.engine.getAspectRatio(this.camera));
-    const { alpha, beta } = this.camera;
-    this.camera.setTarget(frame.target);
+    const { alpha, beta, radius } = this.camera;
+    this.camera.setTarget(blend >= 1 ? frame.target : Vector3.Lerp(this.camera.target, frame.target, blend));
     this.camera.alpha = alpha;
     this.camera.beta = beta;
-    this.camera.radius = frame.radius;
+    this.camera.radius = radius + (frame.radius - radius) * Math.min(blend, 1);
     this.camera.minZ = frame.minZ;
     this.camera.maxZ = frame.maxZ;
     this.camera.pinchPrecision = 200 / frame.radius;
+    if (Math.abs(this.camera.radius - frame.radius) <= frame.radius * 1e-3
+      && Vector3.Distance(this.camera.target, frame.target) <= frame.radius * 1e-3) this.easing = false;
   }
 
   async toggleInspector(host: HTMLElement): Promise<boolean> {
@@ -239,6 +261,21 @@ export class SceneViewer {
     this.inspectorVisible = !this.inspectorVisible;
     this.wake();
     return this.inspectorVisible;
+  }
+
+  get zoom(): number {
+    const { camera, zoomRange } = this;
+    if (!camera || !zoomRange) return 0;
+    return zoomLevel(camera.radius, zoomRange.near, zoomRange.far);
+  }
+
+  setZoom(level: number) {
+    const { camera, zoomRange } = this;
+    if (!camera || !zoomRange) return;
+    this.interact();
+    camera.inertialRadiusOffset = 0;
+    camera.radius = zoomRadius(level, zoomRange.near, zoomRange.far);
+    this.wake();
   }
 
   reset() {
@@ -286,8 +323,10 @@ export class SceneViewer {
     }
     if (this.camera) {
       if (this.autoRotate) {
-        this.camera.alpha += Math.PI / 90 * Math.min(this.engine.getDeltaTime() / 1000, 0.05);
-        this.fit();
+        const seconds = Math.min(this.engine.getDeltaTime() / 1000, 0.05);
+        this.camera.alpha += Math.PI / 90 * seconds;
+        // After idle, glide back to the full-frame view instead of snapping.
+        this.fit(this.easing ? 1 - Math.exp(-seconds * 2.5) : 1);
       }
       this.camera.panningSensibility = 5000 / this.camera.radius;
       this.camera.speed = this.camera.radius * 0.2;
@@ -297,7 +336,26 @@ export class SceneViewer {
 
   private interact = () => {
     this.autoRotate = false;
+    this.easing = false;
     this.userControlled = true;
+    clearTimeout(this.idleTimer);
+    if (!this.reducedMotion && !this.disposed) this.idleTimer = setTimeout(this.resumeRotation, IDLE_ROTATE_MS);
+    this.wake();
+  };
+
+  private pointerMove = (event: PointerEvent) => {
+    if (event.buttons) this.interact(); else this.wake();
+  };
+
+  private resumeRotation = () => {
+    const camera = this.camera;
+    if (this.disposed || !camera) return;
+    if (this.inspectorVisible) { this.interact(); return; }
+    camera.inertialAlphaOffset = camera.inertialBetaOffset = camera.inertialRadiusOffset = 0;
+    camera.inertialPanningX = camera.inertialPanningY = 0;
+    this.userControlled = false;
+    this.easing = true;
+    this.autoRotate = true;
     this.wake();
   };
 
@@ -309,11 +367,12 @@ export class SceneViewer {
 
   dispose() {
     this.disposed = true;
+    clearTimeout(this.idleTimer);
     this.resize.disconnect();
     this.intersection.disconnect();
     document.removeEventListener("visibilitychange", this.visibility);
     this.canvas.removeEventListener("pointerdown", this.interact);
-    this.canvas.removeEventListener("pointermove", this.wake);
+    this.canvas.removeEventListener("pointermove", this.pointerMove);
     this.canvas.removeEventListener("wheel", this.interact);
     this.canvas.removeEventListener("keydown", this.key);
     this.engine.stopRenderLoop();

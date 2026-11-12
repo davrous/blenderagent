@@ -13,6 +13,9 @@ document.title = "3D viewer";
 const canvas = document.getElementById("scene");
 const load = document.getElementById("load");
 const reset = document.getElementById("reset");
+const zoom = document.getElementById("zoom");
+const zoomIn = document.getElementById("zoom-in");
+const zoomOut = document.getElementById("zoom-out");
 const ping = document.getElementById("ping");
 const fullscreen = document.getElementById("fullscreen");
 const inspector = document.getElementById("inspector");
@@ -24,6 +27,8 @@ if (!(root instanceof HTMLElement) || !(canvas instanceof HTMLCanvasElement)
   || !(load instanceof HTMLButtonElement) || !(reset instanceof HTMLButtonElement)
   || !(ping instanceof HTMLButtonElement) || !(fullscreen instanceof HTMLButtonElement)
   || !(inspector instanceof HTMLButtonElement) || !(inspectorHost instanceof HTMLElement)
+  || !(zoom instanceof HTMLInputElement) || !(zoomIn instanceof HTMLButtonElement)
+  || !(zoomOut instanceof HTMLButtonElement)
   || !status || !error || !placeholder) {
   throw new Error("The scene widget document is incomplete.");
 }
@@ -37,6 +42,18 @@ let busy = false;
 let initialized = false;
 let fullscreenSupported = true;
 let switchingDisplayMode = false;
+const ZOOM_STEPS = 1000;
+
+const viewControls = (enabled: boolean) => {
+  reset.disabled = inspector.disabled = !enabled;
+  zoom.disabled = zoomIn.disabled = zoomOut.disabled = !enabled;
+};
+
+const showZoom = (level: number) => {
+  const value = String(Math.round(level * ZOOM_STEPS));
+  if (zoom.value !== value) zoom.value = value;
+  zoom.setAttribute("aria-valuetext", `${Math.round(level * 100)}%`);
+};
 
 function showError(message: string) {
   error!.textContent = message;
@@ -85,9 +102,9 @@ async function connect() {
 async function boot() {
   try {
     await connect();
-    if (!disposed && !busy && !viewer) status!.textContent = "Ready. Load the snapshot to explore it.";
+    if (!disposed && !viewer) await loadScene();
   } catch {
-    if (!disposed) showError("Could not connect to Teams. Use Check connection or Load scene to retry.");
+    if (!disposed) showError("Could not connect to Teams. Use Check connection or Reload scene to retry.");
   }
 }
 
@@ -101,11 +118,11 @@ function config() {
   return { id: data.id, storageOrigin: data.storageOrigin, environmentUrl: data.environmentUrl };
 }
 
-load.addEventListener("click", async () => {
+const loadScene = async () => {
   if (busy || disposed) return;
   busy = true;
   load.disabled = ping.disabled = true;
-  reset.disabled = inspector.disabled = true;
+  viewControls(false);
   inspectorState(false);
   error.hidden = true;
   placeholder.hidden = false;
@@ -132,14 +149,14 @@ load.addEventListener("click", async () => {
     status.textContent = "Preparing 3D geometry and lighting...";
     viewer = new SceneViewer(canvas, () => {
       if (!disposed) {
-        reset.disabled = inspector.disabled = true;
-        showError("The graphics context was lost. Load scene again to recreate the viewer, or download the GLB.");
+        viewControls(false);
+        showError("The graphics context was lost. Reload scene to recreate the viewer, or download the GLB.");
       }
-    });
+    }, showZoom);
     await viewer.load(bytes, settings.environmentUrl, controller.signal);
     if (disposed) return;
     placeholder.hidden = true;
-    reset.disabled = inspector.disabled = false;
+    viewControls(true);
     load.textContent = "Reload scene";
     status.textContent = "Scene ready. This is the exported snapshot, not a live Blender viewport.";
   } catch (reason) {
@@ -154,9 +171,14 @@ load.addEventListener("click", async () => {
     busy = false;
     if (!disposed) load.disabled = ping.disabled = false;
   }
-});
+};
+
+load.addEventListener("click", () => { void loadScene(); });
 
 reset.addEventListener("click", () => { viewer?.reset(); canvas.focus(); });
+zoom.addEventListener("input", () => { viewer?.setZoom(Number(zoom.value) / ZOOM_STEPS); });
+zoomIn.addEventListener("click", () => { if (viewer) viewer.setZoom(viewer.zoom + 0.05); });
+zoomOut.addEventListener("click", () => { if (viewer) viewer.setZoom(viewer.zoom - 0.05); });
 fullscreen.addEventListener("click", async () => {
   if (switchingDisplayMode || disposed) return;
   switchingDisplayMode = true;
@@ -196,7 +218,7 @@ ping.addEventListener("click", async () => {
   try {
     await connect();
     await bridge.call("scene_widget_ping", config().id);
-    if (!disposed) status.textContent = "Teams and the agent are connected. Load scene when ready.";
+    if (!disposed) status.textContent = "Teams and the agent are connected.";
   } catch (reason) {
     if (!disposed) showError(reason instanceof Error ? reason.message.slice(0, 300) : "The connection check failed.");
   } finally {

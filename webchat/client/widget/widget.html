@@ -13,12 +13,17 @@
         <svg class="brand-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m12 2 9 5v10l-9 5-9-5V7Z M3 7l9 5 9-5 M12 12v10"/></svg>
         <div><h2>3D viewer</h2><span class="badge">Read-only snapshot</span></div>
       </div>
-      <button id="load" class="primary" type="button">Load scene</button>
+      <button id="load" class="primary" type="button">Reload scene</button>
     </header>
     <p id="status" role="status" aria-live="polite">Connecting to Teams...</p>
     <div class="viewport">
       <canvas id="scene" tabindex="0" aria-label="3D scene. Arrow keys rotate, plus and minus zoom, Shift and arrow keys pan."></canvas>
-      <div id="placeholder"><span class="placeholder-orbit" aria-hidden="true"></span><p>Your scene, from every angle.</p><span>Load the snapshot to start exploring.</span></div>
+      <div id="placeholder"><span class="placeholder-orbit" aria-hidden="true"></span><p>Your scene, from every angle.</p><span>Loading your 3D scene automatically...</span></div>
+      <div class="zoom-tools" role="group" aria-label="Zoom">
+        <button id="zoom-out" class="icon-button" type="button" aria-label="Zoom out" title="Zoom out" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M5 12h14"/></svg></button>
+        <input id="zoom" type="range" min="0" max="1000" step="1" value="0" aria-label="Zoom level" title="Drag to zoom in or out" disabled>
+        <button id="zoom-in" class="icon-button" type="button" aria-label="Zoom in" title="Zoom in" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M5 12h14M12 5v14"/></svg></button>
+      </div>
       <div class="canvas-tools" role="group" aria-label="Viewer controls">
         <button id="reset" class="icon-button" type="button" aria-label="Reset view" title="Reframe the model" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="6"/><path d="M12 2v5m0 10v5M2 12h5m10 0h5"/></svg></button>
         <button id="inspector" class="icon-button" type="button" aria-label="Show Babylon inspector" title="Inspect this local scene" aria-pressed="false" aria-expanded="false" aria-controls="viewer-inspector" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M5 3v18M12 3v18M19 3v18"/><path d="M2 8h6v4H2zm7 6h6v4H9zm7-9h6v4h-6z" fill="currentColor" stroke="none"/></svg></button>
@@ -27,7 +32,7 @@
     </div>
     <section id="viewer-inspector" aria-label="Babylon inspector" hidden></section>
     <footer>
-      <p class="help">Drag to orbit &middot; Scroll to zoom &middot; Right-drag to pan</p>
+      <p class="help">Drag to orbit &middot; Use the slider to zoom &middot; Right-drag to pan</p>
       <button id="ping" class="icon-button connection-button" type="button" aria-label="Check connection" title="Check Teams-agent connection (diagnostic only)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M8 3v5m8-5v5M6 8h12v3a6 6 0 0 1-12 0Zm6 9v4"/></svg></button>
     </footer>
     <p id="error" role="alert" hidden></p>

@@ -592,6 +592,8 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                 epoch = slot.epoch
                 history = _load_history(state, slot)
                 messages = [
+                    *([Message(role="system", contents=[Content.from_text(widgets.SCENE_PREVIEW_INSTRUCTIONS)])]
+                      if widget_config else []),
                     *(
                         Message(role=entry["role"], contents=[Content.from_text(entry["text"])])
                         for entry in history
@@ -610,7 +612,7 @@ async def _run_turn(agent: Any, context: Any, state: Any) -> None:
                         is_status = message_id.startswith(_STATUS_PREFIXES)
                         is_error = message_id in _ERROR_MESSAGE_IDS
                         has_tool_call = any(content.type == "function_call" for content in update.contents or [])
-                        if native_status and (has_tool_call or is_status or is_tool_media or is_error):
+                        if native_status and (has_tool_call or is_status or is_tool_media or is_error) and message_id != "tool-link-teams-preview":
                             # Only terminal model prose belongs in the final reply.
                             # Keep pre-tool commentary in history, not in Teams.
                             pending_model_parts.clear()

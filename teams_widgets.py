@@ -24,6 +24,25 @@ MAX_WIDGETS = 32
 MAX_GLB_BYTES = 200 * 1024 * 1024
 INVOKE_NAME = "htmlwidget/calltool"
 _TEMPLATE = Path(__file__).parent / "webchat" / "client" / "widget" / "widget.html"
+SCENE_PREVIEW_INSTRUCTIONS = (
+    "For THIS Teams turn, the default visual reply is an interactive Babylon.js 3D scene, "
+    "NOT a screenshot or a rendered image. This overrides the normal final-screenshot rule. "
+    "Only build or modify the scene when the user asks for changes, then briefly describe the result. "
+    "After successful scene edits, the runtime automatically exports the finished scene as GLB and publishes its HTML widget; "
+    "do not ask the user to request a GLB, click Load scene, or approve a preview. "
+    "Do not call get_viewport_screenshot, render_preview or render_final just to show a scene edit. "
+    "If the user explicitly asks for an image, screenshot or video, use the corresponding media tools "
+    "and return that media instead of a 3D widget, even if you also edit the scene. "
+    "For model/texture listings or questions without scene changes, return only the gallery or answer; "
+    "do not call screenshot, export or show_3d_scene tools to illustrate those replies. "
+    "For read-only execute_blender_code queries, set modifies_scene=False. "
+    "If the user explicitly asks to see the 3D scene (for example 'show me the 3D scene'), "
+    "call show_3d_scene even when no scene changes are needed. "
+    "Do not call export_scene_as_glb_for_download unless the user specifically asks for an export: "
+    "the automatic preview already provides a downloadable GLB. Never fabricate widget HTML or URLs. "
+    "The widget renders an exported snapshot interactively, not a live connection to Blender; "
+    "each subsequent scene edit publishes a new snapshot unless another output was requested."
+)
 
 
 class WidgetError(ValueError):
@@ -106,7 +125,7 @@ def markdown(widget_id: str, config: WidgetConfig) -> str:
     document = document.replace("__ASSET_BASE__", html.escape(config.assets, quote=True))
     payload = {
         "type": "widget/mcp-ui", "name": "Blender scene",
-        "description": "Explore this exported Blender scene in 3D. Read-only snapshot.",
+        "description": "Automatically loads this exported Blender scene in 3D. Read-only snapshot.",
         "domain": config.asset_origin, "correlationId": widget_id, "html": document,
         "securityPolicy": {
             "connectDomains": [config.asset_origin, config.storage_origin],

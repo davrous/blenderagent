@@ -22,7 +22,7 @@ To see what the agent can do, watch this video:
 
 - **Create 3D objects**: Cubes, spheres, cylinders, cones, torus, planes, monkeys
 - **Apply materials**: Hex colors with metallic/roughness control
-- **3D model library** — the agent can search Microsoft's public 3D-model service (`list_available_models`) and return a clickable thumbnail gallery in the chat. Click a thumbnail (or ask in natural language) and the agent imports that GLB into the Blender scene (`download_model`) and screenshots the result.
+- **3D model library** — the agent can search Microsoft's public 3D-model service (`list_available_models`) and return a clickable thumbnail gallery in the chat. Click a thumbnail (or ask in natural language) and the agent imports that GLB into the Blender scene (`download_model`). On IgniteDemo, widget-enabled Teams publishes an automatically loaded interactive GLB preview; other channels retain the viewport screenshot.
 - **Poly Haven textures** — the agent can search [Poly Haven](https://polyhaven.com/) for free PBR surface textures (`list_available_textures`) and return a clickable gallery; pick one and name an object and it applies the texture as a material (`apply_texture`).
 - **Viewport screenshots**: Capture the current viewport and return a Blob-hosted PNG preview
 - **Full render**: Render scenes with EEVEE or Cycles engines
@@ -686,8 +686,9 @@ and `node devTools/test_video_webchat.mjs`.
 | `modify_object` | Change location, rotation, or scale |
 | `delete_object` | Remove an object from the scene |
 | `apply_material` | Apply a colored material with metallic/roughness |
-| `execute_blender_code` | Run arbitrary Python code in Blender |
+| `execute_blender_code` | Run arbitrary Python code in Blender; set `modifies_scene=False` for read-only queries |
 | `get_viewport_screenshot` | Capture the 3D viewport as PNG |
+| `show_3d_scene` | Explicitly show the current scene in the Teams 3D widget, or return a GLB download on other channels |
 | `list_available_models` | Search Microsoft's 3D-model library (returns a clickable gallery) |
 | `download_model` | Import a chosen GLB model from the library into the scene |
 | `list_available_textures` | Search Poly Haven for free PBR textures (returns a clickable gallery) |

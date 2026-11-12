@@ -732,6 +732,9 @@ def execute_blender_code(
         str,
         "Python code to execute in Blender. Has access to 'bpy' module. Break complex operations into smaller steps.",
     ],
+    modifies_scene: Annotated[
+        bool, "False for read-only inspection or calculations; True when this code changes the Blender scene.",
+    ] = True,
 ) -> str:
     """
     Execute arbitrary Python code inside Blender.
@@ -739,7 +742,7 @@ def execute_blender_code(
     Use this for complex operations not covered by other tools.
     Break large operations into smaller steps for reliability.
     """
-    logger.info("Tool called: execute_blender_code (code length=%d)", len(code))
+    logger.info("Tool called: execute_blender_code (code length=%d, modifies_scene=%s)", len(code), modifies_scene)
     logger.debug("execute_blender_code code:\n%s", code)
 
     # ── Blender 4.x compatibility patches (defense-in-depth) ──
@@ -871,6 +874,16 @@ def get_viewport_screenshot(
     except Exception as e:
         logger.error("get_viewport_screenshot failed", exc_info=True)
         return f"Error capturing screenshot: {str(e)}"
+
+
+@tool(approval_mode="never_require")
+def show_3d_scene() -> str:
+    """Show the current interactive 3D scene when explicitly requested, without modifying it."""
+    from teams_widgets import exports
+
+    if exports.get() is not None:
+        return "The current 3D scene will be published as an interactive widget at the end of this turn."
+    return export_scene_as_glb_for_download()
 
 
 # ──────────────────────────────────────────────
@@ -1543,7 +1556,8 @@ def export_scene_as_glb_for_download() -> str:
     (Babylon.js Sandbox, three.js editor, Windows 3D Viewer, etc.).
     The link expires after 1 hour.
     In Teams, a configured scene widget is published automatically for this
-    snapshot. Do not generate widget HTML or request another export to load it.
+    snapshot unless the turn requests image/video output instead.
+    Do not generate widget HTML or request another export to load it.
     """
     logger.info("Tool called: export_scene_as_glb_for_download")
     try:
@@ -1607,6 +1621,7 @@ _TOOL_STATUS_MESSAGES: dict[str, str] = {
     "render_final": "Rendering the final image (this may take a moment)…",
     "save_scene_for_download": "Saving scene for download…",
     "export_scene_as_glb_for_download": "Exporting scene as GLB…",
+    "show_3d_scene": "Preparing the interactive 3D scene…",
 }
 
 
@@ -1624,6 +1639,15 @@ class ToolStatusMiddleware(AgentMiddleware):
 
     # Tools whose function_result contains a download link to surface
     _LINK_TOOLS = {"save_scene_for_download", "export_scene_as_glb_for_download"}
+    _SCENE_PREVIEW_TOOLS = {
+        "setup_scene", "create_object", "modify_object", "delete_object", "apply_material",
+        "execute_blender_code", "download_model", "apply_texture", "apply_camera_path",
+        "show_3d_scene",
+    }
+    _NON_SCENE_OUTPUT_TOOLS = {
+        "get_viewport_screenshot", "render_preview", "render_final",
+        "start_animation_render", "start_seedance_finish", "get_video_job_status",
+    }
 
     _IMAGE_LABELS: dict[str, str] = {
         "render_preview": "Here's a quick preview while the final render is in progress:",
@@ -1640,6 +1664,14 @@ class ToolStatusMiddleware(AgentMiddleware):
         original_stream = context.result
 
         async def _wrapped():
+            from teams_widgets import exports
+
+            captured_exports = exports.get()
+            scene_call_ids: dict[str, str] = {}
+            completed_scene_calls: set[str] = set()
+            preview_needed = False
+            preview_suppressed = False
+            export_count = len(captured_exports) if captured_exports is not None else 0
             # Deduplicate by tool *name* so that multiple streaming chunks
             # for the same logical invocation don't produce repeated status
             # messages (the framework can emit several FunctionCallContent
@@ -1726,6 +1758,16 @@ class ToolStatusMiddleware(AgentMiddleware):
                         # ── Status messages before each tool call ──
                         if content.type == "function_call":
                             call_id = content.call_id or content.name
+                            if content.name in self._NON_SCENE_OUTPUT_TOOLS:
+                                preview_suppressed = True
+                            if captured_exports is not None and call_id and (
+                                content.name in self._SCENE_PREVIEW_TOOLS or content.name == "export_scene_as_glb_for_download"
+                            ):
+                                arguments = content.parse_arguments() or {}
+                                if content.name == "execute_blender_code" and arguments.get("modifies_scene") is False:
+                                    scene_call_ids.pop(call_id, None)
+                                else:
+                                    scene_call_ids[call_id] = content.name
                             if content.name in self._IMAGE_TOOLS and call_id:
                                 image_call_ids[call_id] = content.name
                             if content.name in self._LINK_TOOLS and call_id:
@@ -1744,6 +1786,18 @@ class ToolStatusMiddleware(AgentMiddleware):
                         # ── Stream images from tool results immediately ──
                         if content.type == "function_result":
                             cid = content.call_id or ""
+                            if cid in scene_call_ids and cid not in completed_scene_calls:
+                                completed_scene_calls.add(cid)
+                                name = scene_call_ids[cid]
+                                if name == "export_scene_as_glb_for_download":
+                                    if captured_exports is not None and len(captured_exports) > export_count:
+                                        preview_needed = False
+                                        export_count = len(captured_exports)
+                                elif not content.exception and not (
+                                    isinstance(content.result, str)
+                                    and content.result.lower().startswith(("error", "failed", "refused", "blender crashed"))
+                                ):
+                                    preview_needed = True
                             if cid in image_call_ids and cid not in surfaced_call_ids:
                                 match = self._IMAGE_RE.search(
                                     content.result or ""
@@ -1780,6 +1834,25 @@ class ToolStatusMiddleware(AgentMiddleware):
                                     )
 
                     yield update
+                if captured_exports is not None and preview_suppressed:
+                    captured_exports.clear()
+                if captured_exports is not None and preview_needed and not preview_suppressed:
+                    before_export = len(captured_exports)
+                    result = await asyncio.to_thread(export_scene_as_glb_for_download)
+                    link = self._LINK_RE.search(result)
+                    if len(captured_exports) > before_export and link:
+                        yield AgentResponseUpdate(
+                            contents=[Content.from_text(f"\n\n{link.group(0)}\n\n")],
+                            role="assistant", message_id="tool-link-teams-preview",
+                        )
+                    else:
+                        logger.warning("Automatic Teams GLB preview failed; no trusted export was registered.")
+                        yield AgentResponseUpdate(
+                            contents=[Content.from_text(
+                                "\n\nThe interactive 3D preview could not be exported. "
+                                "Ask me to export the scene as GLB again; no preview was published.\n\n"
+                            )], role="assistant", message_id="tool-link-teams-preview",
+                        )
             except asyncio.CancelledError:
                 if not timed_out:
                     # Genuine external cancellation — propagate untouched.
@@ -2461,6 +2534,7 @@ This environment runs **Blender 4.4**. The following Blender 3.x APIs were remov
             apply_material,
             execute_blender_code,
             get_viewport_screenshot,
+            show_3d_scene,
             list_available_models,
             download_model,
             list_available_textures,
